@@ -199,7 +199,7 @@ class GuessGameService(Service):
         try:
             match name:
                 case "guess_song_setup":
-                    return await self._tool_setup()
+                    return await self._tool_setup(arguments)
                 case "guess_song_create":
                     return await self._tool_create(arguments)
                 case "guess_song_join":
@@ -244,8 +244,10 @@ class GuessGameService(Service):
 
     # ── Tool implementations ─────────────────────────────────────────
 
-    async def _tool_setup(self) -> ToolOutput:
+    async def _tool_setup(self, args: dict[str, Any]) -> ToolOutput:
         """Return a setup form for creating a new game."""
+        user_id = args.get("_user_id", "")
+
         # Build speaker options from the speaker service
         speaker_options: list[UIOption] = []
         try:
@@ -258,6 +260,7 @@ class GuessGameService(Service):
         defaults = self._plugin_config
         form = UIBlock(
             title="Guess That Song — New Game",
+            for_user=user_id,
             elements=[
                 UIElement(
                     type="text", name="query",
@@ -360,32 +363,39 @@ class GuessGameService(Service):
             ],
             for_user=user_id,
         )
-        join_block = UIBlock(
-            title="Guess That Song",
-            elements=[
-                UIElement(
-                    type="label", name="join_info",
-                    label=(
-                        f"**{user_name}** started a game!\n"
-                        f"**{query}** — {config_label}"
-                    ),
-                ),
-                UIElement(
-                    type="buttons", name="join_action",
-                    options=[
-                        UIOption("join", "Join Game"),
-                        UIOption("decline", "Decline"),
+        # Create a join block per room member (excluding host)
+        room_members = args.get("_room_members", [])
+        join_blocks = []
+        for member in room_members:
+            mid = member.get("user_id", "")
+            if mid and mid != user_id:
+                join_blocks.append(UIBlock(
+                    title="Guess That Song",
+                    elements=[
+                        UIElement(
+                            type="label", name="join_info",
+                            label=(
+                                f"**{user_name}** started a game!\n"
+                                f"**{query}** — {config_label}"
+                            ),
+                        ),
+                        UIElement(
+                            type="buttons", name="join_action",
+                            options=[
+                                UIOption("join", "Join Game"),
+                                UIOption("decline", "Decline"),
+                            ],
+                        ),
                     ],
-                ),
-            ],
-            exclude_user=user_id,
-        )
+                    for_user=mid,
+                ))
+
         return ToolOutput(
             text=(
                 f"Game created! {query} — {config_label}. "
                 f"Hit Start when ready!"
             ),
-            ui_blocks=[lobby_block, join_block],
+            ui_blocks=[lobby_block, *join_blocks],
         )
 
     async def _tool_join(self, args: dict[str, Any]) -> str:
@@ -441,30 +451,42 @@ class GuessGameService(Service):
         await self._sync_state(game)
         speakers_msg = f" on {', '.join(played_on)}" if played_on else ""
 
-        guess_form = UIBlock(
-            title=f"Round {game.current_round} of {game.config.num_rounds}",
-            elements=[
-                UIElement(
-                    type="label", name="prompt",
-                    label=f"Playing {game.config.clip_seconds}s clip{speakers_msg}... What song is this?",
-                ),
-                UIElement(
-                    type="text", name="guess",
-                    label="Your Guess",
-                    placeholder="Song title and/or artist",
-                    required=True,
-                ),
-            ],
-            submit_label="Submit Guess",
+        # Create a guess form per player
+        round_label = (
+            f"Round {game.current_round} of {game.config.num_rounds}"
         )
+        clip_label = (
+            f"Playing {game.config.clip_seconds}s clip"
+            f"{speakers_msg}... What song is this?"
+        )
+        guess_blocks = [
+            UIBlock(
+                title=round_label,
+                elements=[
+                    UIElement(
+                        type="label", name="prompt",
+                        label=clip_label,
+                    ),
+                    UIElement(
+                        type="text", name="guess",
+                        label="Your Guess",
+                        placeholder="Song title and/or artist",
+                        required=True,
+                    ),
+                ],
+                submit_label="Submit Guess",
+                for_user=pid,
+            )
+            for pid in game.players
+        ]
 
         return ToolOutput(
             text=(
-                f"Round {game.current_round} of {game.config.num_rounds} — "
-                f"playing a {game.config.clip_seconds}s clip{speakers_msg}. "
-                f"Type your guess!"
+                f"{round_label} — "
+                f"playing a {game.config.clip_seconds}s clip"
+                f"{speakers_msg}. Type your guess!"
             ),
-            ui_blocks=[guess_form],
+            ui_blocks=guess_blocks,
         )
 
     async def _tool_submit_guess(self, args: dict[str, Any]) -> str | ToolOutput:
@@ -639,6 +661,7 @@ class GuessGameService(Service):
             elements=[
                 UIElement(type="buttons", name="round_action", options=button_options),
             ],
+            for_user=game.host_id,
         )
 
         # TTS announce
