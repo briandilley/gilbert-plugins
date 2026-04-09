@@ -1,0 +1,19 @@
+name: guess-that-song
+version: "1.0.0"
+description: "Guess That Song — multiplayer music guessing game managed by the AI"
+
+provides:
+  - guess_game
+
+requires:
+  - music
+  - speaker_control
+
+depends_on: []
+
+config:
+  default_clip_seconds: 3
+  default_num_rounds: 5
+  default_volume: 70
+  max_rounds: 20
+  max_concurrent_games: 3
