@@ -29,7 +29,9 @@ if _pkg_name not in sys.modules:
         )
         assert _spec is not None and _spec.loader is not None
         _mod = importlib.util.module_from_spec(_spec)
-        _mod.__package__ = _pkg_name
+        # Don't set __package__ manually — module_from_spec already
+        # wires __spec__.parent correctly, and setting __package__ here
+        # would trip the DeprecationWarning about the two disagreeing.
         sys.modules[f"{_pkg_name}.{_mod_name}"] = _mod
         _spec.loader.exec_module(_mod)
         setattr(pkg, _mod_name, _mod)
