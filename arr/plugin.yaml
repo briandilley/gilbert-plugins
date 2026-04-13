@@ -1,0 +1,11 @@
+name: arr
+version: "1.0.0"
+description: "Radarr + Sonarr integration — manage movies and TV shows from chat"
+
+provides:
+  - radarr
+  - sonarr
+
+requires: []
+
+depends_on: []
