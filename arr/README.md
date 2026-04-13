@@ -42,19 +42,17 @@ with posters and a one-click "Add" button.
   standard on all supported releases.
 - The API key from each server — in Radarr / Sonarr, **Settings →
   General → Security → API Key**.
-- Gilbert with this directory present under `plugins/arr/` and
-  `plugins.directories: [plugins]` in `gilbert.yaml` (the default as
-  of the commit that ships this plugin). Each service is opt-in and
-  starts disabled.
+- Gilbert with this directory present under `std-plugins/arr/`.
+  `gilbert.yaml` ships with `std-plugins`, `local-plugins`, and
+  `installed-plugins` in `plugins.directories` by default, so no
+  config change is needed. Each service is opt-in and starts disabled.
 
 ## Installation
 
 ```bash
-# From the Gilbert repo root
-cd plugins
-git clone git@github.com:briandilley/gilbert-plugins.git .   # if the
-# plugins directory is empty; otherwise the arr tree just needs to
-# exist under plugins/arr/
+# From the Gilbert repo root — clone the first-party plugins repo
+# into std-plugins/
+git clone git@github.com:briandilley/gilbert-plugins.git std-plugins
 ```
 
 No pip install step — the plugin imports only from `gilbert.interfaces.*`
@@ -205,14 +203,14 @@ Every tool is also directly AI-callable. The most common patterns:
 ## Architecture
 
 ```
-plugins/arr/
+std-plugins/arr/
     __init__.py             # empty, makes it a Python package
     plugin.yaml             # manifest — name, version, provides
     plugin.py               # Plugin subclass; registers both services
     arr_client.py           # shared async httpx wrapper (v3 API + X-Api-Key)
     radarr_service.py       # RadarrService (Service + ToolProvider + Configurable + ConfigActionProvider)
     sonarr_service.py       # SonarrService (same shape)
-    tests/                  # conftest for package bootstrap in pytest
+    tests/                  # test file + conftest for package bootstrap
     README.md               # this file
 ```
 
@@ -249,16 +247,20 @@ plugins/arr/
 
 ## Testing
 
-Tests live in the main Gilbert repo at `tests/unit/test_arr_plugin.py`.
-The test file registers this plugin directory as a Python package at
-import time (since plugins use relative imports) and skips gracefully
-when the plugin isn't installed. It uses a `FakeArrClient` that records
-calls and returns canned responses, so the tests have no network
-dependency.
+Tests live alongside the plugin sources at `std-plugins/arr/tests/`.
+The sibling `conftest.py` registers this directory as the
+`gilbert_plugin_arr` Python package at pytest collection time so
+relative imports (`from .arr_client import ...`) resolve correctly.
+A `FakeArrClient` records calls and returns canned responses, so the
+tests have no network dependency.
+
+Gilbert's `pyproject.toml` adds `std-plugins` to its `testpaths`, so
+running `uv run pytest` from the Gilbert repo root picks these up
+automatically whenever the plugin is installed:
 
 ```bash
 # From the Gilbert repo root
-uv run pytest tests/unit/test_arr_plugin.py -v
+uv run pytest std-plugins/arr/tests/ -v
 ```
 
 60 tests cover: plugin entrypoint, service info, tool visibility /

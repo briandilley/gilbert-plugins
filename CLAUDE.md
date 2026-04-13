@@ -6,7 +6,7 @@ A collection of fun and useful plugins for the Gilbert AI assistant platform.
 
 - **Language:** Python 3.12+
 - **Framework:** Gilbert plugin system (see main repo CLAUDE.md for full architecture)
-- **Testing:** pytest with mocks; tests live in the main repo at `tests/unit/`
+- **Testing:** pytest with mocks; tests live alongside each plugin at `<plugin>/tests/`
 - **Dependencies:** Managed via the main Gilbert `uv` project — plugins import from `gilbert.*` interfaces
 
 ## Plugin Structure
@@ -48,23 +48,23 @@ Plugin config defaults go in `plugin.yaml` under `config:`. Users override in th
 - **Follow main repo conventions.** Interface-first, type hints everywhere, async I/O.
 - **Depend on capabilities, not services.** Use `resolver.require_capability("music")`, not concrete class imports.
 - **Return `ToolOutput` for interactive tools.** Use UI blocks (forms, buttons) for rich user interaction.
-- **Write tests in the main repo.** Tests go in `tests/unit/test_<plugin_name>.py` since they need the Gilbert test infrastructure.
+- **Write tests alongside the plugin.** Tests go in `<plugin>/tests/test_<feature>.py` with a sibling `conftest.py` that registers the plugin directory as `gilbert_plugin_<name>`. Gilbert's pyproject adds `std-plugins` to its `testpaths` so `uv run pytest` from the Gilbert repo root discovers them automatically.
 - **Use relative imports within the plugin.** e.g., `from .game import GameState` — the plugin loader handles package setup.
 
 ## Commands
 
 ```bash
-# Run all tests (from main repo root)
+# Run all tests (from main repo root — picks up std-plugins/*/tests via pyproject testpaths)
 uv run pytest
 
 # Run a specific plugin's tests
-uv run pytest tests/unit/test_guess_game.py -v
+uv run pytest std-plugins/arr/tests/ -v
 
 # Type checking (from main repo root)
 uv run mypy src/
 
 # Linting
-uv run ruff check plugins/
+uv run ruff check std-plugins/
 ```
 
 ## Existing Plugins
