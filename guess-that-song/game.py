@@ -46,7 +46,7 @@ class SongInfo:
             title=str(d["title"]),
             artist=str(d["artist"]),
             uri=str(d["uri"]),
-            duration_seconds=float(d.get("duration_seconds", 0)),  # type: ignore[arg-type]
+            duration_seconds=float(str(d.get("duration_seconds", 0))),
             album_art_url=str(d.get("album_art_url", "")),
         )
 
@@ -74,7 +74,7 @@ class PlayerGuess:
             player_id=str(d["player_id"]),
             player_name=str(d["player_name"]),
             guess_text=str(d["guess_text"]),
-            timestamp=float(d.get("timestamp", 0)),  # type: ignore[arg-type]
+            timestamp=float(str(d.get("timestamp", 0))),
         )
 
 
@@ -184,12 +184,15 @@ class GameState:
         """Deserialize game state from storage."""
         config_d = d.get("config", {})
         assert isinstance(config_d, dict)
+        volume_raw = config_d.get("volume")
+        speakers_raw = config_d.get("speakers", [])
+        assert isinstance(speakers_raw, list)
         config = GameConfig(
             query=str(config_d.get("query", "popular hits")),
-            num_rounds=int(config_d.get("num_rounds", 5)),  # type: ignore[arg-type]
-            clip_seconds=int(config_d.get("clip_seconds", 3)),  # type: ignore[arg-type]
-            speakers=list(config_d.get("speakers", [])),  # type: ignore[arg-type]
-            volume=int(config_d["volume"]) if config_d.get("volume") is not None else None,  # type: ignore[arg-type]
+            num_rounds=int(str(config_d.get("num_rounds", 5))),
+            clip_seconds=int(str(config_d.get("clip_seconds", 3))),
+            speakers=[str(s) for s in speakers_raw],
+            volume=int(str(volume_raw)) if volume_raw is not None else None,
         )
         songs_raw = d.get("songs", [])
         assert isinstance(songs_raw, list)
@@ -208,16 +211,21 @@ class GameState:
             config=config,
             status=str(d.get("status", "lobby")),
             players={str(k): str(v) for k, v in players.items()},
-            scores={str(k): int(v) for k, v in scores.items()},  # type: ignore[arg-type]
-            songs=[SongInfo.from_dict(s) for s in songs_raw],  # type: ignore[arg-type]
-            current_round=int(d.get("current_round", 0)),  # type: ignore[arg-type]
-            guesses={str(k): PlayerGuess.from_dict(v) for k, v in guesses_raw.items()},  # type: ignore[arg-type]
+            scores={str(k): int(str(v)) for k, v in scores.items()},
+            songs=[SongInfo.from_dict(s) for s in songs_raw if isinstance(s, dict)],
+            current_round=int(str(d.get("current_round", 0))),
+            guesses={
+                str(k): PlayerGuess.from_dict(v)
+                for k, v in guesses_raw.items()
+                if isinstance(v, dict)
+            },
             round_results=[
                 RoundResult(
-                    round_number=int(r.get("round_number", 0)),  # type: ignore[union-attr]
-                    song=SongInfo.from_dict(r["song"]),  # type: ignore[arg-type, index]
+                    round_number=int(str(r.get("round_number", 0))),
+                    song=SongInfo.from_dict(r["song"]),
                 )
                 for r in results_raw
+                if isinstance(r, dict) and "song" in r and isinstance(r["song"], dict)
             ],
         )
 

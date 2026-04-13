@@ -10,10 +10,3 @@ requires:
   - speaker_control
 
 depends_on: []
-
-config:
-  default_clip_seconds: 3
-  default_num_rounds: 5
-  default_volume: 70
-  max_rounds: 20
-  max_concurrent_games: 3

@@ -8,7 +8,10 @@ import logging
 import random
 from typing import Any
 
+from gilbert.interfaces.configuration import ConfigParam, ConfigurationReader
+from gilbert.interfaces.events import EventBusProvider
 from gilbert.interfaces.service import Service, ServiceInfo, ServiceResolver
+from gilbert.interfaces.speaker import SpeakerProvider
 from gilbert.interfaces.tools import (
     ToolDefinition,
     ToolParameter,
@@ -34,8 +37,9 @@ WRONG_PHRASES = [
 class GuessGameService(Service):
     """Guess That Song multiplayer game, exposed as AI tools with UI blocks."""
 
-    def __init__(self, config: dict[str, Any]) -> None:
-        self._plugin_config = config
+    def __init__(self, config: dict[str, Any] | None = None) -> None:
+        self._plugin_config: dict[str, Any] = config or {}
+        self._enabled: bool = False
         self._games: dict[str, GameState] = {}
 
         # Dependencies (resolved in start)
@@ -49,21 +53,83 @@ class GuessGameService(Service):
             name="guess_game",
             capabilities=frozenset({"guess_game", "ai_tools"}),
             requires=frozenset({"music", "speaker_control"}),
-            optional=frozenset({"event_bus", "text_to_speech", "ai_chat"}),
+            optional=frozenset({"event_bus", "text_to_speech", "ai_chat", "configuration"}),
             ai_calls=frozenset({"guess_song_validate"}),
+            toggleable=True,
+            toggle_description="Guess That Song multiplayer game",
         )
 
     async def start(self, resolver: ServiceResolver) -> None:
+        # Load config from configuration capability if available
+        config_svc = resolver.get_capability("configuration")
+        if config_svc is not None and isinstance(config_svc, ConfigurationReader):
+            section = config_svc.get_section(self.config_namespace)
+            if not section.get("enabled", False):
+                logger.info("Guess That Song service disabled")
+                return
+            # Merge stored config over plugin defaults
+            for key in ("default_clip_seconds", "default_num_rounds",
+                        "default_volume", "max_rounds", "max_concurrent_games"):
+                if key in section:
+                    self._plugin_config[key] = section[key]
+
+        self._enabled = True
         self._music_svc = resolver.require_capability("music")
         self._speaker_svc = resolver.require_capability("speaker_control")
         self._ai_svc = resolver.get_capability("ai_chat")
         event_bus_svc = resolver.get_capability("event_bus")
-        if event_bus_svc is not None:
-            self._event_bus = getattr(event_bus_svc, "bus", None)
+        if event_bus_svc is not None and isinstance(event_bus_svc, EventBusProvider):
+            self._event_bus = event_bus_svc.bus
         logger.info("Guess That Song service started")
 
     async def stop(self) -> None:
         self._games.clear()
+        self._enabled = False
+
+    # --- Configurable protocol ---
+
+    @property
+    def config_namespace(self) -> str:
+        return "guess_game"
+
+    @property
+    def config_category(self) -> str:
+        return "Media"
+
+    def config_params(self) -> list[ConfigParam]:
+        return [
+            ConfigParam(
+                key="default_clip_seconds", type=ToolParameterType.INTEGER,
+                description="Default clip length in seconds (2-10).",
+                default=3,
+            ),
+            ConfigParam(
+                key="default_num_rounds", type=ToolParameterType.INTEGER,
+                description="Default number of rounds per game.",
+                default=5,
+            ),
+            ConfigParam(
+                key="default_volume", type=ToolParameterType.INTEGER,
+                description="Default playback volume (0-100).",
+                default=70,
+            ),
+            ConfigParam(
+                key="max_rounds", type=ToolParameterType.INTEGER,
+                description="Maximum rounds allowed per game.",
+                default=20,
+            ),
+            ConfigParam(
+                key="max_concurrent_games", type=ToolParameterType.INTEGER,
+                description="Maximum number of simultaneous games.",
+                default=3,
+            ),
+        ]
+
+    async def on_config_changed(self, config: dict[str, Any]) -> None:
+        for key in ("default_clip_seconds", "default_num_rounds",
+                    "default_volume", "max_rounds", "max_concurrent_games"):
+            if key in config:
+                self._plugin_config[key] = config[key]
 
     # ── ToolProvider protocol ────────────────────────────────────────
 
@@ -72,6 +138,8 @@ class GuessGameService(Service):
         return "guess_game"
 
     def get_tools(self) -> list[ToolDefinition]:
+        if not self._enabled:
+            return []
         return [
             ToolDefinition(
                 name="guess_song_setup",
@@ -251,6 +319,8 @@ class GuessGameService(Service):
         # Build speaker options from the speaker service
         speaker_options: list[UIOption] = []
         try:
+            if not isinstance(self._speaker_svc, SpeakerProvider):
+                raise RuntimeError("Speaker service does not provide SpeakerProvider")
             speakers = await self._speaker_svc.backend.list_speakers()
             for s in speakers:
                 speaker_options.append(UIOption(value=s.name, label=s.name))
@@ -445,13 +515,12 @@ class GuessGameService(Service):
         if not song:
             return "No more songs available."
 
-        # Announce round start, then play clip
-        await self._announce_round_start(game)
-        played_on = await self._play_clip(game, song)
         await self._sync_state(game)
-        speakers_msg = f" on {', '.join(played_on)}" if played_on else ""
 
-        # Create a guess form per player
+        # Create a guess form per player (sent before clip plays
+        # so players can answer as soon as they hear it)
+        speakers = game.config.speakers or []
+        speakers_msg = f" on {', '.join(speakers)}" if speakers else ""
         round_label = (
             f"Round {game.current_round} of {game.config.num_rounds}"
         )
@@ -459,6 +528,16 @@ class GuessGameService(Service):
             f"Playing {game.config.clip_seconds}s clip"
             f"{speakers_msg}... What song is this?"
         )
+
+        # Announce and play clip in the background after forms are returned
+        async def _announce_and_play() -> None:
+            try:
+                await self._announce_round_start(game)
+                await self._play_clip(game, song)
+            except Exception:
+                logger.exception("Failed to announce/play clip for round %d", game.current_round)
+
+        asyncio.create_task(_announce_and_play())
         guess_blocks = [
             UIBlock(
                 title=round_label,
@@ -648,24 +727,26 @@ class GuessGameService(Service):
 
         reveal_text = "\n".join(lines)
 
-        # Action buttons
-        button_options: list[UIOption] = []
-        if remaining > 0:
-            button_options.append(UIOption("next", "Next Round"))
-            button_options.append(UIOption("replay", "Replay Clip"))
-        button_options.append(UIOption("scores", "Scores"))
-        button_options.append(UIOption("end", "End Game"))
+        # TTS announce round results
+        await self._announce_results(game, song, correct_players)
 
+        # Last round — auto-end the game
+        if remaining == 0:
+            return await self._end_game(game)
+
+        # Action buttons for mid-game rounds
         action_block = UIBlock(
             title="",
             elements=[
-                UIElement(type="buttons", name="round_action", options=button_options),
+                UIElement(type="buttons", name="round_action", options=[
+                    UIOption("next", "Next Round"),
+                    UIOption("replay", "Replay Clip"),
+                    UIOption("scores", "Scores"),
+                    UIOption("end", "End Game"),
+                ]),
             ],
             for_user=game.host_id,
         )
-
-        # TTS announce
-        await self._announce_results(game, song, correct_players)
 
         return ToolOutput(text=reveal_text, ui_blocks=[action_block])
 

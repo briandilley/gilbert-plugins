@@ -23,7 +23,7 @@ class GuessThatSongPlugin(Plugin):
     async def setup(self, context: PluginContext) -> None:
         from .service import GuessGameService
 
-        self._service = GuessGameService(config=context.config)
+        self._service = GuessGameService()
         context.services.register(self._service)
 
     async def teardown(self) -> None:
