@@ -3,7 +3,12 @@
 import logging
 from typing import Any
 
-from gilbert.interfaces.configuration import ConfigAction, ConfigActionResult
+from gilbert.interfaces.configuration import (
+    ConfigAction,
+    ConfigActionResult,
+    ConfigParam,
+)
+from gilbert.interfaces.tools import ToolParameterType
 from gilbert.interfaces.tunnel import TunnelBackend
 
 logger = logging.getLogger(__name__)
@@ -15,10 +20,7 @@ class NgrokTunnel(TunnelBackend):
     backend_name = "ngrok"
 
     @classmethod
-    def backend_config_params(cls) -> list["ConfigParam"]:
-        from gilbert.interfaces.configuration import ConfigParam
-        from gilbert.interfaces.tools import ToolParameterType
-
+    def backend_config_params(cls) -> list[ConfigParam]:
         return [
             ConfigParam(
                 key="api_key", type=ToolParameterType.STRING,

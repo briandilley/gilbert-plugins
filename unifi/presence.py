@@ -16,12 +16,17 @@ from .client import (
 from .name_resolver import NameResolver
 from .network import UniFiNetwork
 from .protect import UniFiProtect
-from gilbert.interfaces.configuration import ConfigAction, ConfigActionResult
+from gilbert.interfaces.configuration import (
+    ConfigAction,
+    ConfigActionResult,
+    ConfigParam,
+)
 from gilbert.interfaces.presence import (
     PresenceBackend,
     PresenceState,
     UserPresence,
 )
+from gilbert.interfaces.tools import ToolParameterType
 
 logger = logging.getLogger(__name__)
 
@@ -57,10 +62,7 @@ class UniFiPresenceBackend(PresenceBackend):
     backend_name = "unifi"
 
     @classmethod
-    def backend_config_params(cls) -> list["ConfigParam"]:
-        from gilbert.interfaces.configuration import ConfigParam
-        from gilbert.interfaces.tools import ToolParameterType
-
+    def backend_config_params(cls) -> list[ConfigParam]:
         return [
             ConfigParam(
                 key="unifi_network.host", type=ToolParameterType.STRING,

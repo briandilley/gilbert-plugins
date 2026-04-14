@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import random
 from typing import Any
@@ -826,7 +825,7 @@ class GuessGameService(Service):
             start_pos = random.uniform(10, max_start) if max_start > 10 else 10.0
 
             # Play via MusicService
-            track = await self._music_svc.play_track(
+            await self._music_svc.play_track(
                 track_id=song.track_id,
                 speaker_names=game.config.speakers or None,
                 volume=game.config.volume,

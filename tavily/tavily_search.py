@@ -7,7 +7,12 @@ from typing import Any
 
 import httpx
 
-from gilbert.interfaces.configuration import ConfigAction, ConfigActionResult
+from gilbert.interfaces.configuration import (
+    ConfigAction,
+    ConfigActionResult,
+    ConfigParam,
+)
+from gilbert.interfaces.tools import ToolParameterType
 from gilbert.interfaces.websearch import WebSearchBackend, WebSearchResult
 
 logger = logging.getLogger(__name__)
@@ -22,10 +27,7 @@ class TavilySearch(WebSearchBackend):
     backend_name = "tavily"
 
     @classmethod
-    def backend_config_params(cls) -> list["ConfigParam"]:
-        from gilbert.interfaces.configuration import ConfigParam
-        from gilbert.interfaces.tools import ToolParameterType
-
+    def backend_config_params(cls) -> list[ConfigParam]:
         return [
             ConfigParam(
                 key="api_key", type=ToolParameterType.STRING,

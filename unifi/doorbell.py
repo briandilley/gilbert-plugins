@@ -9,8 +9,13 @@ from .client import (
     UniFiConnectionError,
 )
 from .protect import UniFiProtect
-from gilbert.interfaces.configuration import ConfigAction, ConfigActionResult
+from gilbert.interfaces.configuration import (
+    ConfigAction,
+    ConfigActionResult,
+    ConfigParam,
+)
 from gilbert.interfaces.doorbell import DoorbellBackend, RingEvent
+from gilbert.interfaces.tools import ToolParameterType
 
 logger = logging.getLogger(__name__)
 
@@ -21,10 +26,7 @@ class UniFiProtectDoorbellBackend(DoorbellBackend):
     backend_name = "unifi"
 
     @classmethod
-    def backend_config_params(cls) -> list["ConfigParam"]:
-        from gilbert.interfaces.configuration import ConfigParam
-        from gilbert.interfaces.tools import ToolParameterType
-
+    def backend_config_params(cls) -> list[ConfigParam]:
         return [
             ConfigParam(
                 key="host", type=ToolParameterType.STRING,

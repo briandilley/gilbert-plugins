@@ -5,7 +5,9 @@ import io
 import logging
 from typing import Any
 
+from gilbert.interfaces.configuration import ConfigParam
 from gilbert.interfaces.ocr import OCRBackend
+from gilbert.interfaces.tools import ToolParameterType
 
 logger = logging.getLogger(__name__)
 
@@ -19,10 +21,7 @@ class TesseractOCR(OCRBackend):
     backend_name = "tesseract"
 
     @classmethod
-    def backend_config_params(cls) -> list["ConfigParam"]:
-        from gilbert.interfaces.configuration import ConfigParam
-        from gilbert.interfaces.tools import ToolParameterType
-
+    def backend_config_params(cls) -> list[ConfigParam]:
         return [
             ConfigParam(
                 key="language",

@@ -16,8 +16,16 @@ from gilbert.interfaces.ai import (
     StopReason,
     TokenUsage,
 )
-from gilbert.interfaces.configuration import ConfigAction, ConfigActionResult
-from gilbert.interfaces.tools import ToolCall, ToolDefinition, ToolResult
+from gilbert.interfaces.configuration import (
+    ConfigAction,
+    ConfigActionResult,
+    ConfigParam,
+)
+from gilbert.interfaces.tools import (
+    ToolCall,
+    ToolDefinition,
+    ToolParameterType,
+)
 
 logger = logging.getLogger(__name__)
 ai_logger = logging.getLogger("gilbert.ai")
@@ -33,10 +41,7 @@ class AnthropicAI(AIBackend):
     backend_name = "anthropic"
 
     @classmethod
-    def backend_config_params(cls) -> list["ConfigParam"]:
-        from gilbert.interfaces.configuration import ConfigParam
-        from gilbert.interfaces.tools import ToolParameterType
-
+    def backend_config_params(cls) -> list[ConfigParam]:
         return [
             ConfigParam(
                 key="api_key", type=ToolParameterType.STRING,

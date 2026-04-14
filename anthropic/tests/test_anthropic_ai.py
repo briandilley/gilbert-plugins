@@ -1,7 +1,6 @@
 """Tests for AnthropicAI backend — message translation and response parsing."""
 
-from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 

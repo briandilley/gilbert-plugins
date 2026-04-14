@@ -1,8 +1,6 @@
 """Tests for UniFi presence backend — composite aggregation, subsystems, name parsing."""
 
-import json
-from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 

@@ -27,9 +27,7 @@ class GoogleDirectoryBackend(UserProviderBackend):
     backend_name = "google_directory"
 
     @classmethod
-    def backend_config_params(cls) -> list["ConfigParam"]:
-        from gilbert.interfaces.configuration import ConfigParam
-
+    def backend_config_params(cls) -> list[ConfigParam]:
         return [
             ConfigParam(
                 key="sa_json", type=ToolParameterType.STRING,

@@ -3,15 +3,16 @@
 import asyncio
 import io
 import logging
-import mimetypes
 from typing import Any, AsyncIterator
 
+from gilbert.interfaces.configuration import ConfigParam
 from gilbert.interfaces.knowledge import (
     DocumentBackend,
     DocumentContent,
     DocumentMeta,
     DocumentType,
 )
+from gilbert.interfaces.tools import ToolParameterType
 
 logger = logging.getLogger(__name__)
 
@@ -93,10 +94,7 @@ class GoogleDriveDocumentBackend(DocumentBackend):
     backend_name = "gdrive"
 
     @classmethod
-    def backend_config_params(cls) -> list["ConfigParam"]:
-        from gilbert.interfaces.configuration import ConfigParam
-        from gilbert.interfaces.tools import ToolParameterType
-
+    def backend_config_params(cls) -> list[ConfigParam]:
         return [
             ConfigParam(
                 key="service_account_json", type=ToolParameterType.STRING,
