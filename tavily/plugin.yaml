@@ -1,0 +1,10 @@
+name: tavily
+version: "1.0.0"
+description: "Tavily web search backend — search and AI summaries via the Tavily API"
+
+provides:
+  - tavily_search
+
+requires: []
+
+depends_on: []

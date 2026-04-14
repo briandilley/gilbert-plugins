@@ -1,0 +1,11 @@
+name: unifi
+version: "1.0.0"
+description: "UniFi integration — presence detection and doorbell via Ubiquiti Network, Protect, and Access APIs"
+
+provides:
+  - unifi_presence
+  - unifi_doorbell
+
+requires: []
+
+depends_on: []

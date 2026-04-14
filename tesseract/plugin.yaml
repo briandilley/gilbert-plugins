@@ -1,0 +1,10 @@
+name: tesseract
+version: "1.0.0"
+description: "Tesseract OCR backend — local text extraction from images via pytesseract"
+
+provides:
+  - tesseract_ocr
+
+requires: []
+
+depends_on: []

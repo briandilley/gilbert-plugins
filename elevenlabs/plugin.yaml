@@ -1,0 +1,10 @@
+name: elevenlabs
+version: "1.0.0"
+description: "ElevenLabs TTS backend — high-quality text-to-speech via the ElevenLabs API"
+
+provides:
+  - elevenlabs_tts
+
+requires: []
+
+depends_on: []

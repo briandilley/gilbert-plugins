@@ -1,0 +1,10 @@
+name: ngrok
+version: "1.0.0"
+description: "Ngrok tunnel backend — public HTTPS URLs via pyngrok"
+
+provides:
+  - ngrok_tunnel
+
+requires: []
+
+depends_on: []

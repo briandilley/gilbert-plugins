@@ -1,0 +1,10 @@
+[project]
+name = "gilbert-plugin-unifi"
+version = "1.0.0"
+description = "UniFi presence and doorbell backends for Gilbert"
+requires-python = ">=3.12"
+# Uses ``httpx`` / ``aiohttp`` which are already Gilbert core deps.
+dependencies = []
+
+[tool.uv]
+package = false

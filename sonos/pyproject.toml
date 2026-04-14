@@ -1,0 +1,11 @@
+[project]
+name = "gilbert-plugin-sonos"
+version = "1.0.0"
+description = "Sonos speaker and music backends for Gilbert"
+requires-python = ">=3.12"
+dependencies = [
+    "soco>=0.30.15",
+]
+
+[tool.uv]
+package = false

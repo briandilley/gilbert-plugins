@@ -1,0 +1,10 @@
+[project]
+name = "gilbert-plugin-tavily"
+version = "1.0.0"
+description = "Tavily web search backend for Gilbert"
+requires-python = ">=3.12"
+# Uses ``httpx`` which is already a Gilbert core dep.
+dependencies = []
+
+[tool.uv]
+package = false

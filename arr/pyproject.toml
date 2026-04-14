@@ -1,0 +1,11 @@
+[project]
+name = "gilbert-plugin-arr"
+version = "1.0.0"
+description = "Radarr + Sonarr integration for Gilbert"
+requires-python = ">=3.12"
+# Uses ``httpx`` which is already a Gilbert core dep — no plugin-specific
+# third-party dependencies.
+dependencies = []
+
+[tool.uv]
+package = false

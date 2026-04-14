@@ -1,0 +1,11 @@
+name: anthropic
+version: "1.0.0"
+description: "Anthropic Claude backends — AI chat and vision via the Anthropic Messages API"
+
+provides:
+  - anthropic_ai
+  - anthropic_vision
+
+requires: []
+
+depends_on: []

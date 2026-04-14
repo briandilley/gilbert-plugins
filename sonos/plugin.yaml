@@ -1,0 +1,11 @@
+name: sonos
+version: "1.0.0"
+description: "Sonos speaker + music backends — control Sonos devices on the local network"
+
+provides:
+  - sonos_speaker
+  - sonos_music
+
+requires: []
+
+depends_on: []

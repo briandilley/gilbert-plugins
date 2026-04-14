@@ -1,0 +1,10 @@
+[project]
+name = "gilbert-plugin-guess-that-song"
+version = "1.0.0"
+description = "Multiplayer music guessing game for Gilbert"
+requires-python = ">=3.12"
+# Pure-stdlib plugin — all integrations go through ``gilbert.interfaces.*``.
+dependencies = []
+
+[tool.uv]
+package = false
