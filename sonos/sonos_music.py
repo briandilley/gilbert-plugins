@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from html import escape
 from typing import Any
 
 import soco
@@ -111,6 +112,21 @@ _SPOTIFY_URI_RE = re.compile(
     r"(?::|%3[Aa])([A-Za-z0-9]+)"
 )
 
+# Spotify's SMAPI service type. Used in the DIDL-Lite ``<desc>`` element
+# for container playback. Stable across installs — Sonos uses this to
+# look up the linked Spotify account on the target system.
+_SPOTIFY_SERVICE_TYPE = 3079
+
+# Map Spotify container kinds to their UPnP class for DIDL metadata. Only
+# kinds that Sonos plays as a *container* (multi-track expansion via
+# ``AddURIToQueue``) appear here — tracks/episodes/shows stay on the
+# direct ``x-sonos-spotify:`` play_uri path.
+_SPOTIFY_CONTAINER_CLASS: dict[str, str] = {
+    "playlist": "object.container.playlistContainer",
+    "album": "object.container.album.musicAlbum",
+    "artist": "object.container.person.musicArtist",
+}
+
 
 def _extract_spotify_uri(item_id: str) -> str | None:
     """Recover a clean ``spotify:<kind>:<id>`` URI from a SMAPI item id.
@@ -135,6 +151,61 @@ def _extract_spotify_uri(item_id: str) -> str | None:
         return None
     kind, sid = match.group(1), match.group(2)
     return f"spotify:{kind}:{sid}"
+
+
+def _spotify_kind(item_id: str) -> str | None:
+    """Return the Spotify content kind embedded in a SMAPI item id.
+
+    One of ``track|album|playlist|artist|episode|show``, or ``None`` if
+    the id doesn't contain a Spotify reference.
+    """
+    if not item_id:
+        return None
+    match = _SPOTIFY_URI_RE.search(item_id)
+    return match.group(1) if match else None
+
+
+def _build_spotify_container_playable(item: MusicItem, kind: str) -> Playable:
+    """Build a ``Playable`` for a Spotify container (playlist/album/artist).
+
+    Sonos silently no-ops when handed a Spotify container URI via
+    ``SetAVTransportURI`` — the AVTransport accepts the call and logs
+    success, but nothing plays because a container URI without queue
+    context doesn't tell Sonos which track to start. The correct path
+    is ``AddURIToQueue`` with an ``x-rincon-cpcontainer:`` URI plus a
+    DIDL-Lite envelope carrying the right ``upnp:class`` and Spotify
+    service descriptor; Sonos expands the container into individual
+    tracks on the queue and then ``play_from_queue`` starts the first.
+
+    The speaker backend sees the ``x-rincon-cpcontainer:`` prefix and
+    routes to its queue-playback path (see ``sonos_speaker._play_container``).
+
+    Uses the raw SMAPI item id (with its 8-char flags prefix and
+    uppercase ``%3A`` percent-encoding) verbatim as both the URI tail
+    and the DIDL ``item id`` — Sonos accepts it exactly as SMAPI
+    returned it. Verified experimentally against live hardware:
+    ``AddURIToQueue`` returns ``NumTracksAdded=50`` for a typical
+    Spotify playlist.
+    """
+    upnp_class = _SPOTIFY_CONTAINER_CLASS[kind]
+    didl = (
+        '<DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/"'
+        ' xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/"'
+        ' xmlns:r="urn:schemas-rinconnetworks-com:metadata-1-0/"'
+        ' xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/">'
+        f'<item id="{escape(item.id)}" parentID="-1" restricted="true">'
+        f"<dc:title>{escape(item.title)}</dc:title>"
+        f"<upnp:class>{upnp_class}</upnp:class>"
+        '<desc id="cdudn" nameSpace="urn:schemas-rinconnetworks-com:metadata-1-0/">'
+        f"SA_RINCON{_SPOTIFY_SERVICE_TYPE}_X_#Svc{_SPOTIFY_SERVICE_TYPE}-0-Token"
+        "</desc>"
+        "</item></DIDL-Lite>"
+    )
+    return Playable(
+        uri=f"x-rincon-cpcontainer:{item.id}",
+        didl_meta=didl,
+        title=item.title,
+    )
 
 
 def _item_uri(item: Any) -> str:
@@ -207,6 +278,73 @@ def _didl_playlist_to_music_item(pl: Any) -> MusicItem:
     )
 
 
+def _smapi_metadata(item: Any) -> dict[str, Any]:
+    """Return the ``.metadata`` dict from a SMAPI result, or ``{}``.
+
+    SoCo SMAPI result objects carry all their fields (id, title, artist,
+    album_art_uri, ...) on ``item.metadata`` — the instance itself
+    doesn't expose them via attribute access, so accidental
+    ``getattr(item, "artist", None)`` comes back empty. Use this helper
+    to walk the nested dict instead.
+    """
+    md = getattr(item, "metadata", None)
+    return md if isinstance(md, dict) else {}
+
+
+def _smapi_track_metadata(md: dict[str, Any]) -> dict[str, Any]:
+    """Return the nested ``track_metadata`` dict for a SMAPI track result.
+
+    Tracks wrap their album/artist/artwork inside a ``TrackMetadata``
+    object whose ``.metadata`` attribute is the actual dict — playlists
+    and albums inline those fields at the top of ``item.metadata``, so
+    the per-kind paths differ. Returns ``{}`` when absent or malformed.
+    """
+    tm = md.get("track_metadata")
+    if tm is None:
+        return {}
+    inner = getattr(tm, "metadata", None)
+    return inner if isinstance(inner, dict) else {}
+
+
+def _smapi_item_art(item: Any) -> str:
+    """Best-effort album art URL extraction from a SMAPI search result.
+
+    Playlists and albums expose ``album_art_uri`` at the top of
+    ``item.metadata``. Tracks nest it inside ``track_metadata.metadata``.
+    Returns an empty string when no artwork is available.
+    """
+    md = _smapi_metadata(item)
+    art = md.get("album_art_uri") or _smapi_track_metadata(md).get("album_art_uri")
+    return str(art) if art else ""
+
+
+def _smapi_item_subtitle(item: Any) -> str:
+    """Best-effort artist/creator extraction for a SMAPI search result.
+
+    Falls back through several fields because SMAPI uses different shapes
+    per kind: playlists have ``artist`` (the curator, e.g. "Spotify"),
+    albums have ``artist``, tracks have it inside ``track_metadata``.
+    Returns an empty string when nothing useful is available.
+    """
+    md = _smapi_metadata(item)
+    val = md.get("artist") or md.get("creator")
+    if not val:
+        val = _smapi_track_metadata(md).get("artist")
+    return str(val) if val else ""
+
+
+def _smapi_item_duration(item: Any) -> float:
+    """Duration in seconds for a SMAPI track result, or 0.0.
+
+    Only tracks carry duration — playlists/albums are containers.
+    """
+    tm = _smapi_track_metadata(_smapi_metadata(item))
+    dur = tm.get("duration")
+    if isinstance(dur, int | float):
+        return float(dur)
+    return 0.0
+
+
 def _smapi_result_to_music_item(
     item: Any, kind: MusicItemKind, service_name: str,
 ) -> MusicItem:
@@ -214,26 +352,23 @@ def _smapi_result_to_music_item(
 
     SMAPI results carry an opaque ``item_id`` that has to be resolved to
     a playable URI via ``sonos_uri_from_id`` later — ``uri`` is left empty
-    here on purpose.
+    here on purpose. Artwork, artist, and duration are pulled from the
+    result's ``metadata`` dict (shape varies by kind; see helpers).
     """
+    md = _smapi_metadata(item)
     title = (
         getattr(item, "title", "")
-        or item.get("title", "")
-        if isinstance(item, dict)
-        else getattr(item, "title", "")
+        or md.get("title")
+        or "(unknown)"
     )
-    subtitle = ""
-    for attr in ("creator", "author", "artist", "album"):
-        val = getattr(item, attr, None)
-        if val:
-            subtitle = str(val)
-            break
     return MusicItem(
         id=_item_id(item),
-        title=str(title or "(unknown)"),
+        title=str(title),
         kind=kind,
-        subtitle=subtitle,
+        subtitle=_smapi_item_subtitle(item),
         uri="",
+        album_art_url=_smapi_item_art(item),
+        duration_seconds=_smapi_item_duration(item),
         service=service_name,
     )
 
@@ -534,10 +669,21 @@ class SonosMusic(MusicBackend):
         if not item.id:
             raise ValueError(f"MusicItem has no uri and no id: {item.title}")
 
-        # Fast path for Spotify: the SMAPI item id embeds the canonical
-        # ``spotify:<kind>:<id>`` URI. Handing that straight through to
-        # the speaker backend lets it build a real ``x-sonos-spotify:``
-        # URI, which is the shape Sonos' AVTransport actually accepts.
+        # Fast path for Spotify containers (playlists/albums/artists):
+        # ``SetAVTransportURI`` with a container URI silently no-ops —
+        # the transport accepts the call but no audio plays. Route
+        # containers through an ``x-rincon-cpcontainer:`` URI plus a
+        # DIDL envelope that the speaker backend will enqueue via
+        # ``AddURIToQueue`` and then ``play_from_queue``.
+        kind = _spotify_kind(item.id)
+        if kind is not None and kind in _SPOTIFY_CONTAINER_CLASS:
+            return _build_spotify_container_playable(item, kind)
+
+        # Fast path for Spotify single items (tracks/episodes/shows):
+        # the SMAPI item id embeds the canonical ``spotify:<kind>:<id>``
+        # URI. Handing that straight through to the speaker backend
+        # lets it build a real ``x-sonos-spotify:`` URI, which is the
+        # shape Sonos' AVTransport actually accepts for single items.
         # ``sonos_uri_from_id`` returns ``soco://...``, which modern
         # firmware rejects as "Illegal MIME-Type" (UPnP 714).
         spotify_uri = _extract_spotify_uri(item.id)

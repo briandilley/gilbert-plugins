@@ -166,12 +166,50 @@ def _to_sonos_spotify_uri(spotify_uri: str, sn: int = 0) -> str:
     Builds the URI with the correct service ID, flags, and serial number
     for the local Sonos system's linked Spotify account.  SoCo's
     ``play_uri`` will generate appropriate metadata from the title arg.
+
+    Only valid for *single items* (tracks, episodes, shows). Spotify
+    containers (playlists, albums, artists) must be routed through
+    ``_play_container`` instead — see ``sonos_music._build_spotify_container_playable``
+    for the upstream construction and ``_play_container`` for the
+    AVTransport queue-playback path.
     """
     from soco.music_services import MusicService
 
     svc = MusicService("Spotify")
     encoded = spotify_uri.replace(":", "%3a")
     return f"x-sonos-spotify:{encoded}?sid={svc.service_id}&flags=8232&sn={sn}"
+
+
+def _play_container(coordinator: SoCo, uri: str, didl: str) -> None:
+    """Play a container URI (Spotify playlist/album/artist) via the queue.
+
+    Clears the current queue, enqueues the container with its DIDL-Lite
+    envelope, and plays from the first newly-enqueued track. This is the
+    *only* path that works for Spotify containers: handing a container
+    URI to ``SetAVTransportURI`` silently no-ops — the transport accepts
+    the call and Sonos logs it as successful, but no audio plays because
+    the container URI without queue context gives Sonos no track to
+    start on. ``AddURIToQueue`` with the proper container DIDL tells
+    Sonos to expand the container into individual tracks on the queue,
+    and ``play_from_queue`` then plays the first one.
+    """
+    if not didl:
+        raise ValueError(
+            f"Container URI requires DIDL metadata; got empty didl_meta for {uri}",
+        )
+    coordinator.clear_queue()
+    response = coordinator.avTransport.AddURIToQueue(
+        [
+            ("InstanceID", 0),
+            ("EnqueuedURI", uri),
+            ("EnqueuedURIMetaData", didl),
+            ("DesiredFirstTrackNumberEnqueued", 0),
+            ("EnqueueAsNext", 0),
+        ],
+    )
+    first = int(response.get("FirstTrackNumberEnqueued", "1"))
+    # FirstTrackNumberEnqueued is 1-based; play_from_queue takes 0-based.
+    coordinator.play_from_queue(first - 1)
 
 
 class SonosSpeaker(SpeakerBackend):
@@ -292,18 +330,39 @@ class SonosSpeaker(SpeakerBackend):
         if "open.spotify.com/" in uri:
             uri = _spotify_url_to_uri(uri)
 
-        if uri.startswith("spotify:"):
-            uri = await asyncio.to_thread(_to_sonos_spotify_uri, uri, self._spotify_sn)
-        try:
-            if request.didl_meta:
+        # Container URIs (Spotify playlists/albums/artists from the music
+        # backend's resolve_playable) must be enqueued, not handed to
+        # SetAVTransportURI directly — Sonos silently accepts the direct
+        # call and plays nothing. Route them through the queue path.
+        if uri.startswith("x-rincon-cpcontainer:"):
+            try:
                 await asyncio.to_thread(
-                    coordinator.play_uri, uri, meta=request.didl_meta, title=title,
+                    _play_container, coordinator, uri, request.didl_meta,
                 )
-            else:
-                await asyncio.to_thread(coordinator.play_uri, uri, title=title)
-        except Exception:
-            logger.exception("Sonos play_uri failed: uri=%s speaker=%s", uri, coordinator.player_name)
-            raise
+            except Exception:
+                logger.exception(
+                    "Sonos container playback failed: uri=%s speaker=%s",
+                    uri, coordinator.player_name,
+                )
+                raise
+        else:
+            if uri.startswith("spotify:"):
+                uri = await asyncio.to_thread(
+                    _to_sonos_spotify_uri, uri, self._spotify_sn,
+                )
+            try:
+                if request.didl_meta:
+                    await asyncio.to_thread(
+                        coordinator.play_uri, uri, meta=request.didl_meta, title=title,
+                    )
+                else:
+                    await asyncio.to_thread(coordinator.play_uri, uri, title=title)
+            except Exception:
+                logger.exception(
+                    "Sonos play_uri failed: uri=%s speaker=%s",
+                    uri, coordinator.player_name,
+                )
+                raise
 
         # Seek to position if requested
         if request.position_seconds is not None and request.position_seconds > 0:
