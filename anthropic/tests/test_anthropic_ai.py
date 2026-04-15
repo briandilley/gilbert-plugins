@@ -602,3 +602,427 @@ async def test_generate_raises_when_not_initialized(backend: AnthropicAI) -> Non
     request = AIRequest(messages=[Message(role=MessageRole.USER, content="Test")])
     with pytest.raises(RuntimeError, match="not initialized"):
         await backend.generate(request)
+
+
+# --- Dangling tool_use heal ---
+
+
+def test_dangling_tool_use_merged_into_next_user_message() -> None:
+    """An assistant tool_use with no tool_result and a following plain
+    user message must get synthetic tool_result blocks folded in."""
+    backend = AnthropicAI()
+    messages = [
+        Message(role=MessageRole.USER, content="make a PO"),
+        Message(
+            role=MessageRole.ASSISTANT,
+            content="I'll build it",
+            tool_calls=[
+                ToolCall(
+                    tool_call_id="toolu_orphan",
+                    tool_name="upload_document",
+                    arguments={"source": "local"},
+                )
+            ],
+        ),
+        # ← note: no TOOL_RESULT row. This is the pre-fix persisted shape.
+        Message(role=MessageRole.USER, content="actually, never mind"),
+    ]
+    result = backend._build_messages(messages)
+
+    # Expected: user / assistant / user — the dangling tool_use got paired
+    # via synthetic tool_result folded into the second user turn.
+    assert len(result) == 3
+    assert result[0]["role"] == "user"
+    assert result[1]["role"] == "assistant"
+    assert result[2]["role"] == "user"
+
+    # The assistant row still has its original tool_use block.
+    asst_blocks = result[1]["content"]
+    assert any(
+        isinstance(b, dict)
+        and b.get("type") == "tool_use"
+        and b.get("id") == "toolu_orphan"
+        for b in asst_blocks
+    )
+
+    # The next user message now starts with a synthetic tool_result
+    # pairing that id, followed by the user's actual text.
+    healed_user = result[2]["content"]
+    assert isinstance(healed_user, list)
+    assert healed_user[0]["type"] == "tool_result"
+    assert healed_user[0]["tool_use_id"] == "toolu_orphan"
+    assert healed_user[0].get("is_error") is True
+    assert any(
+        isinstance(b, dict) and b.get("type") == "text"
+        and b.get("text") == "actually, never mind"
+        for b in healed_user[1:]
+    )
+
+
+def test_dangling_tool_use_at_end_inserts_synthetic_user_turn() -> None:
+    """When the dangling tool_use is the last message and no user turn
+    follows, the heal appends a synthetic user turn so the final state
+    is a valid request shape."""
+    backend = AnthropicAI()
+    messages = [
+        Message(role=MessageRole.USER, content="make a PO"),
+        Message(
+            role=MessageRole.ASSISTANT,
+            content="",
+            tool_calls=[
+                ToolCall(
+                    tool_call_id="toolu_trailing",
+                    tool_name="run_script",
+                    arguments={},
+                )
+            ],
+        ),
+    ]
+    result = backend._build_messages(messages)
+
+    assert len(result) == 3
+    assert result[2]["role"] == "user"
+    assert result[2]["content"][0]["type"] == "tool_result"
+    assert result[2]["content"][0]["tool_use_id"] == "toolu_trailing"
+
+
+def test_well_formed_tool_use_tool_result_pair_untouched() -> None:
+    """The heal is a no-op on conversations that already pair every
+    tool_use with a tool_result — regression guard."""
+    backend = AnthropicAI()
+    messages = [
+        Message(role=MessageRole.USER, content="weather?"),
+        Message(
+            role=MessageRole.ASSISTANT,
+            content="",
+            tool_calls=[
+                ToolCall(
+                    tool_call_id="toolu_ok",
+                    tool_name="get_weather",
+                    arguments={"city": "Portland"},
+                )
+            ],
+        ),
+        Message(
+            role=MessageRole.TOOL_RESULT,
+            tool_results=[
+                ToolResult(
+                    tool_call_id="toolu_ok",
+                    content='{"temp": 72}',
+                )
+            ],
+        ),
+        Message(role=MessageRole.ASSISTANT, content="It's 72."),
+    ]
+    result = backend._build_messages(messages)
+    # user, assistant (tool_use), user (tool_result), assistant (text)
+    assert [m["role"] for m in result] == ["user", "assistant", "user", "assistant"]
+    # No synthetic injected — the tool_result on the user row is the
+    # real one the service produced, content is "{\"temp\": 72}".
+    tr_block = result[2]["content"][0]
+    assert tr_block["tool_use_id"] == "toolu_ok"
+    assert tr_block["content"] == '{"temp": 72}'
+    assert "is_error" not in tr_block
+
+
+# --- Capabilities ---
+
+
+def test_capabilities_reports_streaming_and_attachments() -> None:
+    backend = AnthropicAI()
+    caps = backend.capabilities()
+    assert caps.streaming is True
+    assert caps.attachments_user is True
+
+
+# --- Streaming (generate_stream via mocked SSE) ---
+
+
+class _FakeStreamResponse:
+    """Minimal async-context-manager stand-in for httpx streaming response.
+
+    Lets tests feed a canned sequence of SSE lines (as a list[str]) into
+    ``generate_stream`` without spinning up a real httpx transport. Fans
+    out the lines one per ``aiter_lines`` step. The blank-line event
+    delimiters are part of the input so the parser's state machine sees
+    the same shape it would off the wire.
+    """
+
+    def __init__(self, lines: list[str], status_code: int = 200) -> None:
+        self._lines = lines
+        self.status_code = status_code
+        self.is_error = status_code >= 400
+        self._body_bytes = b""
+
+    async def __aenter__(self) -> "_FakeStreamResponse":
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        return None
+
+    async def aiter_lines(self):  # type: ignore[no-untyped-def]
+        for line in self._lines:
+            yield line
+
+    async def aread(self) -> bytes:
+        return self._body_bytes
+
+
+def _sse(event: str, data: dict) -> list[str]:
+    import json as _j
+
+    return [f"event: {event}", f"data: {_j.dumps(data)}", ""]
+
+
+async def test_generate_stream_text_deltas_and_complete(backend: AnthropicAI) -> None:
+    """SSE text_delta events become StreamEventType.TEXT_DELTA, and the
+    final MESSAGE_COMPLETE carries the assembled AIResponse."""
+    from gilbert.interfaces.ai import StreamEventType
+
+    await backend.initialize({"api_key": "sk-test"})
+    assert backend._client is not None
+
+    lines: list[str] = []
+    lines += _sse(
+        "message_start",
+        {
+            "type": "message_start",
+            "message": {
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": "claude-sonnet-4-6",
+                "stop_reason": None,
+                "usage": {"input_tokens": 12, "output_tokens": 0},
+            },
+        },
+    )
+    lines += _sse(
+        "content_block_start",
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        },
+    )
+    lines += _sse(
+        "content_block_delta",
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "Hello "},
+        },
+    )
+    lines += _sse(
+        "content_block_delta",
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "world"},
+        },
+    )
+    lines += _sse(
+        "content_block_stop",
+        {"type": "content_block_stop", "index": 0},
+    )
+    lines += _sse(
+        "message_delta",
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+            "usage": {"output_tokens": 3},
+        },
+    )
+    lines += _sse("message_stop", {"type": "message_stop"})
+
+    fake = _FakeStreamResponse(lines)
+    backend._client.stream = MagicMock(return_value=fake)  # type: ignore[method-assign]
+
+    events = []
+    async for ev in backend.generate_stream(
+        AIRequest(messages=[Message(role=MessageRole.USER, content="hi")])
+    ):
+        events.append(ev)
+
+    text_events = [e for e in events if e.type == StreamEventType.TEXT_DELTA]
+    assert [e.text for e in text_events] == ["Hello ", "world"]
+
+    completes = [e for e in events if e.type == StreamEventType.MESSAGE_COMPLETE]
+    assert len(completes) == 1
+    final = completes[0].response
+    assert final is not None
+    assert final.message.content == "Hello world"
+    assert final.stop_reason == StopReason.END_TURN
+    assert final.usage is not None
+    assert final.usage.input_tokens == 12
+    assert final.usage.output_tokens == 3
+
+    await backend.close()
+
+
+async def test_generate_stream_tool_use_reassembly(backend: AnthropicAI) -> None:
+    """tool_use blocks are assembled from partial_json deltas so the
+    final AIResponse carries complete ToolCall arguments."""
+    from gilbert.interfaces.ai import StreamEventType
+
+    await backend.initialize({"api_key": "sk-test"})
+    assert backend._client is not None
+
+    lines: list[str] = []
+    lines += _sse(
+        "message_start",
+        {
+            "type": "message_start",
+            "message": {
+                "id": "msg_2",
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": "claude-sonnet-4-6",
+                "stop_reason": None,
+                "usage": {"input_tokens": 20, "output_tokens": 0},
+            },
+        },
+    )
+    lines += _sse(
+        "content_block_start",
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "tool_use",
+                "id": "toolu_01",
+                "name": "get_weather",
+                "input": {},
+            },
+        },
+    )
+    lines += _sse(
+        "content_block_delta",
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": '{"city": "Portl'},
+        },
+    )
+    lines += _sse(
+        "content_block_delta",
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": 'and"}'},
+        },
+    )
+    lines += _sse(
+        "content_block_stop",
+        {"type": "content_block_stop", "index": 0},
+    )
+    lines += _sse(
+        "message_delta",
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+            "usage": {"output_tokens": 8},
+        },
+    )
+    lines += _sse("message_stop", {"type": "message_stop"})
+
+    fake = _FakeStreamResponse(lines)
+    backend._client.stream = MagicMock(return_value=fake)  # type: ignore[method-assign]
+
+    events = []
+    async for ev in backend.generate_stream(
+        AIRequest(messages=[Message(role=MessageRole.USER, content="weather?")])
+    ):
+        events.append(ev)
+
+    # Start/delta/end events for the tool call
+    starts = [e for e in events if e.type == StreamEventType.TOOL_CALL_START]
+    deltas = [e for e in events if e.type == StreamEventType.TOOL_CALL_DELTA]
+    ends = [e for e in events if e.type == StreamEventType.TOOL_CALL_END]
+    assert len(starts) == 1
+    assert starts[0].tool_call_id == "toolu_01"
+    assert starts[0].tool_name == "get_weather"
+    assert len(deltas) == 2
+    assert len(ends) == 1
+
+    # Final assembled response
+    completes = [e for e in events if e.type == StreamEventType.MESSAGE_COMPLETE]
+    assert len(completes) == 1
+    final = completes[0].response
+    assert final is not None
+    assert final.stop_reason == StopReason.TOOL_USE
+    assert len(final.message.tool_calls) == 1
+    tc = final.message.tool_calls[0]
+    assert tc.tool_call_id == "toolu_01"
+    assert tc.tool_name == "get_weather"
+    assert tc.arguments == {"city": "Portland"}
+
+    await backend.close()
+
+
+async def test_generate_stream_max_tokens_stop_reason(backend: AnthropicAI) -> None:
+    """A max_tokens SSE stop reason translates to StopReason.MAX_TOKENS."""
+    from gilbert.interfaces.ai import StreamEventType
+
+    await backend.initialize({"api_key": "sk-test"})
+    assert backend._client is not None
+
+    lines = []
+    lines += _sse(
+        "message_start",
+        {
+            "type": "message_start",
+            "message": {
+                "id": "msg_3",
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": "claude-sonnet-4-6",
+                "stop_reason": None,
+                "usage": {"input_tokens": 5, "output_tokens": 0},
+            },
+        },
+    )
+    lines += _sse(
+        "content_block_start",
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        },
+    )
+    lines += _sse(
+        "content_block_delta",
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "truncated"},
+        },
+    )
+    lines += _sse(
+        "message_delta",
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "max_tokens", "stop_sequence": None},
+            "usage": {"output_tokens": 4096},
+        },
+    )
+    lines += _sse("message_stop", {"type": "message_stop"})
+
+    fake = _FakeStreamResponse(lines)
+    backend._client.stream = MagicMock(return_value=fake)  # type: ignore[method-assign]
+
+    final_response = None
+    async for ev in backend.generate_stream(
+        AIRequest(messages=[Message(role=MessageRole.USER, content="long answer")])
+    ):
+        if ev.type == StreamEventType.MESSAGE_COMPLETE:
+            final_response = ev.response
+
+    assert final_response is not None
+    assert final_response.stop_reason == StopReason.MAX_TOKENS
+    assert final_response.message.content == "truncated"
+
+    await backend.close()

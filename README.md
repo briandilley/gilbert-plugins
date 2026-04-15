@@ -50,8 +50,10 @@ Claude-powered AI chat and vision backends, speaking the Anthropic Messages API 
 **Configure** (Settings → AI and Settings → Vision)
 - `api_key` *(sensitive)* — Anthropic API key (`sk-ant-…`).
 - `model` — Claude model ID (default `claude-sonnet-4-20250514` for chat, `claude-sonnet-4-5-20250929` for vision).
-- `max_tokens` — Per-response cap.
+- `max_tokens` — Per-response cap (default `16384`). Sonnet/Opus 4.x comfortably support higher; the AIService recovers from a `max_tokens` cut-off on a text-only response via bounded continuation, but a `tool_use` that gets truncated mid-JSON is unrecoverable, so keep this comfortably above the largest tool input you expect.
 - `temperature` — Sampling temperature (chat only).
+
+**Streaming.** The chat backend implements `generate_stream` over SSE — `AIService` forwards each text chunk as a `chat.stream.text_delta` event on the bus, plus `chat.stream.round_complete` after every AI round and `chat.stream.turn_complete` at the end. The WS layer delivers them to the conversation's audience (owner for personal chats, members for shared rooms). The frontend's `TurnBubble` builds a live "thinking card" inside the in-flight turn from those events plus `chat.tool.started` / `chat.tool.completed`, and commits to the authoritative round structure when the `chat.message.send` RPC resolves with the server's `rounds` field. All Anthropic-specific SSE parsing stays inside `anthropic_ai.py`; `capabilities()` reports `streaming=True, attachments_user=True`.
 
 **Config action** — `test_connection`: issues a one-token completion to verify credentials.
 
