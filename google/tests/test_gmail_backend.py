@@ -14,9 +14,9 @@ from email.message import Message
 from typing import Any
 
 import pytest
+from gilbert_plugin_google.gmail import GmailBackend
 
 from gilbert.interfaces.email import EmailAddress
-from gilbert_plugin_google.gmail import GmailBackend
 
 
 class _FakeSendRequest:

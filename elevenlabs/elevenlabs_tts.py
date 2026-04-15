@@ -51,12 +51,12 @@ _DEFAULT_CACHE_TTL_SECONDS = 1800  # 30 minutes
 # If any of these fields differ, the backend will produce different
 # output and the cache entry should not be shared.
 _CacheKey = tuple[
-    str,    # voice_id
-    str,    # output_format value
-    str,    # model_id
-    str,    # text
-    float | None,   # stability
-    float | None,   # similarity_boost
+    str,  # voice_id
+    str,  # output_format value
+    str,  # model_id
+    str,  # text
+    float | None,  # stability
+    float | None,  # similarity_boost
     float,  # speed
 ]
 
@@ -81,22 +81,27 @@ class ElevenLabsTTS(TTSBackend):
     def backend_config_params(cls) -> list[ConfigParam]:
         return [
             ConfigParam(
-                key="api_key", type=ToolParameterType.STRING,
+                key="api_key",
+                type=ToolParameterType.STRING,
                 description="ElevenLabs API key.",
-                sensitive=True, restart_required=True,
+                sensitive=True,
+                restart_required=True,
             ),
             ConfigParam(
-                key="voice_id", type=ToolParameterType.STRING,
+                key="voice_id",
+                type=ToolParameterType.STRING,
                 description="ElevenLabs voice ID for speech synthesis.",
                 restart_required=True,
             ),
             ConfigParam(
-                key="model_id", type=ToolParameterType.STRING,
+                key="model_id",
+                type=ToolParameterType.STRING,
                 description="ElevenLabs model ID.",
                 default="eleven_turbo_v2_5",
             ),
             ConfigParam(
-                key="cache_max_entries", type=ToolParameterType.INTEGER,
+                key="cache_max_entries",
+                type=ToolParameterType.INTEGER,
                 description=(
                     "Maximum number of synthesis results to keep in the "
                     "in-memory LRU cache. Identical requests return the "
@@ -106,7 +111,8 @@ class ElevenLabsTTS(TTSBackend):
                 default=_DEFAULT_CACHE_MAX_ENTRIES,
             ),
             ConfigParam(
-                key="cache_ttl_seconds", type=ToolParameterType.INTEGER,
+                key="cache_ttl_seconds",
+                type=ToolParameterType.INTEGER,
                 description=(
                     "How long a cached synthesis result stays valid (in "
                     "seconds). After this, the entry is evicted on next "
@@ -125,14 +131,15 @@ class ElevenLabsTTS(TTSBackend):
                 key="test_connection",
                 label="Test connection",
                 description=(
-                    "Verify the ElevenLabs API key works by listing the "
-                    "available voices."
+                    "Verify the ElevenLabs API key works by listing the available voices."
                 ),
             ),
         ]
 
     async def invoke_backend_action(
-        self, key: str, payload: dict,
+        self,
+        key: str,
+        payload: dict,
     ) -> ConfigActionResult:
         if key == "test_connection":
             return await self._action_test_connection()
@@ -403,4 +410,3 @@ class ElevenLabsTTS(TTSBackend):
         if self._client is None:
             raise RuntimeError("ElevenLabs TTS not initialized — call initialize() first")
         return self._client
-

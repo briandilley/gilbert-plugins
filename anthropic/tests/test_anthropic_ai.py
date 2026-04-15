@@ -65,14 +65,16 @@ def test_build_messages_user() -> None:
 
 def test_build_messages_user_with_image_attachment() -> None:
     backend = AnthropicAI()
-    messages = [Message(
-        role=MessageRole.USER,
-        content="what is this?",
-        attachments=[
-            FileAttachment(kind="image", media_type="image/png", data="AAAA"),
-            FileAttachment(kind="image", media_type="image/jpeg", data="BBBB"),
-        ],
-    )]
+    messages = [
+        Message(
+            role=MessageRole.USER,
+            content="what is this?",
+            attachments=[
+                FileAttachment(kind="image", media_type="image/png", data="AAAA"),
+                FileAttachment(kind="image", media_type="image/jpeg", data="BBBB"),
+            ],
+        )
+    ]
     result = backend._build_messages(messages)
     assert len(result) == 1
     assert result[0]["role"] == "user"
@@ -91,13 +93,15 @@ def test_build_messages_user_with_image_attachment() -> None:
 
 def test_build_messages_user_image_without_text() -> None:
     backend = AnthropicAI()
-    messages = [Message(
-        role=MessageRole.USER,
-        content="",
-        attachments=[
-            FileAttachment(kind="image", media_type="image/png", data="AAAA"),
-        ],
-    )]
+    messages = [
+        Message(
+            role=MessageRole.USER,
+            content="",
+            attachments=[
+                FileAttachment(kind="image", media_type="image/png", data="AAAA"),
+            ],
+        )
+    ]
     result = backend._build_messages(messages)
     content = result[0]["content"]
     assert isinstance(content, list)
@@ -107,16 +111,20 @@ def test_build_messages_user_image_without_text() -> None:
 
 def test_build_messages_user_with_document_attachment() -> None:
     backend = AnthropicAI()
-    messages = [Message(
-        role=MessageRole.USER,
-        content="summarize",
-        attachments=[
-            FileAttachment(
-                kind="document", name="report.pdf",
-                media_type="application/pdf", data="PDFBYTES",
-            ),
-        ],
-    )]
+    messages = [
+        Message(
+            role=MessageRole.USER,
+            content="summarize",
+            attachments=[
+                FileAttachment(
+                    kind="document",
+                    name="report.pdf",
+                    media_type="application/pdf",
+                    data="PDFBYTES",
+                ),
+            ],
+        )
+    ]
     result = backend._build_messages(messages)
     content = result[0]["content"]
     assert content[0] == {
@@ -132,16 +140,20 @@ def test_build_messages_user_with_document_attachment() -> None:
 
 def test_build_messages_user_with_text_attachment() -> None:
     backend = AnthropicAI()
-    messages = [Message(
-        role=MessageRole.USER,
-        content="explain",
-        attachments=[
-            FileAttachment(
-                kind="text", name="notes.md",
-                media_type="text/markdown", text="# hello world",
-            ),
-        ],
-    )]
+    messages = [
+        Message(
+            role=MessageRole.USER,
+            content="explain",
+            attachments=[
+                FileAttachment(
+                    kind="text",
+                    name="notes.md",
+                    media_type="text/markdown",
+                    text="# hello world",
+                ),
+            ],
+        )
+    ]
     result = backend._build_messages(messages)
     content = result[0]["content"]
     assert content[0] == {"type": "text", "text": "## notes.md\n\n# hello world"}
@@ -150,21 +162,27 @@ def test_build_messages_user_with_text_attachment() -> None:
 
 def test_build_messages_mixed_attachment_ordering() -> None:
     backend = AnthropicAI()
-    messages = [Message(
-        role=MessageRole.USER,
-        content="compare",
-        attachments=[
-            FileAttachment(
-                kind="text", name="notes.md",
-                media_type="text/markdown", text="text body",
-            ),
-            FileAttachment(
-                kind="document", name="r.pdf",
-                media_type="application/pdf", data="PDF",
-            ),
-            FileAttachment(kind="image", media_type="image/png", data="IMG"),
-        ],
-    )]
+    messages = [
+        Message(
+            role=MessageRole.USER,
+            content="compare",
+            attachments=[
+                FileAttachment(
+                    kind="text",
+                    name="notes.md",
+                    media_type="text/markdown",
+                    text="text body",
+                ),
+                FileAttachment(
+                    kind="document",
+                    name="r.pdf",
+                    media_type="application/pdf",
+                    data="PDF",
+                ),
+                FileAttachment(kind="image", media_type="image/png", data="IMG"),
+            ],
+        )
+    ]
     result = backend._build_messages(messages)
     content = result[0]["content"]
     # Order is image, document, text, user prompt — regardless of the
@@ -184,15 +202,19 @@ def test_build_messages_assistant_text_only() -> None:
 
 def test_build_messages_assistant_with_tool_calls() -> None:
     backend = AnthropicAI()
-    messages = [Message(
-        role=MessageRole.ASSISTANT,
-        content="Let me check.",
-        tool_calls=[ToolCall(
-            tool_call_id="tc_1",
-            tool_name="search",
-            arguments={"q": "test"},
-        )],
-    )]
+    messages = [
+        Message(
+            role=MessageRole.ASSISTANT,
+            content="Let me check.",
+            tool_calls=[
+                ToolCall(
+                    tool_call_id="tc_1",
+                    tool_name="search",
+                    arguments={"q": "test"},
+                )
+            ],
+        )
+    ]
     result = backend._build_messages(messages)
     content = result[0]["content"]
     assert len(content) == 2
@@ -207,13 +229,15 @@ def test_build_messages_assistant_with_tool_calls() -> None:
 
 def test_build_messages_tool_result() -> None:
     backend = AnthropicAI()
-    messages = [Message(
-        role=MessageRole.TOOL_RESULT,
-        tool_results=[
-            ToolResult(tool_call_id="tc_1", content="found it"),
-            ToolResult(tool_call_id="tc_2", content="failed", is_error=True),
-        ],
-    )]
+    messages = [
+        Message(
+            role=MessageRole.TOOL_RESULT,
+            tool_results=[
+                ToolResult(tool_call_id="tc_1", content="found it"),
+                ToolResult(tool_call_id="tc_2", content="failed", is_error=True),
+            ],
+        )
+    ]
     result = backend._build_messages(messages)
     assert result[0]["role"] == "user"
     content = result[0]["content"]
@@ -466,16 +490,20 @@ def test_build_messages_splits_slash_command_combined_row(backend: AnthropicAI) 
         Message(
             role=MessageRole.ASSISTANT,
             content="Here's your recap...",
-            tool_calls=[ToolCall(
-                tool_call_id="slash-abc123",
-                tool_name="time_logs_recap",
-                arguments={"days": 7},
-            )],
-            tool_results=[ToolResult(
-                tool_call_id="slash-abc123",
-                content="Recap: 7 days...",
-                is_error=False,
-            )],
+            tool_calls=[
+                ToolCall(
+                    tool_call_id="slash-abc123",
+                    tool_name="time_logs_recap",
+                    arguments={"days": 7},
+                )
+            ],
+            tool_results=[
+                ToolResult(
+                    tool_call_id="slash-abc123",
+                    content="Recap: 7 days...",
+                    is_error=False,
+                )
+            ],
         ),
         Message(role=MessageRole.USER, content="show me more"),
     ]
@@ -516,16 +544,20 @@ def test_build_messages_splits_slash_command_error_row(backend: AnthropicAI) -> 
         Message(
             role=MessageRole.ASSISTANT,
             content="",  # tool returned no text
-            tool_calls=[ToolCall(
-                tool_call_id="slash-deadbeef",
-                tool_name="bad_tool",
-                arguments={},
-            )],
-            tool_results=[ToolResult(
-                tool_call_id="slash-deadbeef",
-                content="boom",
-                is_error=True,
-            )],
+            tool_calls=[
+                ToolCall(
+                    tool_call_id="slash-deadbeef",
+                    tool_name="bad_tool",
+                    arguments={},
+                )
+            ],
+            tool_results=[
+                ToolResult(
+                    tool_call_id="slash-deadbeef",
+                    content="boom",
+                    is_error=True,
+                )
+            ],
         ),
     ]
 

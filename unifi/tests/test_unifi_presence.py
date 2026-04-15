@@ -3,20 +3,19 @@
 from unittest.mock import AsyncMock
 
 import pytest
-
-from gilbert.config import GilbertConfig
 from gilbert_plugin_unifi.access import BadgeEvent, UniFiAccess, _classify_direction
+from gilbert_plugin_unifi.name_resolver import NameResolver, _compute_similarity, _tokenize
 from gilbert_plugin_unifi.network import (
     UniFiNetwork,
     WifiClient,
     extract_person_from_device_name,
     extract_person_from_hostname,
 )
-from gilbert_plugin_unifi.name_resolver import NameResolver, _compute_similarity, _tokenize
 from gilbert_plugin_unifi.presence import UniFiPresenceBackend, _epoch_ms_to_iso
-from gilbert_plugin_unifi.protect import UniFiProtect, FaceDetection
-from gilbert.interfaces.presence import PresenceState
+from gilbert_plugin_unifi.protect import FaceDetection, UniFiProtect
 
+from gilbert.config import GilbertConfig
+from gilbert.interfaces.presence import PresenceState
 
 # =============================================================================
 # Name extraction tests
@@ -115,29 +114,47 @@ def backend() -> UniFiPresenceBackend:
 
 def _badge(name: str, direction: str, ts: int = 1700000000000) -> BadgeEvent:
     return BadgeEvent(
-        event_id="e1", person_name=name, direction=direction,
-        door_name="Front Door", timestamp=ts,
+        event_id="e1",
+        person_name=name,
+        direction=direction,
+        door_name="Front Door",
+        timestamp=ts,
     )
 
 
 def _face(name: str, ts: int = 1700000000000) -> FaceDetection:
     return FaceDetection(
-        person_name=name, camera_name="Lobby Cam", timestamp=ts, confidence=90,
+        person_name=name,
+        camera_name="Lobby Cam",
+        timestamp=ts,
+        confidence=90,
     )
 
 
 def _wifi(name: str, last_seen: str = "1700000000") -> dict[str, list[WifiClient]]:
-    return {name: [WifiClient(
-        mac="aa:bb:cc:dd:ee:ff", hostname="device", device_name=f"{name}'s Phone",
-        person=name, rssi=-50, ap_name="AP1", last_seen=last_seen, is_wired=False,
-    )]}
+    return {
+        name: [
+            WifiClient(
+                mac="aa:bb:cc:dd:ee:ff",
+                hostname="device",
+                device_name=f"{name}'s Phone",
+                person=name,
+                rssi=-50,
+                ap_name="AP1",
+                last_seen=last_seen,
+                is_wired=False,
+            )
+        ]
+    }
 
 
 class TestAggregation:
     async def test_badge_in_yields_present(self, backend: UniFiPresenceBackend) -> None:
-        backend._access.get_badge_events = AsyncMock(return_value=[
-            _badge("Brian", "in"),
-        ])
+        backend._access.get_badge_events = AsyncMock(
+            return_value=[
+                _badge("Brian", "in"),
+            ]
+        )
         result = await backend.get_all_presence()
         assert len(result) == 1
         assert result[0].user_id == "brian"
@@ -145,18 +162,22 @@ class TestAggregation:
         assert result[0].source == "unifi:access"
 
     async def test_badge_out_yields_away(self, backend: UniFiPresenceBackend) -> None:
-        backend._access.get_badge_events = AsyncMock(return_value=[
-            _badge("Brian", "out"),
-        ])
+        backend._access.get_badge_events = AsyncMock(
+            return_value=[
+                _badge("Brian", "out"),
+            ]
+        )
         result = await backend.get_all_presence()
         assert len(result) == 1
         assert result[0].state == PresenceState.AWAY
         assert result[0].source == "unifi:access"
 
     async def test_face_yields_present(self, backend: UniFiPresenceBackend) -> None:
-        backend._protect.get_face_detections = AsyncMock(return_value=[
-            _face("Dale"),
-        ])
+        backend._protect.get_face_detections = AsyncMock(
+            return_value=[
+                _face("Dale"),
+            ]
+        )
         result = await backend.get_all_presence()
         assert len(result) == 1
         assert result[0].user_id == "dale"
@@ -177,21 +198,27 @@ class TestAggregation:
         assert result == []
 
     async def test_badge_out_overrides_face(self, backend: UniFiPresenceBackend) -> None:
-        backend._access.get_badge_events = AsyncMock(return_value=[
-            _badge("Brian", "out", ts=1700000002000),
-        ])
-        backend._protect.get_face_detections = AsyncMock(return_value=[
-            _face("Brian", ts=1700000001000),
-        ])
+        backend._access.get_badge_events = AsyncMock(
+            return_value=[
+                _badge("Brian", "out", ts=1700000002000),
+            ]
+        )
+        backend._protect.get_face_detections = AsyncMock(
+            return_value=[
+                _face("Brian", ts=1700000001000),
+            ]
+        )
         result = await backend.get_all_presence()
         brian = [r for r in result if r.user_id == "brian"]
         assert len(brian) == 1
         assert brian[0].state == PresenceState.AWAY
 
     async def test_badge_in_overrides_wifi(self, backend: UniFiPresenceBackend) -> None:
-        backend._access.get_badge_events = AsyncMock(return_value=[
-            _badge("Brian", "in"),
-        ])
+        backend._access.get_badge_events = AsyncMock(
+            return_value=[
+                _badge("Brian", "in"),
+            ]
+        )
         backend._network.get_people_on_network = AsyncMock(return_value=_wifi("Brian"))
         result = await backend.get_all_presence()
         brian = [r for r in result if r.user_id == "brian"]
@@ -199,9 +226,11 @@ class TestAggregation:
         assert brian[0].state == PresenceState.PRESENT
 
     async def test_face_overrides_wifi(self, backend: UniFiPresenceBackend) -> None:
-        backend._protect.get_face_detections = AsyncMock(return_value=[
-            _face("Dale"),
-        ])
+        backend._protect.get_face_detections = AsyncMock(
+            return_value=[
+                _face("Dale"),
+            ]
+        )
         backend._network.get_people_on_network = AsyncMock(return_value=_wifi("Dale"))
         result = await backend.get_all_presence()
         dale = [r for r in result if r.user_id == "dale"]
@@ -210,12 +239,16 @@ class TestAggregation:
         assert dale[0].source == "unifi:protect"
 
     async def test_multiple_people(self, backend: UniFiPresenceBackend) -> None:
-        backend._access.get_badge_events = AsyncMock(return_value=[
-            _badge("Brian", "in"),
-        ])
-        backend._protect.get_face_detections = AsyncMock(return_value=[
-            _face("Dale"),
-        ])
+        backend._access.get_badge_events = AsyncMock(
+            return_value=[
+                _badge("Brian", "in"),
+            ]
+        )
+        backend._protect.get_face_detections = AsyncMock(
+            return_value=[
+                _face("Dale"),
+            ]
+        )
         backend._network.get_people_on_network = AsyncMock(return_value=_wifi("Matt"))
         result = await backend.get_all_presence()
         names = {r.user_id for r in result}
@@ -252,9 +285,11 @@ class TestGracefulDegradation:
 
 class TestGetPresence:
     async def test_known_user(self, backend: UniFiPresenceBackend) -> None:
-        backend._access.get_badge_events = AsyncMock(return_value=[
-            _badge("Brian", "in"),
-        ])
+        backend._access.get_badge_events = AsyncMock(
+            return_value=[
+                _badge("Brian", "in"),
+            ]
+        )
         result = await backend.get_presence("brian")
         assert result.state == PresenceState.PRESENT
 

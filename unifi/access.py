@@ -43,8 +43,10 @@ class UniFiAccess:
         if data is None:
             return []
 
-        raw_events: list[dict[str, Any]] = data.get("data", []) if isinstance(data, dict) else (
-            data if isinstance(data, list) else []
+        raw_events: list[dict[str, Any]] = (
+            data.get("data", [])
+            if isinstance(data, dict)
+            else (data if isinstance(data, list) else [])
         )
 
         events: list[BadgeEvent] = []
@@ -63,13 +65,15 @@ class UniFiAccess:
                 if timestamp < 1e12:  # seconds, not ms
                     timestamp = int(timestamp * 1000)
 
-            events.append(BadgeEvent(
-                event_id=e.get("id", e.get("_id", "")),
-                person_name=person_name,
-                direction=direction,
-                door_name=str(door_name),
-                timestamp=int(timestamp),
-            ))
+            events.append(
+                BadgeEvent(
+                    event_id=e.get("id", e.get("_id", "")),
+                    person_name=person_name,
+                    direction=direction,
+                    door_name=str(door_name),
+                    timestamp=int(timestamp),
+                )
+            )
 
         # Sort by timestamp descending (most recent first)
         events.sort(key=lambda ev: ev.timestamp, reverse=True)
@@ -95,10 +99,7 @@ class UniFiAccess:
                 latest_per_person[name_lower] = event
 
         # Filter to those whose latest event is "in"
-        return [
-            event for event in latest_per_person.values()
-            if event.direction == "in"
-        ]
+        return [event for event in latest_per_person.values() if event.direction == "in"]
 
     @staticmethod
     def _extract_person_name(event: dict[str, Any]) -> str:

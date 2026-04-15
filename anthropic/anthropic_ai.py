@@ -44,22 +44,27 @@ class AnthropicAI(AIBackend):
     def backend_config_params(cls) -> list[ConfigParam]:
         return [
             ConfigParam(
-                key="api_key", type=ToolParameterType.STRING,
+                key="api_key",
+                type=ToolParameterType.STRING,
                 description="Anthropic API key.",
-                sensitive=True, restart_required=True,
+                sensitive=True,
+                restart_required=True,
             ),
             ConfigParam(
-                key="model", type=ToolParameterType.STRING,
+                key="model",
+                type=ToolParameterType.STRING,
                 description="Model ID (e.g., claude-sonnet-4-20250514).",
                 default=_DEFAULT_MODEL,
             ),
             ConfigParam(
-                key="max_tokens", type=ToolParameterType.INTEGER,
+                key="max_tokens",
+                type=ToolParameterType.INTEGER,
                 description="Maximum tokens in AI response.",
                 default=4096,
             ),
             ConfigParam(
-                key="temperature", type=ToolParameterType.NUMBER,
+                key="temperature",
+                type=ToolParameterType.NUMBER,
                 description="Temperature (0.0 = deterministic, 1.0 = creative).",
                 default=0.7,
             ),
@@ -72,14 +77,15 @@ class AnthropicAI(AIBackend):
                 key="test_connection",
                 label="Test connection",
                 description=(
-                    "Send a tiny 'hi' message to the Anthropic API to "
-                    "verify the API key and model."
+                    "Send a tiny 'hi' message to the Anthropic API to verify the API key and model."
                 ),
             ),
         ]
 
     async def invoke_backend_action(
-        self, key: str, payload: dict,
+        self,
+        key: str,
+        payload: dict,
     ) -> ConfigActionResult:
         if key == "test_connection":
             return await self._action_test_connection()
@@ -153,7 +159,9 @@ class AnthropicAI(AIBackend):
 
         body = self._build_request_body(request)
 
-        ai_logger.debug("Anthropic request: model=%s messages=%d", self._model, len(body["messages"]))
+        ai_logger.debug(
+            "Anthropic request: model=%s messages=%d", self._model, len(body["messages"])
+        )
 
         resp = await self._client.post("/messages", json=body)
         if resp.is_error:
@@ -233,28 +241,34 @@ class AnthropicAI(AIBackend):
                     doc_atts = [a for a in msg.attachments if a.kind == "document"]
                     text_atts = [a for a in msg.attachments if a.kind == "text"]
                     for img in image_atts:
-                        user_content.append({
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": img.media_type,
-                                "data": img.data,
-                            },
-                        })
+                        user_content.append(
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": img.media_type,
+                                    "data": img.data,
+                                },
+                            }
+                        )
                     for doc in doc_atts:
-                        user_content.append({
-                            "type": "document",
-                            "source": {
-                                "type": "base64",
-                                "media_type": doc.media_type or "application/pdf",
-                                "data": doc.data,
-                            },
-                        })
+                        user_content.append(
+                            {
+                                "type": "document",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": doc.media_type or "application/pdf",
+                                    "data": doc.data,
+                                },
+                            }
+                        )
                     for txt in text_atts:
-                        user_content.append({
-                            "type": "text",
-                            "text": f"## {txt.name}\n\n{txt.text}",
-                        })
+                        user_content.append(
+                            {
+                                "type": "text",
+                                "text": f"## {txt.name}\n\n{txt.text}",
+                            }
+                        )
                     if msg.content:
                         user_content.append({"type": "text", "text": msg.content})
                     if not user_content:
@@ -276,18 +290,20 @@ class AnthropicAI(AIBackend):
                 # canonical 3-message sequence here. This also heals any
                 # historical conversations stored in the pre-fix shape.
                 if msg.tool_calls and msg.tool_results:
-                    result.append({
-                        "role": "assistant",
-                        "content": [
-                            {
-                                "type": "tool_use",
-                                "id": tc.tool_call_id,
-                                "name": tc.tool_name,
-                                "input": tc.arguments,
-                            }
-                            for tc in msg.tool_calls
-                        ],
-                    })
+                    result.append(
+                        {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": tc.tool_call_id,
+                                    "name": tc.tool_name,
+                                    "input": tc.arguments,
+                                }
+                                for tc in msg.tool_calls
+                            ],
+                        }
+                    )
                     tool_result_blocks: list[dict[str, Any]] = []
                     for tr in msg.tool_results:
                         tr_block: dict[str, Any] = {
@@ -304,24 +320,28 @@ class AnthropicAI(AIBackend):
                     # alternates correctly. Fall back to a short placeholder
                     # when the tool produced no text output (e.g. UI-block
                     # only) — an empty content array would be rejected.
-                    result.append({
-                        "role": "assistant",
-                        "content": [
-                            {"type": "text", "text": msg.content or "(done)"},
-                        ],
-                    })
+                    result.append(
+                        {
+                            "role": "assistant",
+                            "content": [
+                                {"type": "text", "text": msg.content or "(done)"},
+                            ],
+                        }
+                    )
                     continue
 
                 content: list[dict[str, Any]] = []
                 if msg.content:
                     content.append({"type": "text", "text": msg.content})
                 for tc in msg.tool_calls:
-                    content.append({
-                        "type": "tool_use",
-                        "id": tc.tool_call_id,
-                        "name": tc.tool_name,
-                        "input": tc.arguments,
-                    })
+                    content.append(
+                        {
+                            "type": "tool_use",
+                            "id": tc.tool_call_id,
+                            "name": tc.tool_name,
+                            "input": tc.arguments,
+                        }
+                    )
                 result.append({"role": "assistant", "content": content})
 
             elif msg.role == MessageRole.TOOL_RESULT:
@@ -362,11 +382,13 @@ class AnthropicAI(AIBackend):
             if block["type"] == "text":
                 content_text += block["text"]
             elif block["type"] == "tool_use":
-                tool_calls.append(ToolCall(
-                    tool_call_id=block["id"],
-                    tool_name=block["name"],
-                    arguments=block.get("input", {}),
-                ))
+                tool_calls.append(
+                    ToolCall(
+                        tool_call_id=block["id"],
+                        tool_name=block["name"],
+                        arguments=block.get("input", {}),
+                    )
+                )
 
         # Map Anthropic stop_reason to our enum
         raw_stop = data.get("stop_reason", "end_turn")

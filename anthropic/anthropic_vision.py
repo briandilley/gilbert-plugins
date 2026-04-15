@@ -27,17 +27,21 @@ class AnthropicVision(VisionBackend):
     def backend_config_params(cls) -> list[ConfigParam]:
         return [
             ConfigParam(
-                key="api_key", type=ToolParameterType.STRING,
+                key="api_key",
+                type=ToolParameterType.STRING,
                 description="Anthropic API key.",
-                sensitive=True, restart_required=True,
+                sensitive=True,
+                restart_required=True,
             ),
             ConfigParam(
-                key="model", type=ToolParameterType.STRING,
+                key="model",
+                type=ToolParameterType.STRING,
                 description="Vision model ID.",
                 default=_DEFAULT_MODEL,
             ),
             ConfigParam(
-                key="max_tokens", type=ToolParameterType.INTEGER,
+                key="max_tokens",
+                type=ToolParameterType.INTEGER,
                 description="Maximum tokens in vision response.",
                 default=4096,
             ),
@@ -57,7 +61,9 @@ class AnthropicVision(VisionBackend):
         ]
 
     async def invoke_backend_action(
-        self, key: str, payload: dict,
+        self,
+        key: str,
+        payload: dict,
     ) -> ConfigActionResult:
         if key == "test_connection":
             return await self._action_test_connection()
@@ -124,6 +130,7 @@ class AnthropicVision(VisionBackend):
     def _get_client(self) -> Any:
         if self._client is None:
             import anthropic
+
             self._client = anthropic.Anthropic(api_key=self._api_key)
         return self._client
 

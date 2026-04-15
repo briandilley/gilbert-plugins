@@ -224,14 +224,15 @@ class SonosSpeaker(SpeakerBackend):
                 key="test_connection",
                 label="Test connection",
                 description=(
-                    "Run Sonos discovery and report how many speakers "
-                    "are reachable on the network."
+                    "Run Sonos discovery and report how many speakers are reachable on the network."
                 ),
             ),
         ]
 
     async def invoke_backend_action(
-        self, key: str, payload: dict,
+        self,
+        key: str,
+        payload: dict,
     ) -> ConfigActionResult:
         if key == "test_connection":
             return await self._action_test_connection()
@@ -271,7 +272,8 @@ class SonosSpeaker(SpeakerBackend):
         self._spotify_sn = await asyncio.to_thread(_detect_spotify_sn, self._devices)
         logger.info(
             "Sonos backend initialized — %d speakers found (spotify sn=%d)",
-            len(self._devices), self._spotify_sn,
+            len(self._devices),
+            self._spotify_sn,
         )
 
     async def close(self) -> None:
@@ -337,30 +339,40 @@ class SonosSpeaker(SpeakerBackend):
         if uri.startswith("x-rincon-cpcontainer:"):
             try:
                 await asyncio.to_thread(
-                    _play_container, coordinator, uri, request.didl_meta,
+                    _play_container,
+                    coordinator,
+                    uri,
+                    request.didl_meta,
                 )
             except Exception:
                 logger.exception(
                     "Sonos container playback failed: uri=%s speaker=%s",
-                    uri, coordinator.player_name,
+                    uri,
+                    coordinator.player_name,
                 )
                 raise
         else:
             if uri.startswith("spotify:"):
                 uri = await asyncio.to_thread(
-                    _to_sonos_spotify_uri, uri, self._spotify_sn,
+                    _to_sonos_spotify_uri,
+                    uri,
+                    self._spotify_sn,
                 )
             try:
                 if request.didl_meta:
                     await asyncio.to_thread(
-                        coordinator.play_uri, uri, meta=request.didl_meta, title=title,
+                        coordinator.play_uri,
+                        uri,
+                        meta=request.didl_meta,
+                        title=title,
                     )
                 else:
                     await asyncio.to_thread(coordinator.play_uri, uri, title=title)
             except Exception:
                 logger.exception(
                     "Sonos play_uri failed: uri=%s speaker=%s",
-                    uri, coordinator.player_name,
+                    uri,
+                    coordinator.player_name,
                 )
                 raise
 
@@ -498,12 +510,14 @@ class SonosSpeaker(SpeakerBackend):
             if group is None or group.uid in seen_group_ids:
                 continue
             seen_group_ids.add(group.uid)
-            groups.append(SpeakerGroup(
-                group_id=group.uid,
-                name=group.label,
-                coordinator_id=_speaker_id(group.coordinator),
-                member_ids=[_speaker_id(m) for m in group.members],
-            ))
+            groups.append(
+                SpeakerGroup(
+                    group_id=group.uid,
+                    name=group.label,
+                    coordinator_id=_speaker_id(group.coordinator),
+                    member_ids=[_speaker_id(m) for m in group.members],
+                )
+            )
         return groups
 
     async def group_speakers(self, speaker_ids: list[str]) -> SpeakerGroup:
@@ -528,18 +542,21 @@ class SonosSpeaker(SpeakerBackend):
 
             # Poll until the group is formed or timeout
             result = await self._poll_until_grouped(
-                speaker_ids, _GROUP_POLL_TIMEOUT,
+                speaker_ids,
+                _GROUP_POLL_TIMEOUT,
             )
             if result:
                 logger.info(
                     "Speaker group formed: '%s' with %d members",
-                    result.name, len(result.member_ids),
+                    result.name,
+                    len(result.member_ids),
                 )
                 return result
 
             logger.warning(
                 "Group not formed after attempt %d/%d — retrying",
-                attempt, _GROUP_MAX_ATTEMPTS,
+                attempt,
+                _GROUP_MAX_ATTEMPTS,
             )
 
         raise RuntimeError(
@@ -564,7 +581,8 @@ class SonosSpeaker(SpeakerBackend):
     # --- Private grouping helpers ---
 
     async def _check_group_state(
-        self, speaker_ids: list[str],
+        self,
+        speaker_ids: list[str],
     ) -> SpeakerGroup | None:
         """Check if the target speakers are already in the correct group.
 
@@ -593,7 +611,9 @@ class SonosSpeaker(SpeakerBackend):
         return await asyncio.to_thread(check)
 
     async def _apply_group_changes(
-        self, speaker_ids: list[str], target_set: set[str],
+        self,
+        speaker_ids: list[str],
+        target_set: set[str],
     ) -> None:
         """Apply the minimal changes to form the desired group.
 
@@ -610,7 +630,8 @@ class SonosSpeaker(SpeakerBackend):
             coord_group = coordinator.group
             coord_group_uids = (
                 {_speaker_id(m) for m in coord_group.members}
-                if coord_group else {_speaker_id(coordinator)}
+                if coord_group
+                else {_speaker_id(coordinator)}
             )
 
             for sid in speaker_ids:
@@ -644,22 +665,20 @@ class SonosSpeaker(SpeakerBackend):
 
         # Unjoin speakers that are in wrong groups
         if to_unjoin:
-            await asyncio.gather(*(
-                asyncio.to_thread(d.unjoin) for d in to_unjoin
-            ))
+            await asyncio.gather(*(asyncio.to_thread(d.unjoin) for d in to_unjoin))
             await asyncio.sleep(_GROUP_SETTLE_SECONDS)
             logger.debug("Unjoined %d speakers from other groups", len(to_unjoin))
 
         # Join speakers to the coordinator
         if to_join:
-            await asyncio.gather(*(
-                asyncio.to_thread(d.join, coordinator) for d in to_join
-            ))
+            await asyncio.gather(*(asyncio.to_thread(d.join, coordinator) for d in to_join))
             await asyncio.sleep(_GROUP_SETTLE_SECONDS)
             logger.debug("Joined %d speakers to coordinator", len(to_join))
 
     async def _poll_until_grouped(
-        self, speaker_ids: list[str], timeout: float,
+        self,
+        speaker_ids: list[str],
+        timeout: float,
     ) -> SpeakerGroup | None:
         """Poll until the target speakers are in the correct group.
 

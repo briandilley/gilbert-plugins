@@ -11,7 +11,7 @@ import base64
 import json
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Any
@@ -36,17 +36,22 @@ class GmailBackend(EmailBackend):
     def backend_config_params(cls) -> list[ConfigParam]:
         return [
             ConfigParam(
-                key="email_address", type=ToolParameterType.STRING,
+                key="email_address",
+                type=ToolParameterType.STRING,
                 description="Email address (mailbox to monitor and send from).",
                 restart_required=True,
             ),
             ConfigParam(
-                key="service_account_json", type=ToolParameterType.STRING,
+                key="service_account_json",
+                type=ToolParameterType.STRING,
                 description="Google service account key (paste JSON content).",
-                sensitive=True, restart_required=True, multiline=True,
+                sensitive=True,
+                restart_required=True,
+                multiline=True,
             ),
             ConfigParam(
-                key="delegated_user", type=ToolParameterType.STRING,
+                key="delegated_user",
+                type=ToolParameterType.STRING,
                 description="Email of the user to impersonate via domain-wide delegation.",
                 restart_required=True,
             ),
@@ -66,7 +71,9 @@ class GmailBackend(EmailBackend):
         ]
 
     async def invoke_backend_action(
-        self, key: str, payload: dict,
+        self,
+        key: str,
+        payload: dict,
     ) -> ConfigActionResult:
         if key == "test_connection":
             return await self._action_test_connection()
@@ -124,21 +131,26 @@ class GmailBackend(EmailBackend):
             return
 
         try:
-            from google.oauth2 import service_account
             from googleapiclient.discovery import build
+
+            from google.oauth2 import service_account
 
             scopes = [
                 "https://www.googleapis.com/auth/gmail.modify",
                 "https://www.googleapis.com/auth/gmail.send",
             ]
             creds = service_account.Credentials.from_service_account_info(
-                sa_info, scopes=scopes,
+                sa_info,
+                scopes=scopes,
             )
             if delegated_user:
                 creds = creds.with_subject(delegated_user)
 
             self._service = await asyncio.to_thread(
-                build, "gmail", "v1", credentials=creds,
+                build,
+                "gmail",
+                "v1",
+                credentials=creds,
             )
             logger.info("Gmail backend initialized (email=%s)", self._email_address)
         except Exception:
@@ -194,8 +206,7 @@ class GmailBackend(EmailBackend):
             return None
 
         headers = {
-            h["name"].lower(): h["value"]
-            for h in data.get("payload", {}).get("headers", [])
+            h["name"].lower(): h["value"] for h in data.get("payload", {}).get("headers", [])
         }
 
         sender = _parse_sender(headers.get("from", ""))
@@ -318,10 +329,12 @@ def _parse_address_list(header: str) -> list[EmailAddress]:
             continue
         match = re.match(r'^"?([^"<]*)"?\s*<([^>]+)>$', part.strip())
         if match:
-            addresses.append(EmailAddress(
-                email=match.group(2).strip().lower(),
-                name=match.group(1).strip(),
-            ))
+            addresses.append(
+                EmailAddress(
+                    email=match.group(2).strip().lower(),
+                    name=match.group(1).strip(),
+                )
+            )
         elif "@" in part:
             addresses.append(EmailAddress(email=part.strip().lower()))
     return addresses
@@ -330,13 +343,13 @@ def _parse_address_list(header: str) -> list[EmailAddress]:
 def _parse_date(date_str: str) -> datetime:
     """Best-effort parse of email Date header."""
     if not date_str:
-        return datetime.now(timezone.utc)
+        return datetime.now(UTC)
     from email.utils import parsedate_to_datetime
 
     try:
         return parsedate_to_datetime(date_str)
     except Exception:
-        return datetime.now(timezone.utc)
+        return datetime.now(UTC)
 
 
 def _extract_body(payload: dict[str, Any]) -> tuple[str, str]:

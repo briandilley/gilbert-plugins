@@ -65,12 +65,8 @@ class RadarrService(Service):
                 return
             self._url = str(section.get("url", "") or "")
             self._api_key = str(section.get("api_key", "") or "")
-            self._default_quality_profile = str(
-                section.get("default_quality_profile", "") or ""
-            )
-            self._default_root_folder = str(
-                section.get("default_root_folder", "") or ""
-            )
+            self._default_quality_profile = str(section.get("default_quality_profile", "") or "")
+            self._default_root_folder = str(section.get("default_root_folder", "") or "")
 
         if not self._url or not self._api_key:
             logger.warning(
@@ -102,17 +98,13 @@ class RadarrService(Service):
             return
         try:
             profiles = await self._client.get("/qualityprofile")
-            self._profile_choices = tuple(
-                str(p["name"]) for p in profiles if p.get("name")
-            )
+            self._profile_choices = tuple(str(p["name"]) for p in profiles if p.get("name"))
         except Exception:
             logger.debug("Failed to fetch Radarr quality profiles", exc_info=True)
             self._profile_choices = ()
         try:
             folders = await self._client.get("/rootfolder")
-            self._root_folder_choices = tuple(
-                str(f["path"]) for f in folders if f.get("path")
-            )
+            self._root_folder_choices = tuple(str(f["path"]) for f in folders if f.get("path"))
         except Exception:
             logger.debug("Failed to fetch Radarr root folders", exc_info=True)
             self._root_folder_choices = ()
@@ -130,22 +122,30 @@ class RadarrService(Service):
     def config_params(self) -> list[ConfigParam]:
         return [
             ConfigParam(
-                key="enabled", type=ToolParameterType.BOOLEAN,
+                key="enabled",
+                type=ToolParameterType.BOOLEAN,
                 description="Enable the Radarr integration.",
-                default=False, restart_required=True,
+                default=False,
+                restart_required=True,
             ),
             ConfigParam(
-                key="url", type=ToolParameterType.STRING,
+                key="url",
+                type=ToolParameterType.STRING,
                 description="Base URL of the Radarr server (e.g. http://radarr.local:7878).",
-                default="", restart_required=True,
+                default="",
+                restart_required=True,
             ),
             ConfigParam(
-                key="api_key", type=ToolParameterType.STRING,
+                key="api_key",
+                type=ToolParameterType.STRING,
                 description="Radarr API key (Settings → General in Radarr).",
-                default="", restart_required=True, sensitive=True,
+                default="",
+                restart_required=True,
+                sensitive=True,
             ),
             ConfigParam(
-                key="default_quality_profile", type=ToolParameterType.STRING,
+                key="default_quality_profile",
+                type=ToolParameterType.STRING,
                 description=(
                     "Default quality profile name used when adding a movie if "
                     "the caller doesn't specify one. Empty uses Radarr's first profile."
@@ -154,7 +154,8 @@ class RadarrService(Service):
                 choices=self._profile_choices or None,
             ),
             ConfigParam(
-                key="default_root_folder", type=ToolParameterType.STRING,
+                key="default_root_folder",
+                type=ToolParameterType.STRING,
                 description=(
                     "Override for the root folder path used when adding a movie. "
                     "Empty uses Radarr's first configured root folder."
@@ -189,12 +190,15 @@ class RadarrService(Service):
         ]
 
     async def invoke_config_action(
-        self, key: str, payload: dict[str, Any],
+        self,
+        key: str,
+        payload: dict[str, Any],
     ) -> ConfigActionResult:
         if key == "test_connection":
             return await self._action_test_connection()
         return ConfigActionResult(
-            status="error", message=f"Unknown action: {key}",
+            status="error",
+            message=f"Unknown action: {key}",
         )
 
     async def _action_test_connection(self) -> ConfigActionResult:
@@ -215,11 +219,13 @@ class RadarrService(Service):
                 else f"HTTP {exc.response.status_code}"
             )
             return ConfigActionResult(
-                status="error", message=f"Radarr API error: {reason}",
+                status="error",
+                message=f"Radarr API error: {reason}",
             )
         except Exception as exc:
             return ConfigActionResult(
-                status="error", message=f"Connection failed: {exc}",
+                status="error",
+                message=f"Connection failed: {exc}",
             )
 
         # Refresh cached choices so the dropdowns populate on the next render.
@@ -256,7 +262,8 @@ class RadarrService(Service):
                 ),
                 parameters=[
                     ToolParameter(
-                        name="query", type=ToolParameterType.STRING,
+                        name="query",
+                        type=ToolParameterType.STRING,
                         description="Movie name to search for.",
                     ),
                 ],
@@ -275,7 +282,8 @@ class RadarrService(Service):
                 ),
                 parameters=[
                     ToolParameter(
-                        name="query", type=ToolParameterType.STRING,
+                        name="query",
+                        type=ToolParameterType.STRING,
                         description="Movie name to search for.",
                     ),
                 ],
@@ -299,7 +307,8 @@ class RadarrService(Service):
                 ),
                 parameters=[
                     ToolParameter(
-                        name="movie", type=ToolParameterType.STRING,
+                        name="movie",
+                        type=ToolParameterType.STRING,
                         description="Movie name (partial match) or Radarr movie id.",
                     ),
                 ],
@@ -331,7 +340,8 @@ class RadarrService(Service):
                 ),
                 parameters=[
                     ToolParameter(
-                        name="limit", type=ToolParameterType.INTEGER,
+                        name="limit",
+                        type=ToolParameterType.INTEGER,
                         description="Number of results to return (1-10). Default 5.",
                         required=False,
                     ),
@@ -356,11 +366,13 @@ class RadarrService(Service):
                 ),
                 parameters=[
                     ToolParameter(
-                        name="tmdb_id", type=ToolParameterType.INTEGER,
+                        name="tmdb_id",
+                        type=ToolParameterType.INTEGER,
                         description="TMDB id of the movie (from radarr_search).",
                     ),
                     ToolParameter(
-                        name="quality_profile", type=ToolParameterType.STRING,
+                        name="quality_profile",
+                        type=ToolParameterType.STRING,
                         description=(
                             "Quality profile name or id. Partial name match. "
                             "Defaults to the configured default profile."
@@ -368,7 +380,8 @@ class RadarrService(Service):
                         required=False,
                     ),
                     ToolParameter(
-                        name="monitored", type=ToolParameterType.BOOLEAN,
+                        name="monitored",
+                        type=ToolParameterType.BOOLEAN,
                         description="Whether to monitor the movie. Default true.",
                         required=False,
                     ),
@@ -385,7 +398,8 @@ class RadarrService(Service):
                 ),
                 parameters=[
                     ToolParameter(
-                        name="movie", type=ToolParameterType.STRING,
+                        name="movie",
+                        type=ToolParameterType.STRING,
                         description="Movie name (partial match) or Radarr movie id.",
                     ),
                 ],
@@ -401,7 +415,8 @@ class RadarrService(Service):
                 ),
                 parameters=[
                     ToolParameter(
-                        name="movie", type=ToolParameterType.STRING,
+                        name="movie",
+                        type=ToolParameterType.STRING,
                         description="Movie name (partial match) or Radarr movie id.",
                     ),
                 ],
@@ -410,7 +425,9 @@ class RadarrService(Service):
         ]
 
     async def execute_tool(
-        self, name: str, arguments: dict[str, Any],
+        self,
+        name: str,
+        arguments: dict[str, Any],
     ) -> str | ToolOutput:
         if not self._enabled or self._client is None:
             return "Radarr is not configured."
@@ -474,9 +491,11 @@ class RadarrService(Service):
         query = str(movie).lower()
         movies = await self._client.get("/movie")
         match = next(
-            (m for m in movies if m["title"].lower() == query), None,
+            (m for m in movies if m["title"].lower() == query),
+            None,
         ) or next(
-            (m for m in movies if query in m["title"].lower()), None,
+            (m for m in movies if query in m["title"].lower()),
+            None,
         )
         return int(match["id"]) if match else None
 
@@ -540,9 +559,7 @@ class RadarrService(Service):
             poster = self._get_poster(m)
 
             if in_library:
-                text_lines.append(
-                    f"- **{title}** ({year}) — already in your library"
-                )
+                text_lines.append(f"- **{title}** ({year}) — already in your library")
             else:
                 text_lines.append(f"- **{title}** ({year}) — {runtime}min")
 
@@ -559,10 +576,15 @@ class RadarrService(Service):
 
             elements: list[UIElement] = []
             if poster:
-                elements.append(UIElement(
-                    type="image", name="poster",
-                    url=poster, label=title, max_width=96,
-                ))
+                elements.append(
+                    UIElement(
+                        type="image",
+                        name="poster",
+                        url=poster,
+                        label=title,
+                        max_width=96,
+                    )
+                )
             elements.append(
                 UIElement(type="label", name="info", label=label_text),
             )
@@ -580,11 +602,13 @@ class RadarrService(Service):
                     ),
                 )
 
-            blocks.append(UIBlock(
-                title=f"Add {title} ({year}) to Radarr?",
-                elements=elements,
-                submit_label="Add to Radarr",
-            ))
+            blocks.append(
+                UIBlock(
+                    title=f"Add {title} ({year}) to Radarr?",
+                    elements=elements,
+                    submit_label="Add to Radarr",
+                )
+            )
 
         return ToolOutput(text="\n".join(text_lines), ui_blocks=blocks)
 
@@ -599,9 +623,7 @@ class RadarrService(Service):
             year = m.get("year", "?")
             has_file = m.get("hasFile", False)
             status = "downloaded" if has_file else "missing"
-            lines.append(
-                f"- **{m['title']}** ({year}) — {status} [id: {m['id']}]"
-            )
+            lines.append(f"- **{m['title']}** ({year}) — {status} [id: {m['id']}]")
         total = len(monitored)
         shown = min(30, total)
         header = (
@@ -614,10 +636,7 @@ class RadarrService(Service):
     async def _details(self, movie: str | int | None) -> str:
         movie_id = await self._resolve_movie_id(movie)
         if not movie_id:
-            return (
-                f"Movie '{movie}' not found in library. "
-                f"Try searching first with radarr_search."
-            )
+            return f"Movie '{movie}' not found in library. Try searching first with radarr_search."
         assert self._client is not None
         m = await self._client.get(f"/movie/{movie_id}")
         has_file = m.get("hasFile", False)
@@ -647,7 +666,8 @@ class RadarrService(Service):
         start = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
         end = (datetime.now() + timedelta(days=90)).strftime("%Y-%m-%d")
         calendar = await self._client.get(
-            "/calendar", params={"start": start, "end": end},
+            "/calendar",
+            params={"start": start, "end": end},
         )
         if not calendar:
             return "No upcoming movie releases."
@@ -662,9 +682,7 @@ class RadarrService(Service):
                 release = f"physical: {m['physicalRelease'][:10]}"
             elif m.get("inCinemas"):
                 release = f"cinema: {m['inCinemas'][:10]}"
-            lines.append(
-                f"- **{m['title']}** ({m.get('year', '?')}) — {release} ({status})"
-            )
+            lines.append(f"- **{m['title']}** ({m.get('year', '?')}) — {release} ({status})")
         return "Upcoming movies:\n" + "\n".join(lines)
 
     async def _queue(self) -> str:
@@ -705,8 +723,7 @@ class RadarrService(Service):
             },
         )
         records = [
-            r for r in data.get("records", [])
-            if r.get("eventType") == "downloadFolderImported"
+            r for r in data.get("records", []) if r.get("eventType") == "downloadFolderImported"
         ][:n]
         if not records:
             return "No recent movie downloads."
@@ -726,14 +743,10 @@ class RadarrService(Service):
             title = movie.get("title", r.get("sourceTitle", "Unknown"))
             year = movie.get("year", "?")
             date = r.get("date", "?")[:16].replace("T", " ")
-            quality = (
-                r.get("quality", {}).get("quality", {}).get("name", "?")
-            )
+            quality = r.get("quality", {}).get("quality", {}).get("name", "?")
             poster = self._get_poster(movie)
             poster_md = f"![{title}]({poster}) " if poster else ""
-            lines.append(
-                f"- {poster_md}**{title}** ({year}) — {quality}, {date}"
-            )
+            lines.append(f"- {poster_md}**{title}** ({year}) — {quality}, {date}")
         return "Recently downloaded movies:\n" + "\n".join(lines)
 
     async def _list_profiles(self) -> str:
@@ -759,7 +772,8 @@ class RadarrService(Service):
         assert self._client is not None
 
         results = await self._client.get(
-            "/movie/lookup", params={"term": f"tmdb:{tmdb_id_int}"},
+            "/movie/lookup",
+            params={"term": f"tmdb:{tmdb_id_int}"},
         )
         if not results:
             return "Movie not found on TMDB."
@@ -788,13 +802,12 @@ class RadarrService(Service):
         movie["addOptions"] = {"searchForMovie": True}
 
         result = await self._client.post("/movie", data=movie)
-        return (
-            f"Added **{result['title']}** to Radarr. Searching for a download."
-        )
+        return f"Added **{result['title']}** to Radarr. Searching for a download."
 
     @staticmethod
     def _resolve_profile_id(
-        profiles: list[dict[str, Any]], profile_input: Any,
+        profiles: list[dict[str, Any]],
+        profile_input: Any,
     ) -> int | None:
         """Resolve a user-supplied profile identifier to a numeric id.
 
@@ -812,7 +825,8 @@ class RadarrService(Service):
             pass
         needle = str(profile_input).lower()
         match = next(
-            (p for p in profiles if needle in str(p["name"]).lower()), None,
+            (p for p in profiles if needle in str(p["name"]).lower()),
+            None,
         )
         return int(match["id"]) if match else None
 
@@ -822,7 +836,8 @@ class RadarrService(Service):
             return f"Movie '{movie}' not found."
         assert self._client is not None
         await self._client.delete(
-            f"/movie/{movie_id}", params={"deleteFiles": "true"},
+            f"/movie/{movie_id}",
+            params={"deleteFiles": "true"},
         )
         return f"Removed movie {movie_id} and deleted files."
 
@@ -832,6 +847,7 @@ class RadarrService(Service):
             return f"Movie '{movie}' not found."
         assert self._client is not None
         await self._client.post(
-            "/command", data={"name": "MoviesSearch", "movieIds": [movie_id]},
+            "/command",
+            data={"name": "MoviesSearch", "movieIds": [movie_id]},
         )
         return f"Triggered download search for movie {movie_id}."

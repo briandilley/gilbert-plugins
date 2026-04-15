@@ -110,9 +110,7 @@ class UniFiClient:
 
         content_type = response.headers.get("content-type", "")
         if "application/json" not in content_type and "text/json" not in content_type:
-            raise UniFiAPIError(
-                f"{method} {path} returned non-JSON content-type: {content_type}"
-            )
+            raise UniFiAPIError(f"{method} {path} returned non-JSON content-type: {content_type}")
 
         return response.json()
 

@@ -2,13 +2,6 @@
 
 import logging
 
-from .client import (
-    UniFiAPIError,
-    UniFiAuthError,
-    UniFiClient,
-    UniFiConnectionError,
-)
-from .protect import UniFiProtect
 from gilbert.interfaces.configuration import (
     ConfigAction,
     ConfigActionResult,
@@ -16,6 +9,14 @@ from gilbert.interfaces.configuration import (
 )
 from gilbert.interfaces.doorbell import DoorbellBackend, RingEvent
 from gilbert.interfaces.tools import ToolParameterType
+
+from .client import (
+    UniFiAPIError,
+    UniFiAuthError,
+    UniFiClient,
+    UniFiConnectionError,
+)
+from .protect import UniFiProtect
 
 logger = logging.getLogger(__name__)
 
@@ -29,22 +30,31 @@ class UniFiProtectDoorbellBackend(DoorbellBackend):
     def backend_config_params(cls) -> list[ConfigParam]:
         return [
             ConfigParam(
-                key="host", type=ToolParameterType.STRING,
+                key="host",
+                type=ToolParameterType.STRING,
                 description="UniFi Protect controller URL.",
-                default="", restart_required=True,
+                default="",
+                restart_required=True,
             ),
             ConfigParam(
-                key="username", type=ToolParameterType.STRING,
+                key="username",
+                type=ToolParameterType.STRING,
                 description="UniFi Protect username.",
-                default="", restart_required=True, sensitive=True,
+                default="",
+                restart_required=True,
+                sensitive=True,
             ),
             ConfigParam(
-                key="password", type=ToolParameterType.STRING,
+                key="password",
+                type=ToolParameterType.STRING,
                 description="UniFi Protect password.",
-                default="", restart_required=True, sensitive=True,
+                default="",
+                restart_required=True,
+                sensitive=True,
             ),
             ConfigParam(
-                key="doorbell_names", type=ToolParameterType.ARRAY,
+                key="doorbell_names",
+                type=ToolParameterType.ARRAY,
                 description="Doorbells to monitor (empty = all).",
                 default=[],
                 choices_from="doorbells",
@@ -65,7 +75,9 @@ class UniFiProtectDoorbellBackend(DoorbellBackend):
         ]
 
     async def invoke_backend_action(
-        self, key: str, payload: dict,
+        self,
+        key: str,
+        payload: dict,
     ) -> ConfigActionResult:
         if key == "test_connection":
             return await self._action_test_connection()

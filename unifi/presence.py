@@ -6,16 +6,6 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from .access import UniFiAccess
-from .client import (
-    UniFiAPIError,
-    UniFiAuthError,
-    UniFiClient,
-    UniFiConnectionError,
-)
-from .name_resolver import NameResolver
-from .network import UniFiNetwork
-from .protect import UniFiProtect
 from gilbert.interfaces.configuration import (
     ConfigAction,
     ConfigActionResult,
@@ -27,6 +17,17 @@ from gilbert.interfaces.presence import (
     UserPresence,
 )
 from gilbert.interfaces.tools import ToolParameterType
+
+from .access import UniFiAccess
+from .client import (
+    UniFiAPIError,
+    UniFiAuthError,
+    UniFiClient,
+    UniFiConnectionError,
+)
+from .name_resolver import NameResolver
+from .network import UniFiNetwork
+from .protect import UniFiProtect
 
 logger = logging.getLogger(__name__)
 
@@ -65,52 +66,72 @@ class UniFiPresenceBackend(PresenceBackend):
     def backend_config_params(cls) -> list[ConfigParam]:
         return [
             ConfigParam(
-                key="unifi_network.host", type=ToolParameterType.STRING,
+                key="unifi_network.host",
+                type=ToolParameterType.STRING,
                 description="UniFi Network controller URL (e.g., https://192.168.1.1).",
-                default="", restart_required=True,
+                default="",
+                restart_required=True,
             ),
             ConfigParam(
-                key="unifi_network.username", type=ToolParameterType.STRING,
+                key="unifi_network.username",
+                type=ToolParameterType.STRING,
                 description="UniFi Network username.",
-                default="", restart_required=True, sensitive=True,
+                default="",
+                restart_required=True,
+                sensitive=True,
             ),
             ConfigParam(
-                key="unifi_network.password", type=ToolParameterType.STRING,
+                key="unifi_network.password",
+                type=ToolParameterType.STRING,
                 description="UniFi Network password.",
-                default="", restart_required=True, sensitive=True,
+                default="",
+                restart_required=True,
+                sensitive=True,
             ),
             ConfigParam(
-                key="unifi_network.verify_ssl", type=ToolParameterType.BOOLEAN,
+                key="unifi_network.verify_ssl",
+                type=ToolParameterType.BOOLEAN,
                 description="Verify SSL certificates for Network controller.",
                 default=False,
             ),
             ConfigParam(
-                key="unifi_protect.host", type=ToolParameterType.STRING,
+                key="unifi_protect.host",
+                type=ToolParameterType.STRING,
                 description="UniFi Protect controller URL (e.g., https://192.168.1.1).",
-                default="", restart_required=True,
+                default="",
+                restart_required=True,
             ),
             ConfigParam(
-                key="unifi_protect.username", type=ToolParameterType.STRING,
+                key="unifi_protect.username",
+                type=ToolParameterType.STRING,
                 description="UniFi Protect username.",
-                default="", restart_required=True, sensitive=True,
+                default="",
+                restart_required=True,
+                sensitive=True,
             ),
             ConfigParam(
-                key="unifi_protect.password", type=ToolParameterType.STRING,
+                key="unifi_protect.password",
+                type=ToolParameterType.STRING,
                 description="UniFi Protect password.",
-                default="", restart_required=True, sensitive=True,
+                default="",
+                restart_required=True,
+                sensitive=True,
             ),
             ConfigParam(
-                key="unifi_protect.verify_ssl", type=ToolParameterType.BOOLEAN,
+                key="unifi_protect.verify_ssl",
+                type=ToolParameterType.BOOLEAN,
                 description="Verify SSL certificates for Protect controller.",
                 default=False,
             ),
             ConfigParam(
-                key="face_lookback_minutes", type=ToolParameterType.INTEGER,
+                key="face_lookback_minutes",
+                type=ToolParameterType.INTEGER,
                 description="Minutes to look back for face detection events.",
                 default=30,
             ),
             ConfigParam(
-                key="badge_lookback_hours", type=ToolParameterType.INTEGER,
+                key="badge_lookback_hours",
+                type=ToolParameterType.INTEGER,
                 description="Hours to look back for badge/access events.",
                 default=24,
             ),
@@ -219,7 +240,9 @@ class UniFiPresenceBackend(PresenceBackend):
         ]
 
     async def invoke_backend_action(
-        self, key: str, payload: dict,
+        self,
+        key: str,
+        payload: dict,
     ) -> ConfigActionResult:
         if key == "test_connection":
             return await self._action_test_connection()
@@ -287,10 +310,7 @@ class UniFiPresenceBackend(PresenceBackend):
             return ConfigActionResult(
                 status="error",
                 message=(
-                    "Partial success — "
-                    + ", ".join(subsystems_ok)
-                    + " OK; "
-                    + "; ".join(errors)
+                    "Partial success — " + ", ".join(subsystems_ok) + " OK; " + "; ".join(errors)
                 ),
             )
         return ConfigActionResult(
@@ -377,12 +397,14 @@ class UniFiPresenceBackend(PresenceBackend):
                 source = "unifi"
                 since = ""
 
-            results.append(UserPresence(
-                user_id=uid,
-                state=state,
-                since=since,
-                source=source,
-            ))
+            results.append(
+                UserPresence(
+                    user_id=uid,
+                    state=state,
+                    since=since,
+                    source=source,
+                )
+            )
 
         return results
 

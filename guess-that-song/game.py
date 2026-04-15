@@ -231,10 +231,11 @@ class GameState:
 
     def to_ai_summary(self) -> dict[str, object]:
         """AI-visible summary — excludes future song answers."""
-        waiting_on = [
-            name for uid, name in self.players.items()
-            if uid not in self.guesses
-        ] if self.status == "playing" else []
+        waiting_on = (
+            [name for uid, name in self.players.items() if uid not in self.guesses]
+            if self.status == "playing"
+            else []
+        )
 
         past_songs = [
             {"round": r.round_number, "title": r.song.title, "artist": r.song.artist}

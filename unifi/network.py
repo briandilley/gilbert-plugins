@@ -10,13 +10,44 @@ from .client import UniFiClient
 logger = logging.getLogger(__name__)
 
 # Device-only names that should not be treated as person names
-_DEVICE_ONLY_NAMES = frozenset({
-    "iphone", "ipad", "macbook", "android", "pixel", "galaxy", "samsung",
-    "oneplus", "huawei", "xiaomi", "oppo", "motorola", "lg", "nokia",
-    "chromebook", "surface", "thinkpad", "dell", "hp", "lenovo",
-    "echo", "alexa", "google-home", "nest", "sonos", "roku", "firestick",
-    "unknown", "generic", "wireless", "mobile", "phone", "tablet", "laptop",
-})
+_DEVICE_ONLY_NAMES = frozenset(
+    {
+        "iphone",
+        "ipad",
+        "macbook",
+        "android",
+        "pixel",
+        "galaxy",
+        "samsung",
+        "oneplus",
+        "huawei",
+        "xiaomi",
+        "oppo",
+        "motorola",
+        "lg",
+        "nokia",
+        "chromebook",
+        "surface",
+        "thinkpad",
+        "dell",
+        "hp",
+        "lenovo",
+        "echo",
+        "alexa",
+        "google-home",
+        "nest",
+        "sonos",
+        "roku",
+        "firestick",
+        "unknown",
+        "generic",
+        "wireless",
+        "mobile",
+        "phone",
+        "tablet",
+        "laptop",
+    }
+)
 
 # Pattern for possessive device names like "Brian's iPhone" or "Brian Dilley's Phone"
 _POSSESSIVE_RE = re.compile(r"^(.+?)(?:'s?\s)", re.IGNORECASE)
@@ -27,11 +58,13 @@ _CAMEL_SPLIT_RE = re.compile(r"([A-Z][a-z]+)")
 
 # UniFi dev_family values that correspond to phones/mobile devices.
 # These are used to filter network presence to only phones.
-_PHONE_DEV_FAMILIES: frozenset[int] = frozenset({
-    9,   # iPhone
-    14,  # Samsung phone
-    77,  # Android phone
-})
+_PHONE_DEV_FAMILIES: frozenset[int] = frozenset(
+    {
+        9,  # iPhone
+        14,  # Samsung phone
+        77,  # Android phone
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -83,17 +116,19 @@ class UniFiNetwork:
 
             person = self._resolve_person(mac, device_name, hostname)
 
-            results.append(WifiClient(
-                mac=mac,
-                hostname=hostname,
-                device_name=device_name,
-                person=person,
-                rssi=rssi,
-                ap_name=ap_name,
-                last_seen=last_seen,
-                is_wired=is_wired,
-                is_phone=dev_family in _PHONE_DEV_FAMILIES,
-            ))
+            results.append(
+                WifiClient(
+                    mac=mac,
+                    hostname=hostname,
+                    device_name=device_name,
+                    person=person,
+                    rssi=rssi,
+                    ap_name=ap_name,
+                    last_seen=last_seen,
+                    is_wired=is_wired,
+                    is_phone=dev_family in _PHONE_DEV_FAMILIES,
+                )
+            )
 
         matched = [r for r in results if r.person and not r.is_wired]
         logger.debug(
@@ -161,8 +196,20 @@ def extract_person_from_device_name(name: str) -> str:
         candidate = parts[0]
         if _is_valid_person_name(candidate):
             # Accept if any remaining word looks like a device type
-            if any(d in name.lower() for d in ("phone", "iphone", "pixel", "galaxy", "ipad",
-                                                 "macbook", "laptop", "watch", "tablet")):
+            if any(
+                d in name.lower()
+                for d in (
+                    "phone",
+                    "iphone",
+                    "pixel",
+                    "galaxy",
+                    "ipad",
+                    "macbook",
+                    "laptop",
+                    "watch",
+                    "tablet",
+                )
+            ):
                 return candidate
 
     return ""
@@ -210,6 +257,4 @@ def _is_valid_person_name(name: str) -> bool:
     if name.lower() in _DEVICE_ONLY_NAMES:
         return False
     # Must be alphabetic
-    if not name.isalpha():
-        return False
-    return True
+    return name.isalpha()

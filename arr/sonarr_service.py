@@ -63,12 +63,8 @@ class SonarrService(Service):
                 return
             self._url = str(section.get("url", "") or "")
             self._api_key = str(section.get("api_key", "") or "")
-            self._default_quality_profile = str(
-                section.get("default_quality_profile", "") or ""
-            )
-            self._default_root_folder = str(
-                section.get("default_root_folder", "") or ""
-            )
+            self._default_quality_profile = str(section.get("default_quality_profile", "") or "")
+            self._default_root_folder = str(section.get("default_root_folder", "") or "")
 
         if not self._url or not self._api_key:
             logger.warning(
@@ -100,17 +96,13 @@ class SonarrService(Service):
             return
         try:
             profiles = await self._client.get("/qualityprofile")
-            self._profile_choices = tuple(
-                str(p["name"]) for p in profiles if p.get("name")
-            )
+            self._profile_choices = tuple(str(p["name"]) for p in profiles if p.get("name"))
         except Exception:
             logger.debug("Failed to fetch Sonarr quality profiles", exc_info=True)
             self._profile_choices = ()
         try:
             folders = await self._client.get("/rootfolder")
-            self._root_folder_choices = tuple(
-                str(f["path"]) for f in folders if f.get("path")
-            )
+            self._root_folder_choices = tuple(str(f["path"]) for f in folders if f.get("path"))
         except Exception:
             logger.debug("Failed to fetch Sonarr root folders", exc_info=True)
             self._root_folder_choices = ()
@@ -128,22 +120,30 @@ class SonarrService(Service):
     def config_params(self) -> list[ConfigParam]:
         return [
             ConfigParam(
-                key="enabled", type=ToolParameterType.BOOLEAN,
+                key="enabled",
+                type=ToolParameterType.BOOLEAN,
                 description="Enable the Sonarr integration.",
-                default=False, restart_required=True,
+                default=False,
+                restart_required=True,
             ),
             ConfigParam(
-                key="url", type=ToolParameterType.STRING,
+                key="url",
+                type=ToolParameterType.STRING,
                 description="Base URL of the Sonarr server (e.g. http://sonarr.local:8989).",
-                default="", restart_required=True,
+                default="",
+                restart_required=True,
             ),
             ConfigParam(
-                key="api_key", type=ToolParameterType.STRING,
+                key="api_key",
+                type=ToolParameterType.STRING,
                 description="Sonarr API key (Settings → General in Sonarr).",
-                default="", restart_required=True, sensitive=True,
+                default="",
+                restart_required=True,
+                sensitive=True,
             ),
             ConfigParam(
-                key="default_quality_profile", type=ToolParameterType.STRING,
+                key="default_quality_profile",
+                type=ToolParameterType.STRING,
                 description=(
                     "Default quality profile name used when adding a show if "
                     "the caller doesn't specify one. Empty uses Sonarr's first profile."
@@ -152,7 +152,8 @@ class SonarrService(Service):
                 choices=self._profile_choices or None,
             ),
             ConfigParam(
-                key="default_root_folder", type=ToolParameterType.STRING,
+                key="default_root_folder",
+                type=ToolParameterType.STRING,
                 description=(
                     "Override for the root folder path used when adding a show. "
                     "Empty uses Sonarr's first configured root folder."
@@ -186,12 +187,15 @@ class SonarrService(Service):
         ]
 
     async def invoke_config_action(
-        self, key: str, payload: dict[str, Any],
+        self,
+        key: str,
+        payload: dict[str, Any],
     ) -> ConfigActionResult:
         if key == "test_connection":
             return await self._action_test_connection()
         return ConfigActionResult(
-            status="error", message=f"Unknown action: {key}",
+            status="error",
+            message=f"Unknown action: {key}",
         )
 
     async def _action_test_connection(self) -> ConfigActionResult:
@@ -212,11 +216,13 @@ class SonarrService(Service):
                 else f"HTTP {exc.response.status_code}"
             )
             return ConfigActionResult(
-                status="error", message=f"Sonarr API error: {reason}",
+                status="error",
+                message=f"Sonarr API error: {reason}",
             )
         except Exception as exc:
             return ConfigActionResult(
-                status="error", message=f"Connection failed: {exc}",
+                status="error",
+                message=f"Connection failed: {exc}",
             )
 
         await self._refresh_choices()
@@ -252,7 +258,8 @@ class SonarrService(Service):
                 ),
                 parameters=[
                     ToolParameter(
-                        name="query", type=ToolParameterType.STRING,
+                        name="query",
+                        type=ToolParameterType.STRING,
                         description="Show name to search for.",
                     ),
                 ],
@@ -271,7 +278,8 @@ class SonarrService(Service):
                 ),
                 parameters=[
                     ToolParameter(
-                        name="query", type=ToolParameterType.STRING,
+                        name="query",
+                        type=ToolParameterType.STRING,
                         description="Show name to search for.",
                     ),
                 ],
@@ -295,7 +303,8 @@ class SonarrService(Service):
                 ),
                 parameters=[
                     ToolParameter(
-                        name="show", type=ToolParameterType.STRING,
+                        name="show",
+                        type=ToolParameterType.STRING,
                         description="Show name (partial match) or Sonarr series id.",
                     ),
                 ],
@@ -311,7 +320,8 @@ class SonarrService(Service):
                 ),
                 parameters=[
                     ToolParameter(
-                        name="show", type=ToolParameterType.STRING,
+                        name="show",
+                        type=ToolParameterType.STRING,
                         description="Show name (partial match) or Sonarr series id.",
                     ),
                 ],
@@ -343,7 +353,8 @@ class SonarrService(Service):
                 ),
                 parameters=[
                     ToolParameter(
-                        name="limit", type=ToolParameterType.INTEGER,
+                        name="limit",
+                        type=ToolParameterType.INTEGER,
                         description="Number of results to return (1-10). Default 5.",
                         required=False,
                     ),
@@ -368,11 +379,13 @@ class SonarrService(Service):
                 ),
                 parameters=[
                     ToolParameter(
-                        name="tvdb_id", type=ToolParameterType.INTEGER,
+                        name="tvdb_id",
+                        type=ToolParameterType.INTEGER,
                         description="TVDB id of the show (from sonarr_search).",
                     ),
                     ToolParameter(
-                        name="quality_profile", type=ToolParameterType.STRING,
+                        name="quality_profile",
+                        type=ToolParameterType.STRING,
                         description=(
                             "Quality profile name or id. Partial name match. "
                             "Defaults to the configured default profile."
@@ -380,7 +393,8 @@ class SonarrService(Service):
                         required=False,
                     ),
                     ToolParameter(
-                        name="monitored", type=ToolParameterType.BOOLEAN,
+                        name="monitored",
+                        type=ToolParameterType.BOOLEAN,
                         description="Whether to monitor new episodes. Default true.",
                         required=False,
                     ),
@@ -397,7 +411,8 @@ class SonarrService(Service):
                 ),
                 parameters=[
                     ToolParameter(
-                        name="show", type=ToolParameterType.STRING,
+                        name="show",
+                        type=ToolParameterType.STRING,
                         description="Show name (partial match) or Sonarr series id.",
                     ),
                 ],
@@ -407,12 +422,11 @@ class SonarrService(Service):
                 name="sonarr_grab",
                 slash_command="grab",
                 slash_help="Search for missing episodes: /sonarr.grab <name or series_id>",
-                description=(
-                    "Trigger a Sonarr search for missing episodes of a show."
-                ),
+                description=("Trigger a Sonarr search for missing episodes of a show."),
                 parameters=[
                     ToolParameter(
-                        name="show", type=ToolParameterType.STRING,
+                        name="show",
+                        type=ToolParameterType.STRING,
                         description="Show name (partial match) or Sonarr series id.",
                     ),
                 ],
@@ -421,7 +435,9 @@ class SonarrService(Service):
         ]
 
     async def execute_tool(
-        self, name: str, arguments: dict[str, Any],
+        self,
+        name: str,
+        arguments: dict[str, Any],
     ) -> str | ToolOutput:
         if not self._enabled or self._client is None:
             return "Sonarr is not configured."
@@ -486,15 +502,18 @@ class SonarrService(Service):
         query = str(show).lower()
         series = await self._client.get("/series")
         match = next(
-            (s for s in series if s["title"].lower() == query), None,
+            (s for s in series if s["title"].lower() == query),
+            None,
         ) or next(
-            (s for s in series if query in s["title"].lower()), None,
+            (s for s in series if query in s["title"].lower()),
+            None,
         )
         return int(match["id"]) if match else None
 
     @staticmethod
     def _resolve_profile_id(
-        profiles: list[dict[str, Any]], profile_input: Any,
+        profiles: list[dict[str, Any]],
+        profile_input: Any,
     ) -> int | None:
         if profile_input in (None, "", 0):
             return int(profiles[0]["id"]) if profiles else None
@@ -506,7 +525,8 @@ class SonarrService(Service):
             pass
         needle = str(profile_input).lower()
         match = next(
-            (p for p in profiles if needle in str(p["name"]).lower()), None,
+            (p for p in profiles if needle in str(p["name"]).lower()),
+            None,
         )
         return int(match["id"]) if match else None
 
@@ -564,13 +584,9 @@ class SonarrService(Service):
             poster = self._get_poster(s)
 
             if in_library:
-                text_lines.append(
-                    f"- **{title}** ({year}) — already in your library"
-                )
+                text_lines.append(f"- **{title}** ({year}) — already in your library")
             else:
-                text_lines.append(
-                    f"- **{title}** ({year}) — {seasons} seasons, {status}"
-                )
+                text_lines.append(f"- **{title}** ({year}) — {seasons} seasons, {status}")
 
             meta_lines = [
                 f"{title} ({year})",
@@ -588,10 +604,15 @@ class SonarrService(Service):
 
             elements: list[UIElement] = []
             if poster:
-                elements.append(UIElement(
-                    type="image", name="poster",
-                    url=poster, label=title, max_width=96,
-                ))
+                elements.append(
+                    UIElement(
+                        type="image",
+                        name="poster",
+                        url=poster,
+                        label=title,
+                        max_width=96,
+                    )
+                )
             elements.append(
                 UIElement(type="label", name="info", label=label_text),
             )
@@ -609,11 +630,13 @@ class SonarrService(Service):
                     ),
                 )
 
-            blocks.append(UIBlock(
-                title=f"Add {title} ({year}) to Sonarr?",
-                elements=elements,
-                submit_label="Add to Sonarr",
-            ))
+            blocks.append(
+                UIBlock(
+                    title=f"Add {title} ({year}) to Sonarr?",
+                    elements=elements,
+                    submit_label="Add to Sonarr",
+                )
+            )
 
         return ToolOutput(text="\n".join(text_lines), ui_blocks=blocks)
 
@@ -630,8 +653,7 @@ class SonarrService(Service):
             total = eps.get("totalEpisodeCount", 0)
             pct = eps.get("percentOfEpisodes", 0)
             lines.append(
-                f"- **{s['title']}** — {have}/{total} episodes "
-                f"({pct:.0f}%) [id: {s['id']}]"
+                f"- **{s['title']}** — {have}/{total} episodes ({pct:.0f}%) [id: {s['id']}]"
             )
         return f"Monitored shows ({len(monitored)}):\n" + "\n".join(lines)
 
@@ -664,7 +686,8 @@ class SonarrService(Service):
         assert self._client is not None
         s = await self._client.get(f"/series/{series_id}")
         episodes = await self._client.get(
-            "/episode", params={"seriesId": series_id},
+            "/episode",
+            params={"seriesId": series_id},
         )
         if not episodes:
             return f"No episodes found for {s['title']}."
@@ -686,7 +709,7 @@ class SonarrService(Service):
             has = latest_aired.get("hasFile", False)
             status = "downloaded" if has else "missing"
             lines.append(
-                f"Latest aired: S{sn:02d}E{ep:02d} \"{title}\" — "
+                f'Latest aired: S{sn:02d}E{ep:02d} "{title}" — '
                 f"{latest_aired.get('airDate', '?')} ({status})"
             )
         if latest_downloaded and latest_downloaded is not latest_aired:
@@ -694,7 +717,7 @@ class SonarrService(Service):
             ep = latest_downloaded["episodeNumber"]
             title = latest_downloaded.get("title", "")
             lines.append(
-                f"Latest downloaded: S{sn:02d}E{ep:02d} \"{title}\" — "
+                f'Latest downloaded: S{sn:02d}E{ep:02d} "{title}" — '
                 f"{latest_downloaded.get('airDate', '?')}"
             )
 
@@ -711,10 +734,7 @@ class SonarrService(Service):
                 ep = e["episodeNumber"]
                 title = e.get("title", "")
                 has = "downloaded" if e.get("hasFile") else "missing"
-                lines.append(
-                    f"  S{sn:02d}E{ep:02d} \"{title}\" — "
-                    f"{e.get('airDate', '?')} ({has})"
-                )
+                lines.append(f'  S{sn:02d}E{ep:02d} "{title}" — {e.get("airDate", "?")} ({has})')
 
         return "\n".join(lines)
 
@@ -723,7 +743,8 @@ class SonarrService(Service):
         start = datetime.now().strftime("%Y-%m-%d")
         end = (datetime.now() + timedelta(days=14)).strftime("%Y-%m-%d")
         calendar = await self._client.get(
-            "/calendar", params={"start": start, "end": end},
+            "/calendar",
+            params={"start": start, "end": end},
         )
         if not calendar:
             return "No upcoming episodes in the next 2 weeks."
@@ -736,9 +757,7 @@ class SonarrService(Service):
             air = ep.get("airDate", "?")
             has_file = ep.get("hasFile", False)
             status = "downloaded" if has_file else "upcoming"
-            lines.append(
-                f"- **{show}** S{sn:02d}E{en:02d} \"{title}\" — {air} ({status})"
-            )
+            lines.append(f'- **{show}** S{sn:02d}E{en:02d} "{title}" — {air} ({status})')
         return "Upcoming episodes:\n" + "\n".join(lines)
 
     async def _queue(self) -> str:
@@ -757,7 +776,8 @@ class SonarrService(Service):
                 except Exception:
                     series_cache[sid] = {}
             show = series_cache.get(sid, {}).get(
-                "title", item.get("title", "Unknown"),
+                "title",
+                item.get("title", "Unknown"),
             )
             sn = item.get("seasonNumber", 0)
             status = item.get("status", "?")
@@ -781,8 +801,7 @@ class SonarrService(Service):
             },
         )
         records = [
-            r for r in data.get("records", [])
-            if r.get("eventType") == "downloadFolderImported"
+            r for r in data.get("records", []) if r.get("eventType") == "downloadFolderImported"
         ][:n]
         if not records:
             return "No recent downloads."
@@ -812,14 +831,11 @@ class SonarrService(Service):
             en = episode.get("episodeNumber", 0)
             title = episode.get("title", "")
             date = r.get("date", "?")[:16].replace("T", " ")
-            quality = (
-                r.get("quality", {}).get("quality", {}).get("name", "?")
-            )
+            quality = r.get("quality", {}).get("quality", {}).get("name", "?")
             poster = self._get_poster(series)
             poster_md = f"![{show}]({poster}) " if poster else ""
             lines.append(
-                f"- {poster_md}**{show}** S{sn:02d}E{en:02d} \"{title}\" — "
-                f"{quality}, {date}"
+                f'- {poster_md}**{show}** S{sn:02d}E{en:02d} "{title}" — {quality}, {date}'
             )
         return "Recently downloaded episodes:\n" + "\n".join(lines)
 
@@ -846,7 +862,8 @@ class SonarrService(Service):
         assert self._client is not None
 
         results = await self._client.get(
-            "/series/lookup", params={"term": f"tvdb:{tvdb_id_int}"},
+            "/series/lookup",
+            params={"term": f"tvdb:{tvdb_id_int}"},
         )
         if not results:
             return "Show not found on TVDB."
@@ -883,7 +900,8 @@ class SonarrService(Service):
             return f"Show '{show}' not found."
         assert self._client is not None
         await self._client.delete(
-            f"/series/{series_id}", params={"deleteFiles": "true"},
+            f"/series/{series_id}",
+            params={"deleteFiles": "true"},
         )
         return f"Removed series {series_id} and deleted files."
 
@@ -893,6 +911,7 @@ class SonarrService(Service):
             return f"Show '{show}' not found."
         assert self._client is not None
         await self._client.post(
-            "/command", data={"name": "SeriesSearch", "seriesId": series_id},
+            "/command",
+            data={"name": "SeriesSearch", "seriesId": series_id},
         )
         return f"Triggered search for missing episodes of series {series_id}."

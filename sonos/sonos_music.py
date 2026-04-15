@@ -73,12 +73,17 @@ class _InMemoryTokenStore(TokenStoreBase):
         return self._key
 
     def save_token_pair(
-        self, music_service_id: Any, household_id: Any, token_pair: Any,
+        self,
+        music_service_id: Any,
+        household_id: Any,
+        token_pair: Any,
     ) -> None:
         self._token, self._key = token_pair[0], token_pair[1]
 
     def load_token_pair(
-        self, music_service_id: Any, household_id: Any,
+        self,
+        music_service_id: Any,
+        household_id: Any,
     ) -> tuple[str, str]:
         if not self._token:
             raise KeyError("No SMAPI token stored — run link flow first")
@@ -346,7 +351,9 @@ def _smapi_item_duration(item: Any) -> float:
 
 
 def _smapi_result_to_music_item(
-    item: Any, kind: MusicItemKind, service_name: str,
+    item: Any,
+    kind: MusicItemKind,
+    service_name: str,
 ) -> MusicItem:
     """Map a SMAPI search result row to a ``MusicItem``.
 
@@ -356,11 +363,7 @@ def _smapi_result_to_music_item(
     result's ``metadata`` dict (shape varies by kind; see helpers).
     """
     md = _smapi_metadata(item)
-    title = (
-        getattr(item, "title", "")
-        or md.get("title")
-        or "(unknown)"
-    )
+    title = getattr(item, "title", "") or md.get("title") or "(unknown)"
     return MusicItem(
         id=_item_id(item),
         title=str(title),
@@ -624,10 +627,7 @@ class SonosMusic(MusicBackend):
         def _search() -> list[MusicItem]:
             svc = self._get_smapi()
             results = svc.search(smapi_kind, query, count=limit)
-            return [
-                _smapi_result_to_music_item(r, kind, self._preferred_service)
-                for r in results
-            ]
+            return [_smapi_result_to_music_item(r, kind, self._preferred_service) for r in results]
 
         try:
             return await asyncio.to_thread(_search)
@@ -705,7 +705,9 @@ class SonosMusic(MusicBackend):
     # --- Actions ---
 
     async def invoke_backend_action(
-        self, key: str, payload: dict[str, Any],
+        self,
+        key: str,
+        payload: dict[str, Any],
     ) -> ConfigActionResult:
         if key == "link_spotify":
             return await self._action_link_start()
@@ -757,8 +759,7 @@ class SonosMusic(MusicBackend):
             return ConfigActionResult(
                 status="error",
                 message=(
-                    "No link flow in progress. Click 'Link music service "
-                    "for search' to start over."
+                    "No link flow in progress. Click 'Link music service for search' to start over."
                 ),
             )
         link_code = self._pending_link["link_code"]
@@ -778,20 +779,14 @@ class SonosMusic(MusicBackend):
             self._pending_link = None
             return ConfigActionResult(
                 status="error",
-                message=(
-                    "Couldn't complete link flow (did you approve in the "
-                    f"browser?): {exc}"
-                ),
+                message=(f"Couldn't complete link flow (did you approve in the browser?): {exc}"),
             )
 
         self._pending_link = None
         if not token:
             return ConfigActionResult(
                 status="error",
-                message=(
-                    "Link flow completed but no token was issued. Try "
-                    "starting over."
-                ),
+                message=("Link flow completed but no token was issued. Try starting over."),
             )
 
         # Push the new token/key into the settings form as unsaved
@@ -804,8 +799,7 @@ class SonosMusic(MusicBackend):
         return ConfigActionResult(
             status="ok",
             message=(
-                f"{self._preferred_service} linked for search. "
-                "Click Save to store the auth token."
+                f"{self._preferred_service} linked for search. Click Save to store the auth token."
             ),
             data={
                 "persist": {
@@ -849,10 +843,7 @@ class SonosMusic(MusicBackend):
             except Exception as exc:
                 return ConfigActionResult(
                     status="error",
-                    message=(
-                        f"Found {len(devices)} speakers, but search "
-                        f"failed: {exc}"
-                    ),
+                    message=(f"Found {len(devices)} speakers, but search failed: {exc}"),
                 )
 
         return ConfigActionResult(

@@ -32,17 +32,22 @@ class GoogleAuthBackend(AuthBackend):
     def backend_config_params(cls) -> list[ConfigParam]:
         return [
             ConfigParam(
-                key="client_id", type=ToolParameterType.STRING,
+                key="client_id",
+                type=ToolParameterType.STRING,
                 description="Google OAuth client ID.",
-                restart_required=True, sensitive=True,
+                restart_required=True,
+                sensitive=True,
             ),
             ConfigParam(
-                key="client_secret", type=ToolParameterType.STRING,
+                key="client_secret",
+                type=ToolParameterType.STRING,
                 description="Google OAuth client secret.",
-                restart_required=True, sensitive=True,
+                restart_required=True,
+                sensitive=True,
             ),
             ConfigParam(
-                key="domain", type=ToolParameterType.STRING,
+                key="domain",
+                type=ToolParameterType.STRING,
                 description="Restrict Google login to this domain (empty = any).",
                 default="",
             ),
@@ -62,7 +67,9 @@ class GoogleAuthBackend(AuthBackend):
         ]
 
     async def invoke_backend_action(
-        self, key: str, payload: dict,
+        self,
+        key: str,
+        payload: dict,
     ) -> ConfigActionResult:
         if key == "test_connection":
             return await self._action_test_connection()
@@ -134,16 +141,18 @@ class GoogleAuthBackend(AuthBackend):
 
     def get_authorization_url(self, redirect_uri: str, state: str) -> str:
         """Build the full Google OAuth authorization URL."""
-        params = urllib.parse.urlencode({
-            "client_id": self._oauth_client_id,
-            "redirect_uri": redirect_uri,
-            "response_type": "code",
-            "scope": "openid email profile",
-            "access_type": "offline",
-            "prompt": "select_account",
-            "state": state,
-            **({"hd": self._domain} if self._domain else {}),
-        })
+        params = urllib.parse.urlencode(
+            {
+                "client_id": self._oauth_client_id,
+                "redirect_uri": redirect_uri,
+                "response_type": "code",
+                "scope": "openid email profile",
+                "access_type": "offline",
+                "prompt": "select_account",
+                "state": state,
+                **({"hd": self._domain} if self._domain else {}),
+            }
+        )
         return f"https://accounts.google.com/o/oauth2/v2/auth?{params}"
 
     async def authenticate(self, credentials: dict[str, Any]) -> AuthInfo | None:
@@ -171,7 +180,9 @@ class GoogleAuthBackend(AuthBackend):
                 return None
 
             if self._domain and info.get("hd") != self._domain:
-                logger.warning("Google auth rejected: domain %s != %s", info.get("hd"), self._domain)
+                logger.warning(
+                    "Google auth rejected: domain %s != %s", info.get("hd"), self._domain
+                )
                 return None
 
             return AuthInfo(

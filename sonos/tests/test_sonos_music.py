@@ -168,9 +168,7 @@ async def test_resolve_playable_non_spotify_falls_back_to_smapi() -> None:
     backend = SonosMusic()
 
     fake_svc = MagicMock()
-    fake_svc.sonos_uri_from_id.return_value = (
-        "soco://apple_music:song:123?sid=52&sn=1"
-    )
+    fake_svc.sonos_uri_from_id.return_value = "soco://apple_music:song:123?sid=52&sn=1"
     backend._get_smapi = MagicMock(return_value=fake_svc)  # type: ignore[method-assign]
 
     item = MusicItem(
@@ -254,8 +252,7 @@ class TestBuildSpotifyContainerPlayable:
         # URI uses the raw SMAPI item id as the cpcontainer tail. The
         # speaker backend dispatches on this prefix.
         assert playable.uri == (
-            "x-rincon-cpcontainer:"
-            "0fffffffspotify%3Aplaylist%3A37i9dQZF1EIeh2qaJ3IfzG"
+            "x-rincon-cpcontainer:0fffffffspotify%3Aplaylist%3A37i9dQZF1EIeh2qaJ3IfzG"
         )
         assert playable.title == "Blues Rock Mix"
 
@@ -268,9 +265,7 @@ class TestBuildSpotifyContainerPlayable:
         # Service descriptor binds the URI to the linked Spotify account.
         assert "SA_RINCON3079_X_#Svc3079-0-Token" in didl
         # Item id matches the URI tail so Sonos can resolve the container.
-        assert (
-            'id="0fffffffspotify%3Aplaylist%3A37i9dQZF1EIeh2qaJ3IfzG"' in didl
-        )
+        assert 'id="0fffffffspotify%3Aplaylist%3A37i9dQZF1EIeh2qaJ3IfzG"' in didl
 
     def test_album_uses_album_container_class(self) -> None:
         item = MusicItem(
@@ -283,10 +278,7 @@ class TestBuildSpotifyContainerPlayable:
         )
         playable = _build_spotify_container_playable(item, "album")
         assert playable.uri.startswith("x-rincon-cpcontainer:")
-        assert (
-            "<upnp:class>object.container.album.musicAlbum</upnp:class>"
-            in playable.didl_meta
-        )
+        assert "<upnp:class>object.container.album.musicAlbum</upnp:class>" in playable.didl_meta
 
     def test_artist_uses_person_container_class(self) -> None:
         item = MusicItem(
@@ -299,16 +291,13 @@ class TestBuildSpotifyContainerPlayable:
         )
         playable = _build_spotify_container_playable(item, "artist")
         assert playable.uri.startswith("x-rincon-cpcontainer:")
-        assert (
-            "<upnp:class>object.container.person.musicArtist</upnp:class>"
-            in playable.didl_meta
-        )
+        assert "<upnp:class>object.container.person.musicArtist</upnp:class>" in playable.didl_meta
 
     def test_escapes_special_chars_in_title(self) -> None:
         """DIDL is XML — titles with < or & must be escaped or the blob breaks."""
         item = MusicItem(
             id="0fffffffspotify%3Aplaylist%3AabcDEF",
-            title='R&B <2020>',
+            title="R&B <2020>",
             kind=MusicItemKind.PLAYLIST,
             subtitle="",
             uri="",
@@ -338,7 +327,10 @@ class _SMAPIStub:
     on the instance and everything else inside a ``.metadata`` dict."""
 
     def __init__(
-        self, item_id: str, title: str, metadata: dict[str, Any],
+        self,
+        item_id: str,
+        title: str,
+        metadata: dict[str, Any],
     ) -> None:
         self.item_id = item_id
         self.title = title
@@ -479,8 +471,5 @@ async def test_resolve_playable_playlist_uses_container_fast_path() -> None:
     playable = await backend.resolve_playable(item)
 
     assert playable.uri.startswith("x-rincon-cpcontainer:")
-    assert (
-        "<upnp:class>object.container.playlistContainer</upnp:class>"
-        in playable.didl_meta
-    )
+    assert "<upnp:class>object.container.playlistContainer</upnp:class>" in playable.didl_meta
     assert playable.title == "Blues Rock Mix"

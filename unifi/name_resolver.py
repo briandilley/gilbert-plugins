@@ -9,14 +9,54 @@ logger = logging.getLogger(__name__)
 
 # Words to strip from UniFi names before matching against user display names.
 # These are device-related terms that appear in hostnames and device names.
-_DEVICE_TOKENS = frozenset({
-    "iphone", "ipad", "macbook", "android", "pixel", "galaxy", "samsung",
-    "oneplus", "huawei", "xiaomi", "oppo", "motorola", "nokia", "lg",
-    "chromebook", "surface", "thinkpad", "dell", "hp", "lenovo",
-    "echo", "alexa", "google", "home", "nest", "sonos", "roku", "firestick",
-    "phone", "tablet", "laptop", "watch", "pro", "max", "mini", "plus",
-    "air", "se", "wifi", "wireless", "mobile", "device", "unknown", "generic",
-})
+_DEVICE_TOKENS = frozenset(
+    {
+        "iphone",
+        "ipad",
+        "macbook",
+        "android",
+        "pixel",
+        "galaxy",
+        "samsung",
+        "oneplus",
+        "huawei",
+        "xiaomi",
+        "oppo",
+        "motorola",
+        "nokia",
+        "lg",
+        "chromebook",
+        "surface",
+        "thinkpad",
+        "dell",
+        "hp",
+        "lenovo",
+        "echo",
+        "alexa",
+        "google",
+        "home",
+        "nest",
+        "sonos",
+        "roku",
+        "firestick",
+        "phone",
+        "tablet",
+        "laptop",
+        "watch",
+        "pro",
+        "max",
+        "mini",
+        "plus",
+        "air",
+        "se",
+        "wifi",
+        "wireless",
+        "mobile",
+        "device",
+        "unknown",
+        "generic",
+    }
+)
 
 # Characters to strip when normalizing names
 _STRIP_RE = re.compile(r"[^a-z\s]")

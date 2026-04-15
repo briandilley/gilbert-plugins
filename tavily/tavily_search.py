@@ -30,12 +30,15 @@ class TavilySearch(WebSearchBackend):
     def backend_config_params(cls) -> list[ConfigParam]:
         return [
             ConfigParam(
-                key="api_key", type=ToolParameterType.STRING,
+                key="api_key",
+                type=ToolParameterType.STRING,
                 description="Tavily API key.",
-                sensitive=True, restart_required=True,
+                sensitive=True,
+                restart_required=True,
             ),
             ConfigParam(
-                key="timeout", type=ToolParameterType.INTEGER,
+                key="timeout",
+                type=ToolParameterType.INTEGER,
                 description="Request timeout in seconds.",
                 default=_DEFAULT_TIMEOUT,
             ),
@@ -47,14 +50,14 @@ class TavilySearch(WebSearchBackend):
             ConfigAction(
                 key="test_connection",
                 label="Test connection",
-                description=(
-                    "Run a one-result search to verify the Tavily API key."
-                ),
+                description=("Run a one-result search to verify the Tavily API key."),
             ),
         ]
 
     async def invoke_backend_action(
-        self, key: str, payload: dict,
+        self,
+        key: str,
+        payload: dict,
     ) -> ConfigActionResult:
         if key == "test_connection":
             return await self._action_test_connection()
@@ -107,7 +110,9 @@ class TavilySearch(WebSearchBackend):
             self._client = None
 
     async def search(
-        self, query: str, count: int = 5,
+        self,
+        query: str,
+        count: int = 5,
     ) -> list[WebSearchResult]:
         if self._client is None:
             raise RuntimeError("TavilySearch not initialized")
@@ -129,26 +134,32 @@ class TavilySearch(WebSearchBackend):
         # Include Tavily's AI-generated answer as the first result if present
         answer = data.get("answer")
         if answer:
-            results.append(WebSearchResult(
-                title="AI Summary",
-                url="",
-                snippet=answer,
-            ))
+            results.append(
+                WebSearchResult(
+                    title="AI Summary",
+                    url="",
+                    snippet=answer,
+                )
+            )
 
         for item in data.get("results", []):
             content = item.get("content", "")
             if len(content) > 500:
                 content = content[:500] + "..."
-            results.append(WebSearchResult(
-                title=item.get("title", ""),
-                url=item.get("url", ""),
-                snippet=content,
-            ))
+            results.append(
+                WebSearchResult(
+                    title=item.get("title", ""),
+                    url=item.get("url", ""),
+                    snippet=content,
+                )
+            )
 
         return results
 
     async def search_images(
-        self, query: str, count: int = 5,
+        self,
+        query: str,
+        count: int = 5,
     ) -> list[str]:
         if self._client is None:
             raise RuntimeError("TavilySearch not initialized")

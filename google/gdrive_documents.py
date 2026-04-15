@@ -3,7 +3,8 @@
 import asyncio
 import io
 import logging
-from typing import Any, AsyncIterator
+from collections.abc import AsyncIterator
+from typing import Any
 
 from gilbert.interfaces.configuration import ConfigParam
 from gilbert.interfaces.knowledge import (
@@ -97,17 +98,23 @@ class GoogleDriveDocumentBackend(DocumentBackend):
     def backend_config_params(cls) -> list[ConfigParam]:
         return [
             ConfigParam(
-                key="service_account_json", type=ToolParameterType.STRING,
+                key="service_account_json",
+                type=ToolParameterType.STRING,
                 description="Google service account key (paste JSON content).",
-                sensitive=True, restart_required=True, multiline=True,
+                sensitive=True,
+                restart_required=True,
+                multiline=True,
             ),
             ConfigParam(
-                key="delegated_user", type=ToolParameterType.STRING,
+                key="delegated_user",
+                type=ToolParameterType.STRING,
                 description="Email of the user to impersonate via domain-wide delegation.",
-                default="", restart_required=True,
+                default="",
+                restart_required=True,
             ),
             ConfigParam(
-                key="folder_id", type=ToolParameterType.STRING,
+                key="folder_id",
+                type=ToolParameterType.STRING,
                 description="Google Drive folder or Shared Drive ID to index.",
                 restart_required=True,
             ),
@@ -143,18 +150,23 @@ class GoogleDriveDocumentBackend(DocumentBackend):
         if sa_json:
             try:
                 sa_info = _json.loads(sa_json) if isinstance(sa_json, str) else sa_json
-                from google.oauth2 import service_account
                 from googleapiclient.discovery import build
+
+                from google.oauth2 import service_account
 
                 scopes = ["https://www.googleapis.com/auth/drive.readonly"]
                 creds = service_account.Credentials.from_service_account_info(
-                    sa_info, scopes=scopes,
+                    sa_info,
+                    scopes=scopes,
                 )
                 if delegated_user:
                     creds = creds.with_subject(delegated_user)
 
                 self._drive = await asyncio.to_thread(
-                    build, "drive", "v3", credentials=creds,
+                    build,
+                    "drive",
+                    "v3",
+                    credentials=creds,
                 )
             except Exception:
                 logger.exception("Failed to initialize Google Drive backend '%s'", self._name)
@@ -187,7 +199,10 @@ class GoogleDriveDocumentBackend(DocumentBackend):
         return files
 
     async def _list_files_recursive(
-        self, folder_id: str, path_prefix: str, filter_prefix: str,
+        self,
+        folder_id: str,
+        path_prefix: str,
+        filter_prefix: str,
         out: list[dict[str, Any]],
     ) -> None:
         """Recursively list files in a folder and its subfolders."""
@@ -212,9 +227,7 @@ class GoogleDriveDocumentBackend(DocumentBackend):
                 kwargs["pageToken"] = page_token
             try:
                 async with self._api_lock:
-                    result = await asyncio.to_thread(
-                        self._drive.files().list(**kwargs).execute
-                    )
+                    result = await asyncio.to_thread(self._drive.files().list(**kwargs).execute)
             except Exception:
                 logger.warning("Drive API error listing folder %s", folder_id, exc_info=True)
                 return
@@ -300,9 +313,7 @@ class GoogleDriveDocumentBackend(DocumentBackend):
                 kwargs["pageToken"] = page_token
             try:
                 async with self._api_lock:
-                    result = await asyncio.to_thread(
-                        self._drive.files().list(**kwargs).execute
-                    )
+                    result = await asyncio.to_thread(self._drive.files().list(**kwargs).execute)
             except Exception:
                 logger.warning("Drive API error listing children at %s", path, exc_info=True)
                 return []
@@ -315,24 +326,28 @@ class GoogleDriveDocumentBackend(DocumentBackend):
                 if is_folder:
                     # Cache folder ID for future navigation
                     self._folder_id_cache[child_path] = f["id"]
-                    children.append({
-                        "name": name,
-                        "path": child_path,
-                        "is_folder": True,
-                    })
+                    children.append(
+                        {
+                            "name": name,
+                            "path": child_path,
+                            "is_folder": True,
+                        }
+                    )
                 else:
                     doc_type = _type_from_mime(f.get("mimeType", ""), name)
                     if doc_type == DocumentType.UNKNOWN:
                         continue
-                    children.append({
-                        "name": name,
-                        "path": child_path,
-                        "is_folder": False,
-                        "size": int(f.get("size", 0)),
-                        "modified": f.get("modifiedTime", ""),
-                        "type": doc_type.value,
-                        "external_url": f.get("webViewLink", ""),
-                    })
+                    children.append(
+                        {
+                            "name": name,
+                            "path": child_path,
+                            "is_folder": False,
+                            "size": int(f.get("size", 0)),
+                            "modified": f.get("modifiedTime", ""),
+                            "type": doc_type.value,
+                            "external_url": f.get("webViewLink", ""),
+                        }
+                    )
                     # Cache file for metadata lookups
                     f["_path"] = child_path
                     self._file_cache[child_path] = f
@@ -369,10 +384,15 @@ class GoogleDriveDocumentBackend(DocumentBackend):
             try:
                 async with self._api_lock:
                     result = await asyncio.to_thread(
-                        self._drive.files().list(
-                            q=q, fields="files(id)", pageSize=1,
-                            includeItemsFromAllDrives=True, supportsAllDrives=True,
-                        ).execute
+                        self._drive.files()
+                        .list(
+                            q=q,
+                            fields="files(id)",
+                            pageSize=1,
+                            includeItemsFromAllDrives=True,
+                            supportsAllDrives=True,
+                        )
+                        .execute
                     )
                 files = result.get("files", [])
                 if not files:
@@ -423,9 +443,7 @@ class GoogleDriveDocumentBackend(DocumentBackend):
         try:
             if self._is_google_native(mime_type):
                 export_mime = _EXPORT_MAP[mime_type]
-                request = self._drive.files().export_media(
-                    fileId=file_id, mimeType=export_mime
-                )
+                request = self._drive.files().export_media(fileId=file_id, mimeType=export_mime)
             else:
                 request = self._drive.files().get_media(fileId=file_id)
 
@@ -446,9 +464,7 @@ class GoogleDriveDocumentBackend(DocumentBackend):
             logger.warning("Failed to download file %s", file_id, exc_info=True)
             return None
 
-    async def upload_document(
-        self, path: str, data: bytes, mime_type: str = ""
-    ) -> DocumentMeta:
+    async def upload_document(self, path: str, data: bytes, mime_type: str = "") -> DocumentMeta:
         if self._drive is None:
             raise RuntimeError("Drive not initialized")
 
@@ -460,6 +476,7 @@ class GoogleDriveDocumentBackend(DocumentBackend):
 
         if not mime_type:
             import mimetypes as mt
+
             mime_type = mt.guess_type(path)[0] or "application/octet-stream"
 
         media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime_type)
@@ -472,9 +489,7 @@ class GoogleDriveDocumentBackend(DocumentBackend):
         kwargs["supportsAllDrives"] = True
 
         async with self._api_lock:
-            result = await asyncio.to_thread(
-                self._drive.files().create(**kwargs).execute
-            )
+            result = await asyncio.to_thread(self._drive.files().create(**kwargs).execute)
         self._file_cache[result["name"]] = result
         logger.info("Uploaded to Drive: %s", path)
         return self._file_to_meta(result)
@@ -502,5 +517,5 @@ class GoogleDriveDocumentBackend(DocumentBackend):
         data = content.data
         offset = 0
         while offset < len(data):
-            yield data[offset:offset + _STREAM_CHUNK_SIZE]
+            yield data[offset : offset + _STREAM_CHUNK_SIZE]
             offset += _STREAM_CHUNK_SIZE

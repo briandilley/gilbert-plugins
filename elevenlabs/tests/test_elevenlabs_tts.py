@@ -3,9 +3,9 @@
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from gilbert_plugin_elevenlabs.elevenlabs_tts import ElevenLabsTTS
 
 from gilbert.interfaces.tts import AudioFormat, SynthesisRequest
-from gilbert_plugin_elevenlabs.elevenlabs_tts import ElevenLabsTTS
 
 
 @pytest.fixture
@@ -266,12 +266,16 @@ async def test_cache_keys_differ_by_format(backend: ElevenLabsTTS) -> None:
     ) as mock_post:
         await backend.synthesize(
             SynthesisRequest(
-                text="Hi", voice_id="v1", output_format=AudioFormat.MP3,
+                text="Hi",
+                voice_id="v1",
+                output_format=AudioFormat.MP3,
             )
         )
         await backend.synthesize(
             SynthesisRequest(
-                text="Hi", voice_id="v1", output_format=AudioFormat.WAV,
+                text="Hi",
+                voice_id="v1",
+                output_format=AudioFormat.WAV,
             )
         )
         assert mock_post.call_count == 2
@@ -289,12 +293,8 @@ async def test_cache_keys_differ_by_voice_settings(
         "post",
         return_value=_make_mock_response(),
     ) as mock_post:
-        await backend.synthesize(
-            SynthesisRequest(text="Hi", voice_id="v1", stability=0.5)
-        )
-        await backend.synthesize(
-            SynthesisRequest(text="Hi", voice_id="v1", stability=0.9)
-        )
+        await backend.synthesize(SynthesisRequest(text="Hi", voice_id="v1", stability=0.5))
+        await backend.synthesize(SynthesisRequest(text="Hi", voice_id="v1", stability=0.9))
         assert mock_post.call_count == 2
 
     await backend.close()
@@ -353,9 +353,7 @@ async def test_cache_ttl_expires_old_entries(backend: ElevenLabsTTS) -> None:
     """Entries older than ttl_seconds are evicted on access."""
     import time as time_mod
 
-    await backend.initialize(
-        {"api_key": "sk-test", "cache_ttl_seconds": 0.05}
-    )
+    await backend.initialize({"api_key": "sk-test", "cache_ttl_seconds": 0.05})
 
     with patch.object(
         backend._client,  # type: ignore[union-attr]
@@ -378,9 +376,7 @@ async def test_cache_ttl_expires_old_entries(backend: ElevenLabsTTS) -> None:
 
 async def test_cache_ttl_zero_disables_expiry(backend: ElevenLabsTTS) -> None:
     """ttl=0 means entries live until LRU evicts them."""
-    await backend.initialize(
-        {"api_key": "sk-test", "cache_ttl_seconds": 0}
-    )
+    await backend.initialize({"api_key": "sk-test", "cache_ttl_seconds": 0})
 
     with patch.object(
         backend._client,  # type: ignore[union-attr]

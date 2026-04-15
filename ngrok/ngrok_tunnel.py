@@ -23,14 +23,18 @@ class NgrokTunnel(TunnelBackend):
     def backend_config_params(cls) -> list[ConfigParam]:
         return [
             ConfigParam(
-                key="api_key", type=ToolParameterType.STRING,
+                key="api_key",
+                type=ToolParameterType.STRING,
                 description="Ngrok auth token.",
-                sensitive=True, restart_required=True,
+                sensitive=True,
+                restart_required=True,
             ),
             ConfigParam(
-                key="domain", type=ToolParameterType.STRING,
+                key="domain",
+                type=ToolParameterType.STRING,
                 description="Custom ngrok domain (e.g., 'myapp.ngrok.io').",
-                default="", restart_required=True,
+                default="",
+                restart_required=True,
             ),
         ]
 
@@ -41,14 +45,15 @@ class NgrokTunnel(TunnelBackend):
                 key="test_connection",
                 label="Test connection",
                 description=(
-                    "Report the current public tunnel URL (or an error if "
-                    "the tunnel isn't active)."
+                    "Report the current public tunnel URL (or an error if the tunnel isn't active)."
                 ),
             ),
         ]
 
     async def invoke_backend_action(
-        self, key: str, payload: dict,
+        self,
+        key: str,
+        payload: dict,
     ) -> ConfigActionResult:
         if key == "test_connection":
             return await self._action_test_connection()

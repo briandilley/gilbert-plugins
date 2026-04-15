@@ -67,18 +67,17 @@ class UniFiProtect:
         for c in data if isinstance(data, list) else []:
             feature_flags = c.get("featureFlags", {}) or {}
             model_name = c.get("type", "")
-            is_doorbell = (
-                feature_flags.get("hasChime", False)
-                or "doorbell" in model_name.lower()
+            is_doorbell = feature_flags.get("hasChime", False) or "doorbell" in model_name.lower()
+            cameras.append(
+                Camera(
+                    camera_id=c.get("id", ""),
+                    name=c.get("name", ""),
+                    model=model_name,
+                    state=c.get("state", ""),
+                    last_motion=c.get("lastMotion", 0),
+                    is_doorbell=is_doorbell,
+                )
             )
-            cameras.append(Camera(
-                camera_id=c.get("id", ""),
-                name=c.get("name", ""),
-                model=model_name,
-                state=c.get("state", ""),
-                last_motion=c.get("lastMotion", 0),
-                is_doorbell=is_doorbell,
-            ))
         return cameras
 
     async def _ensure_camera_names(self) -> None:
@@ -124,15 +123,17 @@ class UniFiProtect:
 
         events: list[DetectionEvent] = []
         for e in data if isinstance(data, list) else []:
-            events.append(DetectionEvent(
-                event_id=e.get("id", ""),
-                camera_name=self._resolve_camera_name(e.get("camera")),
-                event_type=e.get("type", ""),
-                smart_types=e.get("smartDetectTypes", []),
-                start=e.get("start", 0),
-                end=e.get("end", 0),
-                score=e.get("score", 0),
-            ))
+            events.append(
+                DetectionEvent(
+                    event_id=e.get("id", ""),
+                    camera_name=self._resolve_camera_name(e.get("camera")),
+                    event_type=e.get("type", ""),
+                    smart_types=e.get("smartDetectTypes", []),
+                    start=e.get("start", 0),
+                    end=e.get("end", 0),
+                    score=e.get("score", 0),
+                )
+            )
         return events
 
     async def get_face_detections(self, lookback_minutes: int = 30) -> list[FaceDetection]:
@@ -171,12 +172,14 @@ class UniFiProtect:
             if not matched_name:
                 continue
 
-            faces.append(FaceDetection(
-                person_name=matched_name,
-                camera_name=self._resolve_camera_name(e.get("camera")),
-                timestamp=e.get("start", 0),
-                confidence=e.get("score", 0),
-            ))
+            faces.append(
+                FaceDetection(
+                    person_name=matched_name,
+                    camera_name=self._resolve_camera_name(e.get("camera")),
+                    timestamp=e.get("start", 0),
+                    confidence=e.get("score", 0),
+                )
+            )
 
         if faces:
             unique_people = {f.person_name for f in faces}

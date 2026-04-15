@@ -102,14 +102,16 @@ async def score_round(
         if is_fastest:
             pts += 1
 
-        results.append({
-            "player_id": pg.player_id,
-            "player_name": pg.player_name,
-            "guess_text": pg.guess_text,
-            "got_title": match["title"],
-            "got_artist": match["artist"],
-            "is_fastest": is_fastest,
-            "points": pts,
-        })
+        results.append(
+            {
+                "player_id": pg.player_id,
+                "player_name": pg.player_name,
+                "guess_text": pg.guess_text,
+                "got_title": match["title"],
+                "got_artist": match["artist"],
+                "is_fastest": is_fastest,
+                "points": pts,
+            }
+        )
 
     return results

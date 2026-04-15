@@ -93,8 +93,7 @@ class SlackService(Service):
             from slack_bolt.async_app import AsyncApp
         except ImportError:
             logger.warning(
-                "slack-bolt not installed — Slack service disabled. "
-                "Install with: uv add slack-bolt"
+                "slack-bolt not installed — Slack service disabled. Install with: uv add slack-bolt"
             )
             return
 
@@ -174,14 +173,20 @@ class SlackService(Service):
     def config_params(self) -> list[ConfigParam]:
         return [
             ConfigParam(
-                key="bot_token", type=ToolParameterType.STRING,
+                key="bot_token",
+                type=ToolParameterType.STRING,
                 description="Slack bot token (xoxb-...).",
-                default="", restart_required=True, sensitive=True,
+                default="",
+                restart_required=True,
+                sensitive=True,
             ),
             ConfigParam(
-                key="app_token", type=ToolParameterType.STRING,
+                key="app_token",
+                type=ToolParameterType.STRING,
                 description="Slack app-level token (xapp-...).",
-                default="", restart_required=True, sensitive=True,
+                default="",
+                restart_required=True,
+                sensitive=True,
             ),
         ]
 
@@ -308,9 +313,7 @@ class SlackService(Service):
                 result = await client.users_info(user=slack_user_id)
                 profile = result.get("user", {}).get("profile", {})
                 display_name = (
-                    profile.get("display_name")
-                    or profile.get("real_name")
-                    or display_name
+                    profile.get("display_name") or profile.get("real_name") or display_name
                 )
                 email = profile.get("email", "")
         except Exception:

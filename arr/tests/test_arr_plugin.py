@@ -28,7 +28,9 @@ def _http_status_error(code: int) -> httpx.HTTPStatusError:
     request = httpx.Request("GET", "http://example/fake")
     response = httpx.Response(code, request=request)
     return httpx.HTTPStatusError(
-        f"HTTP {code}", request=request, response=response,
+        f"HTTP {code}",
+        request=request,
+        response=response,
     )
 
 
@@ -49,7 +51,10 @@ class FakeArrClient:
         self.errors[(method, path)] = exc
 
     def _dispatch(
-        self, method: str, path: str, payload: dict[str, Any] | None,
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None,
     ) -> Any:
         self.calls.append((method, path, payload))
         err = self.errors.get((method, path))
@@ -131,9 +136,17 @@ def test_disabled_sonarr_returns_no_tools() -> None:
 def test_enabled_radarr_exposes_expected_tools(radarr: RadarrService) -> None:
     names = {t.name for t in radarr.get_tools()}
     expected = {
-        "radarr_search", "radarr_find", "radarr_list", "radarr_details",
-        "radarr_upcoming", "radarr_queue", "radarr_recent", "radarr_profiles",
-        "radarr_add", "radarr_remove", "radarr_grab",
+        "radarr_search",
+        "radarr_find",
+        "radarr_list",
+        "radarr_details",
+        "radarr_upcoming",
+        "radarr_queue",
+        "radarr_recent",
+        "radarr_profiles",
+        "radarr_add",
+        "radarr_remove",
+        "radarr_grab",
     }
     assert expected <= names
 
@@ -141,9 +154,18 @@ def test_enabled_radarr_exposes_expected_tools(radarr: RadarrService) -> None:
 def test_enabled_sonarr_exposes_expected_tools(sonarr: SonarrService) -> None:
     names = {t.name for t in sonarr.get_tools()}
     expected = {
-        "sonarr_search", "sonarr_find", "sonarr_list", "sonarr_details",
-        "sonarr_episodes", "sonarr_upcoming", "sonarr_queue", "sonarr_recent",
-        "sonarr_profiles", "sonarr_add", "sonarr_remove", "sonarr_grab",
+        "sonarr_search",
+        "sonarr_find",
+        "sonarr_list",
+        "sonarr_details",
+        "sonarr_episodes",
+        "sonarr_upcoming",
+        "sonarr_queue",
+        "sonarr_recent",
+        "sonarr_profiles",
+        "sonarr_add",
+        "sonarr_remove",
+        "sonarr_grab",
     }
     assert expected <= names
 
@@ -205,11 +227,16 @@ async def test_radarr_disabled_returns_error_message() -> None:
 async def test_radarr_search_formats_results(radarr: RadarrService) -> None:
     client: FakeArrClient = radarr._client  # type: ignore[assignment]
     client.set(
-        "GET", "/movie/lookup",
+        "GET",
+        "/movie/lookup",
         [
             {
-                "title": "Inception", "year": 2010, "runtime": 148,
-                "tmdbId": 27205, "id": 0, "overview": "A thief who steals corporate secrets...",
+                "title": "Inception",
+                "year": 2010,
+                "runtime": 148,
+                "tmdbId": 27205,
+                "id": 0,
+                "overview": "A thief who steals corporate secrets...",
                 "images": [],
             },
         ],
@@ -229,7 +256,8 @@ async def test_radarr_search_requires_query(radarr: RadarrService) -> None:
 async def test_radarr_list_skips_unmonitored(radarr: RadarrService) -> None:
     client: FakeArrClient = radarr._client  # type: ignore[assignment]
     client.set(
-        "GET", "/movie",
+        "GET",
+        "/movie",
         [
             {"title": "Monitored", "year": 2001, "hasFile": True, "monitored": True, "id": 1},
             {"title": "Skipped", "year": 2002, "hasFile": False, "monitored": False, "id": 2},
@@ -243,15 +271,22 @@ async def test_radarr_list_skips_unmonitored(radarr: RadarrService) -> None:
 async def test_radarr_details_resolves_by_name(radarr: RadarrService) -> None:
     client: FakeArrClient = radarr._client  # type: ignore[assignment]
     client.set(
-        "GET", "/movie",
+        "GET",
+        "/movie",
         [{"id": 42, "title": "The Matrix"}],
     )
     client.set(
-        "GET", "/movie/42",
+        "GET",
+        "/movie/42",
         {
-            "id": 42, "title": "The Matrix", "year": 1999,
-            "hasFile": True, "runtime": 136, "genres": ["Action"],
-            "monitored": True, "images": [],
+            "id": 42,
+            "title": "The Matrix",
+            "year": 1999,
+            "hasFile": True,
+            "runtime": 136,
+            "genres": ["Action"],
+            "monitored": True,
+            "images": [],
             "movieFile": {
                 "quality": {"quality": {"name": "1080p"}},
                 "size": 5_368_709_120,
@@ -274,15 +309,22 @@ async def test_radarr_details_missing_returns_friendly_message(radarr: RadarrSer
 async def test_radarr_add_happy_path(radarr: RadarrService) -> None:
     client: FakeArrClient = radarr._client  # type: ignore[assignment]
     client.set(
-        "GET", "/movie/lookup",
-        [{
-            "title": "Dune", "year": 2021, "tmdbId": 438631, "id": 0,
-            "images": [],
-        }],
+        "GET",
+        "/movie/lookup",
+        [
+            {
+                "title": "Dune",
+                "year": 2021,
+                "tmdbId": 438631,
+                "id": 0,
+                "images": [],
+            }
+        ],
     )
     client.set("GET", "/rootfolder", [{"path": "/movies"}])
     client.set(
-        "GET", "/qualityprofile",
+        "GET",
+        "/qualityprofile",
         [{"id": 1, "name": "HD"}, {"id": 2, "name": "Ultra-HD"}],
     )
     client.set("POST", "/movie", {"title": "Dune"})
@@ -312,7 +354,8 @@ async def test_radarr_add_rejects_missing_tmdb_id(radarr: RadarrService) -> None
 async def test_radarr_add_rejects_already_in_library(radarr: RadarrService) -> None:
     client: FakeArrClient = radarr._client  # type: ignore[assignment]
     client.set(
-        "GET", "/movie/lookup",
+        "GET",
+        "/movie/lookup",
         [{"title": "Dune", "tmdbId": 438631, "id": 5, "images": []}],
     )
     result = await radarr.execute_tool("radarr_add", {"tmdb_id": 438631})
@@ -371,12 +414,19 @@ async def test_sonarr_disabled_returns_error_message() -> None:
 async def test_sonarr_search_formats_results(sonarr: SonarrService) -> None:
     client: FakeArrClient = sonarr._client  # type: ignore[assignment]
     client.set(
-        "GET", "/series/lookup",
-        [{
-            "title": "Breaking Bad", "year": 2008, "seasonCount": 5,
-            "status": "ended", "tvdbId": 81189, "images": [],
-            "overview": "A chemistry teacher diagnosed with cancer...",
-        }],
+        "GET",
+        "/series/lookup",
+        [
+            {
+                "title": "Breaking Bad",
+                "year": 2008,
+                "seasonCount": 5,
+                "status": "ended",
+                "tvdbId": 81189,
+                "images": [],
+                "overview": "A chemistry teacher diagnosed with cancer...",
+            }
+        ],
     )
     result = await sonarr.execute_tool("sonarr_search", {"query": "breaking"})
     assert "Breaking Bad" in result
@@ -386,14 +436,20 @@ async def test_sonarr_search_formats_results(sonarr: SonarrService) -> None:
 async def test_sonarr_list_formats_progress(sonarr: SonarrService) -> None:
     client: FakeArrClient = sonarr._client  # type: ignore[assignment]
     client.set(
-        "GET", "/series",
-        [{
-            "id": 1, "title": "Fringe", "monitored": True,
-            "statistics": {
-                "episodeFileCount": 80, "totalEpisodeCount": 100,
-                "percentOfEpisodes": 80.0,
-            },
-        }],
+        "GET",
+        "/series",
+        [
+            {
+                "id": 1,
+                "title": "Fringe",
+                "monitored": True,
+                "statistics": {
+                    "episodeFileCount": 80,
+                    "totalEpisodeCount": 100,
+                    "percentOfEpisodes": 80.0,
+                },
+            }
+        ],
     )
     result = await sonarr.execute_tool("sonarr_list", {})
     assert "Fringe" in result
@@ -403,12 +459,14 @@ async def test_sonarr_list_formats_progress(sonarr: SonarrService) -> None:
 async def test_sonarr_add_happy_path(sonarr: SonarrService) -> None:
     client: FakeArrClient = sonarr._client  # type: ignore[assignment]
     client.set(
-        "GET", "/series/lookup",
+        "GET",
+        "/series/lookup",
         [{"title": "Severance", "tvdbId": 371980, "id": 0, "images": []}],
     )
     client.set("GET", "/rootfolder", [{"path": "/tv"}])
     client.set(
-        "GET", "/qualityprofile",
+        "GET",
+        "/qualityprofile",
         [{"id": 4, "name": "Any"}, {"id": 5, "name": "HD-1080p"}],
     )
     client.set("POST", "/series", {"title": "Severance"})
@@ -445,10 +503,16 @@ async def test_sonarr_details_resolves_by_name(sonarr: SonarrService) -> None:
     client: FakeArrClient = sonarr._client  # type: ignore[assignment]
     client.set("GET", "/series", [{"id": 11, "title": "Lost"}])
     client.set(
-        "GET", "/series/11",
+        "GET",
+        "/series/11",
         {
-            "id": 11, "title": "Lost", "year": 2004, "status": "ended",
-            "seasonCount": 6, "network": "ABC", "monitored": True,
+            "id": 11,
+            "title": "Lost",
+            "year": 2004,
+            "status": "ended",
+            "seasonCount": 6,
+            "network": "ABC",
+            "monitored": True,
             "statistics": {"episodeFileCount": 120, "totalEpisodeCount": 121},
             "images": [],
         },
@@ -494,11 +558,13 @@ async def test_sonarr_test_connection_disabled_returns_error() -> None:
 async def test_radarr_test_connection_ok_returns_version(radarr: RadarrService) -> None:
     client: FakeArrClient = radarr._client  # type: ignore[assignment]
     client.set(
-        "GET", "/system/status",
+        "GET",
+        "/system/status",
         {"appName": "Radarr", "version": "5.4.1.8668"},
     )
     client.set(
-        "GET", "/qualityprofile",
+        "GET",
+        "/qualityprofile",
         [{"id": 1, "name": "HD"}, {"id": 2, "name": "Ultra-HD"}],
     )
     client.set("GET", "/rootfolder", [{"path": "/movies"}, {"path": "/4k"}])
@@ -515,7 +581,8 @@ async def test_radarr_test_connection_ok_returns_version(radarr: RadarrService) 
 async def test_sonarr_test_connection_ok_returns_version(sonarr: SonarrService) -> None:
     client: FakeArrClient = sonarr._client  # type: ignore[assignment]
     client.set(
-        "GET", "/system/status",
+        "GET",
+        "/system/status",
         {"appName": "Sonarr", "version": "4.0.9.2332"},
     )
     client.set("GET", "/qualityprofile", [{"id": 1, "name": "Any"}])
@@ -565,7 +632,9 @@ async def test_radarr_test_connection_network_error_reports_failure(
 ) -> None:
     client: FakeArrClient = radarr._client  # type: ignore[assignment]
     client.set_error(
-        "GET", "/system/status", httpx.ConnectError("unreachable"),
+        "GET",
+        "/system/status",
+        httpx.ConnectError("unreachable"),
     )
 
     result = await radarr.invoke_config_action("test_connection", {})
@@ -615,10 +684,14 @@ async def test_radarr_refresh_choices_survives_partial_failure(
     """If one of the two lookups fails, the other should still populate."""
     client: FakeArrClient = radarr._client  # type: ignore[assignment]
     client.set(
-        "GET", "/qualityprofile", [{"id": 1, "name": "HD"}],
+        "GET",
+        "/qualityprofile",
+        [{"id": 1, "name": "HD"}],
     )
     client.set_error(
-        "GET", "/rootfolder", httpx.ConnectError("root folder boom"),
+        "GET",
+        "/rootfolder",
+        httpx.ConnectError("root folder boom"),
     )
 
     await radarr._refresh_choices()
@@ -631,11 +704,13 @@ async def test_radarr_refresh_choices_filters_empty_names(
 ) -> None:
     client: FakeArrClient = radarr._client  # type: ignore[assignment]
     client.set(
-        "GET", "/qualityprofile",
+        "GET",
+        "/qualityprofile",
         [{"id": 1, "name": "HD"}, {"id": 2, "name": ""}, {"id": 3}],
     )
     client.set(
-        "GET", "/rootfolder",
+        "GET",
+        "/rootfolder",
         [{"path": "/movies"}, {"path": ""}, {}],
     )
 
@@ -675,19 +750,27 @@ async def test_radarr_find_returns_tooloutput_with_blocks(
 ) -> None:
     client: FakeArrClient = radarr._client  # type: ignore[assignment]
     client.set(
-        "GET", "/movie/lookup",
+        "GET",
+        "/movie/lookup",
         [
             {
-                "title": "Inception", "year": 2010, "runtime": 148,
-                "tmdbId": 27205, "id": 0,
+                "title": "Inception",
+                "year": 2010,
+                "runtime": 148,
+                "tmdbId": 27205,
+                "id": 0,
                 "overview": "A thief who steals corporate secrets via dream-sharing tech.",
                 "images": [
                     {"coverType": "poster", "remoteUrl": "http://img/inception.jpg"},
                 ],
             },
             {
-                "title": "Dune", "year": 2021, "runtime": 155,
-                "tmdbId": 438631, "id": 0, "overview": "",
+                "title": "Dune",
+                "year": 2021,
+                "runtime": 155,
+                "tmdbId": 438631,
+                "id": 0,
+                "overview": "",
                 "images": [],
             },
         ],
@@ -724,7 +807,8 @@ async def test_radarr_find_returns_tooloutput_with_blocks(
 async def test_radarr_find_caps_at_five_candidates(radarr: RadarrService) -> None:
     client: FakeArrClient = radarr._client  # type: ignore[assignment]
     client.set(
-        "GET", "/movie/lookup",
+        "GET",
+        "/movie/lookup",
         [
             {"title": f"Movie {i}", "year": 2000 + i, "tmdbId": i, "id": 0, "images": []}
             for i in range(10)
@@ -740,11 +824,17 @@ async def test_radarr_find_skips_add_button_when_already_in_library(
 ) -> None:
     client: FakeArrClient = radarr._client  # type: ignore[assignment]
     client.set(
-        "GET", "/movie/lookup",
-        [{
-            "title": "Owned Movie", "year": 2001, "tmdbId": 1, "id": 99,
-            "images": [],
-        }],
+        "GET",
+        "/movie/lookup",
+        [
+            {
+                "title": "Owned Movie",
+                "year": 2001,
+                "tmdbId": 1,
+                "id": 99,
+                "images": [],
+            }
+        ],
     )
     result = await radarr.execute_tool("radarr_find", {"query": "owned"})
     assert isinstance(result, ToolOutput)
@@ -769,15 +859,22 @@ async def test_sonarr_find_returns_tooloutput_with_blocks(
 ) -> None:
     client: FakeArrClient = sonarr._client  # type: ignore[assignment]
     client.set(
-        "GET", "/series/lookup",
-        [{
-            "title": "Severance", "year": 2022, "seasonCount": 2,
-            "status": "continuing", "tvdbId": 371980, "id": 0,
-            "overview": "Innies and outies at Lumon Industries.",
-            "images": [
-                {"coverType": "poster", "remoteUrl": "http://img/severance.jpg"},
-            ],
-        }],
+        "GET",
+        "/series/lookup",
+        [
+            {
+                "title": "Severance",
+                "year": 2022,
+                "seasonCount": 2,
+                "status": "continuing",
+                "tvdbId": 371980,
+                "id": 0,
+                "overview": "Innies and outies at Lumon Industries.",
+                "images": [
+                    {"coverType": "poster", "remoteUrl": "http://img/severance.jpg"},
+                ],
+            }
+        ],
     )
     result = await sonarr.execute_tool("sonarr_find", {"query": "sev"})
     assert isinstance(result, ToolOutput)
@@ -800,11 +897,18 @@ async def test_sonarr_find_skips_add_button_when_already_in_library(
 ) -> None:
     client: FakeArrClient = sonarr._client  # type: ignore[assignment]
     client.set(
-        "GET", "/series/lookup",
-        [{
-            "title": "Owned Show", "year": 2010, "tvdbId": 1, "id": 42,
-            "seasonCount": 3, "images": [],
-        }],
+        "GET",
+        "/series/lookup",
+        [
+            {
+                "title": "Owned Show",
+                "year": 2010,
+                "tvdbId": 1,
+                "id": 42,
+                "seasonCount": 3,
+                "images": [],
+            }
+        ],
     )
     result = await sonarr.execute_tool("sonarr_find", {"query": "owned"})
     assert isinstance(result, ToolOutput)

@@ -30,17 +30,22 @@ class GoogleDirectoryBackend(UserProviderBackend):
     def backend_config_params(cls) -> list[ConfigParam]:
         return [
             ConfigParam(
-                key="sa_json", type=ToolParameterType.STRING,
+                key="sa_json",
+                type=ToolParameterType.STRING,
                 description="Google service account key (paste JSON content).",
-                sensitive=True, restart_required=True, multiline=True,
+                sensitive=True,
+                restart_required=True,
+                multiline=True,
             ),
             ConfigParam(
-                key="delegated_user", type=ToolParameterType.STRING,
+                key="delegated_user",
+                type=ToolParameterType.STRING,
                 description="Admin email to impersonate for directory API.",
                 restart_required=True,
             ),
             ConfigParam(
-                key="domain", type=ToolParameterType.STRING,
+                key="domain",
+                type=ToolParameterType.STRING,
                 description="Google Workspace domain to sync users from.",
                 restart_required=True,
             ),
@@ -60,7 +65,9 @@ class GoogleDirectoryBackend(UserProviderBackend):
         ]
 
     async def invoke_backend_action(
-        self, key: str, payload: dict,
+        self,
+        key: str,
+        payload: dict,
     ) -> ConfigActionResult:
         if key == "test_connection":
             return await self._action_test_connection()
@@ -81,10 +88,12 @@ class GoogleDirectoryBackend(UserProviderBackend):
             )
         try:
             response = await asyncio.to_thread(
-                self._directory.users().list(
+                self._directory.users()
+                .list(
                     domain=self._domain,
                     maxResults=1,
-                ).execute,
+                )
+                .execute,
             )
         except Exception as exc:
             return ConfigActionResult(
@@ -118,21 +127,26 @@ class GoogleDirectoryBackend(UserProviderBackend):
         try:
             sa_info = json.loads(sa_json) if isinstance(sa_json, str) else sa_json
 
-            from google.oauth2 import service_account
             from googleapiclient.discovery import build
+
+            from google.oauth2 import service_account
 
             scopes = [
                 "https://www.googleapis.com/auth/admin.directory.user.readonly",
                 "https://www.googleapis.com/auth/admin.directory.group.readonly",
             ]
             creds = service_account.Credentials.from_service_account_info(
-                sa_info, scopes=scopes,
+                sa_info,
+                scopes=scopes,
             )
             if delegated_user:
                 creds = creds.with_subject(delegated_user)
 
             self._directory = await asyncio.to_thread(
-                build, "admin", "directory_v1", credentials=creds,
+                build,
+                "admin",
+                "directory_v1",
+                credentials=creds,
             )
             logger.info("Google Directory backend initialized (domain=%s)", self._domain or "(any)")
         except Exception:
@@ -317,9 +331,7 @@ class GoogleDirectoryBackend(UserProviderBackend):
         return groups
 
     @staticmethod
-    def _assign_groups_to_users(
-        users: list[ExternalUser], groups: list[dict[str, Any]]
-    ) -> None:
+    def _assign_groups_to_users(users: list[ExternalUser], groups: list[dict[str, Any]]) -> None:
         email_to_user = {u.email: u for u in users}
         for group in groups:
             group_name = group.get("name", group.get("email", ""))
