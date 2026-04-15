@@ -7,6 +7,7 @@ import logging
 import random
 from typing import Any
 
+from gilbert.interfaces.auth import UserContext
 from gilbert.interfaces.configuration import ConfigParam, ConfigurationReader
 from gilbert.interfaces.events import EventBusProvider
 from gilbert.interfaces.service import Service, ServiceInfo, ServiceResolver
@@ -136,7 +137,7 @@ class GuessGameService(Service):
     def tool_provider_name(self) -> str:
         return "guess_game"
 
-    def get_tools(self) -> list[ToolDefinition]:
+    def get_tools(self, user_ctx: UserContext | None = None) -> list[ToolDefinition]:
         if not self._enabled:
             return []
         return [
