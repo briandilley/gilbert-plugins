@@ -223,7 +223,49 @@ class AnthropicAI(AIBackend):
                 continue
 
             if msg.role == MessageRole.USER:
-                result.append({"role": "user", "content": msg.content})
+                if msg.attachments:
+                    # Multimodal turn. Order per Anthropic's recommendation:
+                    # images first, then documents, then text-kind blocks
+                    # (which read as prompt context), then the user's own
+                    # typed message last.
+                    user_content: list[dict[str, Any]] = []
+                    image_atts = [a for a in msg.attachments if a.kind == "image"]
+                    doc_atts = [a for a in msg.attachments if a.kind == "document"]
+                    text_atts = [a for a in msg.attachments if a.kind == "text"]
+                    for img in image_atts:
+                        user_content.append({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": img.media_type,
+                                "data": img.data,
+                            },
+                        })
+                    for doc in doc_atts:
+                        user_content.append({
+                            "type": "document",
+                            "source": {
+                                "type": "base64",
+                                "media_type": doc.media_type or "application/pdf",
+                                "data": doc.data,
+                            },
+                        })
+                    for txt in text_atts:
+                        user_content.append({
+                            "type": "text",
+                            "text": f"## {txt.name}\n\n{txt.text}",
+                        })
+                    if msg.content:
+                        user_content.append({"type": "text", "text": msg.content})
+                    if not user_content:
+                        # All attachments were of an unknown kind; fall
+                        # back to the plain-string form so Anthropic gets
+                        # a valid message.
+                        result.append({"role": "user", "content": msg.content})
+                    else:
+                        result.append({"role": "user", "content": user_content})
+                else:
+                    result.append({"role": "user", "content": msg.content})
 
             elif msg.role == MessageRole.ASSISTANT:
                 # Slash-command turns are persisted as a single assistant row

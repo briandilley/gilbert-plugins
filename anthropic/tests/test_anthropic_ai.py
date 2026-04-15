@@ -3,11 +3,12 @@
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
 from gilbert_plugin_anthropic.anthropic_ai import AnthropicAI
+
 from gilbert.interfaces.ai import (
     AIBackendError,
     AIRequest,
+    FileAttachment,
     Message,
     MessageRole,
     StopReason,
@@ -60,6 +61,118 @@ def test_build_messages_user() -> None:
     messages = [Message(role=MessageRole.USER, content="Hello")]
     result = backend._build_messages(messages)
     assert result == [{"role": "user", "content": "Hello"}]
+
+
+def test_build_messages_user_with_image_attachment() -> None:
+    backend = AnthropicAI()
+    messages = [Message(
+        role=MessageRole.USER,
+        content="what is this?",
+        attachments=[
+            FileAttachment(kind="image", media_type="image/png", data="AAAA"),
+            FileAttachment(kind="image", media_type="image/jpeg", data="BBBB"),
+        ],
+    )]
+    result = backend._build_messages(messages)
+    assert len(result) == 1
+    assert result[0]["role"] == "user"
+    content = result[0]["content"]
+    assert isinstance(content, list)
+    assert content[0] == {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"},
+    }
+    assert content[1] == {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/jpeg", "data": "BBBB"},
+    }
+    assert content[2] == {"type": "text", "text": "what is this?"}
+
+
+def test_build_messages_user_image_without_text() -> None:
+    backend = AnthropicAI()
+    messages = [Message(
+        role=MessageRole.USER,
+        content="",
+        attachments=[
+            FileAttachment(kind="image", media_type="image/png", data="AAAA"),
+        ],
+    )]
+    result = backend._build_messages(messages)
+    content = result[0]["content"]
+    assert isinstance(content, list)
+    assert len(content) == 1
+    assert content[0]["type"] == "image"
+
+
+def test_build_messages_user_with_document_attachment() -> None:
+    backend = AnthropicAI()
+    messages = [Message(
+        role=MessageRole.USER,
+        content="summarize",
+        attachments=[
+            FileAttachment(
+                kind="document", name="report.pdf",
+                media_type="application/pdf", data="PDFBYTES",
+            ),
+        ],
+    )]
+    result = backend._build_messages(messages)
+    content = result[0]["content"]
+    assert content[0] == {
+        "type": "document",
+        "source": {
+            "type": "base64",
+            "media_type": "application/pdf",
+            "data": "PDFBYTES",
+        },
+    }
+    assert content[1] == {"type": "text", "text": "summarize"}
+
+
+def test_build_messages_user_with_text_attachment() -> None:
+    backend = AnthropicAI()
+    messages = [Message(
+        role=MessageRole.USER,
+        content="explain",
+        attachments=[
+            FileAttachment(
+                kind="text", name="notes.md",
+                media_type="text/markdown", text="# hello world",
+            ),
+        ],
+    )]
+    result = backend._build_messages(messages)
+    content = result[0]["content"]
+    assert content[0] == {"type": "text", "text": "## notes.md\n\n# hello world"}
+    assert content[1] == {"type": "text", "text": "explain"}
+
+
+def test_build_messages_mixed_attachment_ordering() -> None:
+    backend = AnthropicAI()
+    messages = [Message(
+        role=MessageRole.USER,
+        content="compare",
+        attachments=[
+            FileAttachment(
+                kind="text", name="notes.md",
+                media_type="text/markdown", text="text body",
+            ),
+            FileAttachment(
+                kind="document", name="r.pdf",
+                media_type="application/pdf", data="PDF",
+            ),
+            FileAttachment(kind="image", media_type="image/png", data="IMG"),
+        ],
+    )]
+    result = backend._build_messages(messages)
+    content = result[0]["content"]
+    # Order is image, document, text, user prompt — regardless of the
+    # order the attachments were declared in.
+    assert content[0]["type"] == "image"
+    assert content[1]["type"] == "document"
+    assert content[2] == {"type": "text", "text": "## notes.md\n\ntext body"}
+    assert content[3] == {"type": "text", "text": "compare"}
 
 
 def test_build_messages_assistant_text_only() -> None:
