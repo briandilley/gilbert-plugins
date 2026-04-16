@@ -575,16 +575,27 @@ class AnthropicAI(AIBackend):
                     # — we just announce their existence so the model
                     # knows the user uploaded *something* and can ask
                     # clarifying questions instead of acting like the
-                    # attachment wasn't there. The actual bytes still
-                    # ride through the conversation row so the user's
-                    # own chat bubble renders the download chip.
+                    # attachment wasn't there. The bytes live either
+                    # inline in ``data`` (legacy small uploads) or on
+                    # disk in a workspace reference; the stub text is
+                    # the same either way.
                     for f in file_atts:
-                        import base64 as _b64
+                        # Prefer the explicit ``size`` field (filled
+                        # in by the upload endpoint and by the parser
+                        # for inline files) so we don't re-decode a
+                        # potentially huge base64 string on every
+                        # turn.
+                        if f.size:
+                            size_label = _format_bytes(f.size)
+                        elif f.data:
+                            import base64 as _b64
 
-                        try:
-                            size = len(_b64.b64decode(f.data, validate=False))
-                            size_label = _format_bytes(size)
-                        except Exception:
+                            try:
+                                size = len(_b64.b64decode(f.data, validate=False))
+                                size_label = _format_bytes(size)
+                            except Exception:
+                                size_label = "unknown size"
+                        else:
                             size_label = "unknown size"
                         mime = f.media_type or "application/octet-stream"
                         user_content.append(
