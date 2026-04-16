@@ -193,6 +193,79 @@ def test_build_messages_mixed_attachment_ordering() -> None:
     assert content[3] == {"type": "text", "text": "compare"}
 
 
+def test_build_messages_user_with_opaque_file_attachment() -> None:
+    """``kind="file"`` attachments render as a text stub naming the
+    file, its size, and its mime type. The model can't read the
+    contents, but it knows the user uploaded something."""
+    import base64
+
+    backend = AnthropicAI()
+    payload = base64.b64encode(b"x" * 4096).decode()
+    messages = [
+        Message(
+            role=MessageRole.USER,
+            content="what's in this?",
+            attachments=[
+                FileAttachment(
+                    kind="file",
+                    name="archive.zip",
+                    media_type="application/zip",
+                    data=payload,
+                ),
+            ],
+        )
+    ]
+    result = backend._build_messages(messages)
+    content = result[0]["content"]
+    # One stub block + one user prompt block.
+    assert len(content) == 2
+    stub = content[0]
+    assert stub["type"] == "text"
+    assert "archive.zip" in stub["text"]
+    assert "application/zip" in stub["text"]
+    assert "4.0 KB" in stub["text"]
+    # The stub tells the model it can't read the file.
+    assert "can't read" in stub["text"].lower()
+    # User's typed message comes last.
+    assert content[1] == {"type": "text", "text": "what's in this?"}
+
+
+def test_build_messages_file_ordered_after_images_and_docs() -> None:
+    """File stubs come after image/document/text blocks but before
+    the user's typed message, matching the ordering convention."""
+    backend = AnthropicAI()
+    messages = [
+        Message(
+            role=MessageRole.USER,
+            content="check these",
+            attachments=[
+                FileAttachment(
+                    kind="file",
+                    name="binary.dat",
+                    media_type="application/octet-stream",
+                    data="AAAA",
+                ),
+                FileAttachment(kind="image", media_type="image/png", data="IMG"),
+                FileAttachment(
+                    kind="text",
+                    name="notes.md",
+                    media_type="text/markdown",
+                    text="hi",
+                ),
+            ],
+        )
+    ]
+    result = backend._build_messages(messages)
+    content = result[0]["content"]
+    assert content[0]["type"] == "image"
+    assert content[1]["type"] == "text"
+    assert "notes.md" in content[1]["text"]
+    # File stub lives after image/document/text, before user prompt.
+    assert content[2]["type"] == "text"
+    assert "binary.dat" in content[2]["text"]
+    assert content[3] == {"type": "text", "text": "check these"}
+
+
 def test_build_messages_assistant_text_only() -> None:
     backend = AnthropicAI()
     messages = [Message(role=MessageRole.ASSISTANT, content="Hi there")]

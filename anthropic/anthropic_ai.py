@@ -39,6 +39,21 @@ _DEFAULT_MODEL = "claude-sonnet-4-20250514"
 _API_VERSION = "2023-06-01"
 
 
+def _format_bytes(n: int) -> str:
+    """Render a byte count as a short human-readable label (``1.2 MB``).
+
+    Used only for the opaque-file attachment stub the model sees so it
+    has a sense of scale when the user uploads a non-readable file.
+    """
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f} KB"
+    if n < 1024 * 1024 * 1024:
+        return f"{n / (1024 * 1024):.1f} MB"
+    return f"{n / (1024 * 1024 * 1024):.1f} GB"
+
+
 class AnthropicAI(AIBackend):
     """AI backend using the Anthropic Messages API via httpx."""
 
@@ -517,12 +532,14 @@ class AnthropicAI(AIBackend):
                 if msg.attachments:
                     # Multimodal turn. Order per Anthropic's recommendation:
                     # images first, then documents, then text-kind blocks
-                    # (which read as prompt context), then the user's own
-                    # typed message last.
+                    # (which read as prompt context), then any opaque
+                    # ``file`` stubs, then the user's own typed message
+                    # last.
                     user_content: list[dict[str, Any]] = []
                     image_atts = [a for a in msg.attachments if a.kind == "image"]
                     doc_atts = [a for a in msg.attachments if a.kind == "document"]
                     text_atts = [a for a in msg.attachments if a.kind == "text"]
+                    file_atts = [a for a in msg.attachments if a.kind == "file"]
                     for img in image_atts:
                         user_content.append(
                             {
@@ -550,6 +567,38 @@ class AnthropicAI(AIBackend):
                             {
                                 "type": "text",
                                 "text": f"## {txt.name}\n\n{txt.text}",
+                            }
+                        )
+                    # ``kind="file"`` is the catch-all for attachments
+                    # the model can't read natively (zips, videos,
+                    # binaries, docx, …). We don't try to decode them
+                    # — we just announce their existence so the model
+                    # knows the user uploaded *something* and can ask
+                    # clarifying questions instead of acting like the
+                    # attachment wasn't there. The actual bytes still
+                    # ride through the conversation row so the user's
+                    # own chat bubble renders the download chip.
+                    for f in file_atts:
+                        import base64 as _b64
+
+                        try:
+                            size = len(_b64.b64decode(f.data, validate=False))
+                            size_label = _format_bytes(size)
+                        except Exception:
+                            size_label = "unknown size"
+                        mime = f.media_type or "application/octet-stream"
+                        user_content.append(
+                            {
+                                "type": "text",
+                                "text": (
+                                    f"[Attached file: {f.name} "
+                                    f"({size_label}, {mime}). I can't "
+                                    "read the contents of this file "
+                                    "directly — ask the user to share "
+                                    "it in a format I support (image, "
+                                    "PDF, or text) if you need to "
+                                    "reason about what's inside.]"
+                                ),
                             }
                         )
                     if msg.content:
