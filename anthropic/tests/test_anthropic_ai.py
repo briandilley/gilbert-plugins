@@ -193,10 +193,57 @@ def test_build_messages_mixed_attachment_ordering() -> None:
     assert content[3] == {"type": "text", "text": "compare"}
 
 
-def test_build_messages_user_with_opaque_file_attachment() -> None:
-    """``kind="file"`` attachments render as a text stub naming the
-    file, its size, and its mime type. The model can't read the
-    contents, but it knows the user uploaded something."""
+def test_build_messages_user_with_opaque_file_attachment_reference() -> None:
+    """Reference-mode ``kind="file"`` attachments (the normal shape
+    after the HTTP upload endpoint lands them on disk) render as a
+    text stub naming the file + size + mime type AND telling the
+    model exactly how to reach the file: workspace coords and the
+    ``run_workspace_script`` tool with ``skill_name='chat-uploads'``.
+    The contents are NOT uploaded to Anthropic — a 332 MB STEP file
+    would blow out the context window and Anthropic can't parse it
+    anyway. The AI is expected to write a Python script that opens
+    the file by its bare relative path and prints a summary."""
+    backend = AnthropicAI()
+    messages = [
+        Message(
+            role=MessageRole.USER,
+            content="count the lines in this",
+            attachments=[
+                FileAttachment(
+                    kind="file",
+                    name="SeaArk_Hull_Model_V4.step",
+                    media_type="application/octet-stream",
+                    workspace_skill="chat-uploads",
+                    workspace_path="SeaArk_Hull_Model_V4.step",
+                    workspace_conv="conv-abc",
+                    size=332 * 1024 * 1024,  # 332 MB
+                ),
+            ],
+        )
+    ]
+    result = backend._build_messages(messages)
+    content = result[0]["content"]
+    assert len(content) == 2
+    stub = content[0]
+    assert stub["type"] == "text"
+    # Basic file metadata.
+    assert "SeaArk_Hull_Model_V4.step" in stub["text"]
+    assert "application/octet-stream" in stub["text"]
+    assert "332.0 MB" in stub["text"]
+    # The stub tells the model how to analyze it — via the
+    # script-running tool, not by asking for another format.
+    assert "run_workspace_script" in stub["text"]
+    assert "chat-uploads" in stub["text"]
+    # And that it shouldn't try to slurp the whole file.
+    assert "Do NOT" in stub["text"] or "do not" in stub["text"].lower()
+    # User's typed message comes last.
+    assert content[1] == {"type": "text", "text": "count the lines in this"}
+
+
+def test_build_messages_user_with_opaque_file_attachment_inline_legacy() -> None:
+    """Legacy inline-mode file attachments (no workspace coords)
+    still render as a stub but with a note saying there's no disk
+    path to run scripts against."""
     import base64
 
     backend = AnthropicAI()
@@ -217,16 +264,13 @@ def test_build_messages_user_with_opaque_file_attachment() -> None:
     ]
     result = backend._build_messages(messages)
     content = result[0]["content"]
-    # One stub block + one user prompt block.
     assert len(content) == 2
     stub = content[0]
-    assert stub["type"] == "text"
     assert "archive.zip" in stub["text"]
     assert "application/zip" in stub["text"]
     assert "4.0 KB" in stub["text"]
-    # The stub tells the model it can't read the file.
-    assert "can't read" in stub["text"].lower()
-    # User's typed message comes last.
+    # Legacy path — no workspace coords.
+    assert "inline legacy" in stub["text"].lower()
     assert content[1] == {"type": "text", "text": "what's in this?"}
 
 

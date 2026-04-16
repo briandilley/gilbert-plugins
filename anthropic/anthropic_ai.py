@@ -571,14 +571,30 @@ class AnthropicAI(AIBackend):
                         )
                     # ``kind="file"`` is the catch-all for attachments
                     # the model can't read natively (zips, videos,
-                    # binaries, docx, …). We don't try to decode them
-                    # — we just announce their existence so the model
-                    # knows the user uploaded *something* and can ask
-                    # clarifying questions instead of acting like the
-                    # attachment wasn't there. The bytes live either
-                    # inline in ``data`` (legacy small uploads) or on
-                    # disk in a workspace reference; the stub text is
-                    # the same either way.
+                    # binaries, docx, step, dwg, …). The bytes live on
+                    # disk in the conversation's per-user skill
+                    # workspace tree (``users/<u>/conversations/<c>/
+                    # chat-uploads/<name>``). We do NOT upload the
+                    # contents to the model — they could easily be
+                    # gigabytes, and the model doesn't have a parser
+                    # for most formats anyway.
+                    #
+                    # Instead, the stub tells the model exactly how to
+                    # reach the file from its Python sandbox: via the
+                    # ``run_workspace_script`` tool with
+                    # ``skill_name="chat-uploads"``. That runs a
+                    # Python/bash script with the workspace as ``cwd``,
+                    # so the script can open the file by its bare
+                    # name and return a summary (line count, parsed
+                    # features, header fields, whatever). The model
+                    # sees the summary, not the raw bytes.
+                    #
+                    # ``chat-uploads`` is implicitly accessible —
+                    # SkillService's activation gate bypasses the
+                    # normal "is this skill active?" check for this
+                    # synthetic skill name because the user uploaded
+                    # the file, which is itself an explicit "look at
+                    # this" signal.
                     for f in file_atts:
                         # Prefer the explicit ``size`` field (filled
                         # in by the upload endpoint and by the parser
@@ -598,17 +614,53 @@ class AnthropicAI(AIBackend):
                         else:
                             size_label = "unknown size"
                         mime = f.media_type or "application/octet-stream"
+                        # Show the workspace coordinates when the
+                        # file was uploaded via the HTTP endpoint
+                        # (reference mode). The AI uses these to
+                        # write scripts that read the file — the
+                        # ``skill_name`` is the pseudo-skill name and
+                        # the ``path`` is how the script addresses
+                        # the file from within the workspace (which
+                        # is also its ``cwd``).
+                        if f.workspace_skill and f.workspace_path:
+                            location_hint = (
+                                f"It lives on disk at workspace "
+                                f"skill='{f.workspace_skill}' "
+                                f"path='{f.workspace_path}'. Use "
+                                "``run_workspace_script`` with "
+                                f"skill_name='{f.workspace_skill}' "
+                                "to write and execute a Python or "
+                                "bash script against it — the "
+                                "script runs with the workspace as "
+                                "its working directory, so it can "
+                                f"open '{f.workspace_path}' by its "
+                                "bare relative path. Do NOT try to "
+                                "read the whole file into context; "
+                                "write a script that extracts what "
+                                "you need (a count, a summary, a "
+                                "parsed structure) and return the "
+                                "result. If you need a script file "
+                                "on disk first, use "
+                                "``write_skill_workspace_file`` to "
+                                "create it, then run it."
+                            )
+                        else:
+                            # Legacy inline-file fallback — there's
+                            # no disk path; the bytes ride in the
+                            # frame and there's nothing the AI can
+                            # do with them beyond acknowledging.
+                            location_hint = (
+                                "(Inline legacy upload — no "
+                                "workspace path; you can't run "
+                                "scripts against this one.)"
+                            )
                         user_content.append(
                             {
                                 "type": "text",
                                 "text": (
                                     f"[Attached file: {f.name} "
-                                    f"({size_label}, {mime}). I can't "
-                                    "read the contents of this file "
-                                    "directly — ask the user to share "
-                                    "it in a format I support (image, "
-                                    "PDF, or text) if you need to "
-                                    "reason about what's inside.]"
+                                    f"({size_label}, {mime}). "
+                                    f"{location_hint}]"
                                 ),
                             }
                         )
