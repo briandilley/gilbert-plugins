@@ -1,0 +1,10 @@
+name: qwen
+version: "1.0.0"
+description: "Qwen (Alibaba DashScope) backend — AI chat via the OpenAI-compatible DashScope API"
+
+provides:
+  - qwen_ai
+
+requires: []
+
+depends_on: []

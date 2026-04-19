@@ -32,6 +32,7 @@ The table below is an index — jump to each plugin's detail section for configu
 | [guess-that-song](#guess-that-song) | `guess_game` service | — (pure stdlib) | Games |
 | [ngrok](#ngrok) | `TunnelBackend "ngrok"` | `pyngrok` | Infrastructure |
 | [openai](#openai) | `AIBackend "openai"` | — (uses `httpx`) | Intelligence |
+| [qwen](#qwen) | `AIBackend "qwen"` | — (uses `httpx`) | Intelligence |
 | [slack](#slack) | `slack` service (Socket Mode bot) | `slack-bolt` | Communication |
 | [sonos](#sonos) | `SpeakerBackend "sonos"`, `MusicBackend "sonos"` | `soco` | Media |
 | [tavily](#tavily) | `WebSearchBackend "tavily"` | — (uses `httpx`) | Intelligence |
@@ -176,6 +177,29 @@ OpenAI GPT chat backend, speaking the [Chat Completions API](https://platform.op
 **Streaming.** The backend implements `generate_stream` over OpenAI's SSE chunks, translating `delta.content` into `TEXT_DELTA` events and assembling incremental `tool_calls[i].function.arguments` deltas back into complete `ToolCall`s at the end of the stream. All OpenAI-specific SSE parsing stays inside `openai_ai.py`; `capabilities()` reports `streaming=True, attachments_user=True`.
 
 **Attachments.** Image attachments are rendered as `image_url` content parts with `data:<mime>;base64,…` URLs, which the vision-capable models (`gpt-4o`, `gpt-4-turbo`) understand natively. Document (PDF) attachments become text stubs pointing the model at the workspace tools (`read_workspace_file`, `run_workspace_script`) — Chat Completions doesn't accept PDFs directly. Text attachments are inlined as `## <name>\n\n<body>`.
+
+**Config action** — `test_connection`: issues a one-word completion to verify credentials.
+
+---
+
+### qwen
+
+Alibaba Qwen chat backend, speaking DashScope's [OpenAI-compatible Chat Completions endpoint](https://help.aliyun.com/zh/model-studio/compatibility-of-openai-with-dashscope) directly over `httpx` (no `dashscope` SDK dependency). Because DashScope accepts OpenAI's request shape, streaming protocol, and tool-calling format verbatim, the backend runs alongside `openai` and `anthropic` with the same capabilities — configure one or several, then pick per-profile in the AI profile editor.
+
+**Backend registered** — `AIBackend.backend_name = "qwen"`: tool-use capable, streaming, image-input capable on vision models (`qwen-vl-max`, `qwen-vl-plus`), per-call model override.
+
+**Configure** (Settings → Intelligence → AI, with the `qwen` backend selected)
+- `enabled` — Initialize this backend at startup (default `true`). Uncheck to hide its settings and stop it being offered in profile dropdowns.
+- `api_key` *(sensitive)* — DashScope API key (`sk-…`).
+- `base_url` — API base URL (default `https://dashscope-intl.aliyuncs.com/compatible-mode/v1`). Switch to `https://dashscope.aliyuncs.com/compatible-mode/v1` for the mainland-China endpoint, or point at a local OpenAI-compatible proxy.
+- `model` — Default model ID used when a request specifies no per-call model (default `qwen-plus`).
+- `enabled_models` — Subset of advertised models that the chat UI and AI profile editor expose for selection. Defaults to every model the backend knows about (`qwen3-max`, `qwen-max`, `qwen-plus`, `qwen-turbo`, `qwen2.5-72b-instruct`, `qwen2.5-32b-instruct`, `qwen2.5-coder-32b-instruct`, `qwq-32b-preview`, `qwen-vl-max`, `qwen-vl-plus`).
+- `max_tokens` — Per-response cap (default `8192`). Sent as the standard OpenAI `max_tokens` field — no `o`-series-style `max_completion_tokens` workaround needed.
+- `temperature` — Sampling temperature (default `0.7`).
+
+**Streaming.** The backend implements `generate_stream` over DashScope's SSE chunks, which use the same wire format as OpenAI — `delta.content` becomes `TEXT_DELTA` events, and incremental `tool_calls[i].function.arguments` deltas are reassembled back into complete `ToolCall`s at the end of the stream. `capabilities()` reports `streaming=True, attachments_user=True`.
+
+**Attachments.** Image attachments are rendered as `image_url` content parts with `data:<mime>;base64,…` URLs, which the `qwen-vl-*` models understand natively. Document (PDF) attachments become text stubs pointing the model at the workspace tools (`read_workspace_file`, `run_workspace_script`) — the compatible-mode endpoint doesn't accept PDFs directly. Text attachments are inlined as `## <name>\n\n<body>`.
 
 **Config action** — `test_connection`: issues a one-word completion to verify credentials.
 
