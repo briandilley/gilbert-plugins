@@ -41,6 +41,7 @@ The table below is an index — jump to each plugin's detail section for configu
 | [tavily](#tavily) | `WebSearchBackend "tavily"` | — (uses `httpx`) | Intelligence |
 | [tesseract](#tesseract) | `OCRBackend "tesseract"` | `pytesseract` | Intelligence |
 | [unifi](#unifi) | `PresenceBackend "unifi"`, `DoorbellBackend "unifi"` | — (uses `httpx`/`aiohttp`) | Monitoring |
+| [xai](#xai) | `AIBackend "xai"` | — (uses `httpx`) | Intelligence |
 
 ---
 
@@ -371,6 +372,29 @@ The doorbell backend uses a flat config pointing at Protect:
 **Config action** — `test_connection`: pings each configured subsystem and reports status.
 
 **No third-party Python dependencies** — all UniFi APIs are spoken via `httpx`/`aiohttp`.
+
+---
+
+### xai
+
+xAI Grok chat backend, speaking the [OpenAI-compatible xAI API](https://docs.x.ai/docs/api-reference) at `api.x.ai/v1` directly over `httpx`. Runs the Grok 4 / Grok 3 / Grok 2 lineup including the `grok-2-vision-1212` multimodal model.
+
+**Backend registered** — `AIBackend.backend_name = "xai"`: tool-use capable, streaming, image-input capable on `grok-2-vision-1212`, per-call model override.
+
+**Configure** (Settings → Intelligence → AI, with the `xai` backend selected)
+- `enabled` — Initialize this backend at startup (default `true`).
+- `api_key` *(sensitive)* — xAI API key (`xai-…`).
+- `base_url` — API base URL (default `https://api.x.ai/v1`).
+- `model` — Default model ID (default `grok-4-0709`). Choices: `grok-4-0709`, `grok-3`, `grok-3-mini`, `grok-2-vision-1212`, `grok-2-1212`.
+- `enabled_models` — Subset exposed to the chat UI and AI profile editor.
+- `max_tokens` — Per-response cap (default `8192`).
+- `temperature` — Sampling temperature (default `0.7`).
+
+**Streaming.** OpenAI-compatible SSE — `delta.content` → `TEXT_DELTA`, streamed `tool_calls[i].function.arguments` deltas reassembled into complete `ToolCall`s. `capabilities()` reports `streaming=True, attachments_user=True`.
+
+**Attachments.** `grok-2-vision-1212` accepts `image_url` content parts with base64 data URLs. Non-vision Grok models ignore image parts, so sending the data URL is safe. Document (PDF) attachments become text stubs pointing the model at the workspace tools.
+
+**Config action** — `test_connection`: issues a one-word completion to verify credentials.
 
 ---
 

@@ -1,0 +1,10 @@
+name: xai
+version: "1.0.0"
+description: "xAI (Grok) backend — AI chat via xAI's OpenAI-compatible API"
+
+provides:
+  - xai_ai
+
+requires: []
+
+depends_on: []
