@@ -1,0 +1,11 @@
+[project]
+name = "gilbert-plugin-openrouter"
+version = "1.0.0"
+description = "OpenRouter AI backend for Gilbert"
+requires-python = ">=3.12"
+# No third-party deps — talks to OpenRouter's OpenAI-compatible REST API
+# directly via ``httpx`` (already a core Gilbert dep).
+dependencies = []
+
+[tool.uv]
+package = false

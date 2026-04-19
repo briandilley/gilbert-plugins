@@ -1,0 +1,10 @@
+name: openrouter
+version: "1.0.0"
+description: "OpenRouter backend — AI chat via OpenRouter's multi-provider OpenAI-compatible API"
+
+provides:
+  - openrouter_ai
+
+requires: []
+
+depends_on: []

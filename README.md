@@ -35,6 +35,7 @@ The table below is an index — jump to each plugin's detail section for configu
 | [mistral](#mistral) | `AIBackend "mistral"` | — (uses `httpx`) | Intelligence |
 | [ngrok](#ngrok) | `TunnelBackend "ngrok"` | `pyngrok` | Infrastructure |
 | [openai](#openai) | `AIBackend "openai"` | — (uses `httpx`) | Intelligence |
+| [openrouter](#openrouter) | `AIBackend "openrouter"` | — (uses `httpx`) | Intelligence |
 | [qwen](#qwen) | `AIBackend "qwen"` | — (uses `httpx`) | Intelligence |
 | [slack](#slack) | `slack` service (Socket Mode bot) | `slack-bolt` | Communication |
 | [sonos](#sonos) | `SpeakerBackend "sonos"`, `MusicBackend "sonos"` | `soco` | Media |
@@ -250,6 +251,33 @@ OpenAI GPT chat backend, speaking the [Chat Completions API](https://platform.op
 **Streaming.** The backend implements `generate_stream` over OpenAI's SSE chunks, translating `delta.content` into `TEXT_DELTA` events and assembling incremental `tool_calls[i].function.arguments` deltas back into complete `ToolCall`s at the end of the stream. All OpenAI-specific SSE parsing stays inside `openai_ai.py`; `capabilities()` reports `streaming=True, attachments_user=True`.
 
 **Attachments.** Image attachments are rendered as `image_url` content parts with `data:<mime>;base64,…` URLs, which the vision-capable models (`gpt-4o`, `gpt-4-turbo`) understand natively. Document (PDF) attachments become text stubs pointing the model at the workspace tools (`read_workspace_file`, `run_workspace_script`) — Chat Completions doesn't accept PDFs directly. Text attachments are inlined as `## <name>\n\n<body>`.
+
+**Config action** — `test_connection`: issues a one-word completion to verify credentials.
+
+---
+
+### openrouter
+
+OpenRouter chat backend — a meta-provider that fronts ~200 models from Anthropic, OpenAI, Google, Meta, Mistral, DeepSeek, xAI, Qwen, and more behind a single API key and a unified [OpenAI-compatible endpoint](https://openrouter.ai/docs). Handy for experimenting across providers without signing up with each one, and for routing a single Gilbert install to different frontier models per profile tier.
+
+**Backend registered** — `AIBackend.backend_name = "openrouter"`: tool-use capable, streaming, image-input capable for vision-capable models, per-call model override.
+
+**Model slugs.** Models are addressed as `provider/model`, e.g. `anthropic/claude-sonnet-4-5`, `openai/gpt-4o`, `google/gemini-2.5-pro`, `meta-llama/llama-3.3-70b-instruct`. The plugin ships with a curated list of popular tool-capable slugs; the `model` field is free-text so users can paste any slug from https://openrouter.ai/models without patching the plugin.
+
+**Configure** (Settings → Intelligence → AI, with the `openrouter` backend selected)
+- `enabled` — Initialize this backend at startup (default `true`).
+- `api_key` *(sensitive)* — OpenRouter API key (`sk-or-v1-…`).
+- `base_url` — API base URL (default `https://openrouter.ai/api/v1`).
+- `site_url` — Optional `HTTP-Referer` URL sent to OpenRouter for attribution on their public leaderboard. Blank = anonymous.
+- `site_name` — Optional `X-Title` name sent with the same purpose.
+- `model` — Default model slug (default `anthropic/claude-sonnet-4-5`).
+- `enabled_models` — Subset of the curated slug list exposed to the chat UI and AI profile editor.
+- `max_tokens` — Per-response cap (default `8192`).
+- `temperature` — Sampling temperature (default `0.7`).
+
+**Streaming.** OpenAI-compatible SSE — `delta.content` → `TEXT_DELTA`, streamed `tool_calls[i].function.arguments` deltas reassembled into complete `ToolCall`s. `capabilities()` reports `streaming=True, attachments_user=True`.
+
+**Attachments.** Vision-capable models on OpenRouter (Claude, GPT-4o, Gemini, Pixtral, Grok Vision, …) accept `image_url` content parts with base64 data URLs. Text-only models ignore vision parts, so the same payload is safe regardless of model choice.
 
 **Config action** — `test_connection`: issues a one-word completion to verify credentials.
 
