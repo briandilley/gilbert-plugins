@@ -1,0 +1,12 @@
+[project]
+name = "gilbert-plugin-gemini"
+version = "1.0.0"
+description = "Google Gemini AI backend for Gilbert"
+requires-python = ">=3.12"
+# No third-party deps — talks to Google's OpenAI-compatible Gemini
+# endpoint directly via ``httpx`` (already a core Gilbert dep). No
+# ``google-generativeai`` SDK dependency.
+dependencies = []
+
+[tool.uv]
+package = false

@@ -1,0 +1,10 @@
+name: gemini
+version: "1.0.0"
+description: "Google Gemini backend — AI chat via the OpenAI-compatible Gemini API"
+
+provides:
+  - gemini_ai
+
+requires: []
+
+depends_on: []

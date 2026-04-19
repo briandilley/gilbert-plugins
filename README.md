@@ -29,6 +29,7 @@ The table below is an index — jump to each plugin's detail section for configu
 | [arr](#arr) | `radarr` service, `sonarr` service | — (uses `httpx`) | Media |
 | [deepseek](#deepseek) | `AIBackend "deepseek"` | — (uses `httpx`) | Intelligence |
 | [elevenlabs](#elevenlabs) | `TTSBackend "elevenlabs"` | — (uses `httpx`) | Media |
+| [gemini](#gemini) | `AIBackend "gemini"` | — (uses `httpx`) | Intelligence |
 | [google](#google) | `AuthBackend "google"`, `UserProviderBackend "google_directory"`, `EmailBackend "gmail"`, `DocumentBackend "google_drive"` | `google-auth`, `google-api-python-client` | Identity / Communication / Knowledge |
 | [groq](#groq) | `AIBackend "groq"` | — (uses `httpx`) | Intelligence |
 | [guess-that-song](#guess-that-song) | `guess_game` service | — (pure stdlib) | Games |
@@ -127,6 +128,29 @@ High-quality text-to-speech via the ElevenLabs API. Used by the core `speaker.an
 **Config action** — `test_connection`: requests the available voices list to verify the API key.
 
 **No third-party Python dependencies** — talks directly to the REST API via `httpx`.
+
+---
+
+### gemini
+
+Google Gemini chat backend, speaking the [OpenAI-compatible Gemini endpoint](https://ai.google.dev/gemini-api/docs/openai) at `generativelanguage.googleapis.com/v1beta/openai/` directly over `httpx` (no `google-generativeai` SDK). Gemini's pitch is very large context windows (~1M tokens on 2.5 Pro) and native multimodal input.
+
+**Backend registered** — `AIBackend.backend_name = "gemini"`: tool-use capable, streaming, image-input capable on every current model (all 2.5 and 2.0 tiers are natively multimodal), per-call model override.
+
+**Configure** (Settings → Intelligence → AI, with the `gemini` backend selected)
+- `enabled` — Initialize this backend at startup (default `true`).
+- `api_key` *(sensitive)* — Google AI Studio API key (`AIza…`), generated at https://aistudio.google.com/apikey. Distinct from a Google Cloud Vertex AI key — this plugin uses the AI Studio path, not Vertex.
+- `base_url` — API base URL (default `https://generativelanguage.googleapis.com/v1beta/openai`).
+- `model` — Default model ID (default `gemini-2.5-flash`). Choices: `gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-2.5-flash-lite`, `gemini-2.0-flash`, `gemini-1.5-pro`.
+- `enabled_models` — Subset exposed to the chat UI and AI profile editor.
+- `max_tokens` — Per-response cap (default `8192`).
+- `temperature` — Sampling temperature (default `0.7`).
+
+**Streaming.** OpenAI-compatible SSE — `delta.content` → `TEXT_DELTA`, streamed `tool_calls[i].function.arguments` deltas reassembled into complete `ToolCall`s. `capabilities()` reports `streaming=True, attachments_user=True`.
+
+**Attachments.** Every current Gemini model accepts `image_url` content parts with base64 data URLs on the compat endpoint. Document (PDF) attachments become text stubs pointing the model at the workspace tools — PDFs work on Gemini's native API but the OpenAI-compat layer isn't reliable for them yet.
+
+**Config action** — `test_connection`: issues a one-word completion to verify credentials.
 
 ---
 
