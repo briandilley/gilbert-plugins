@@ -1,0 +1,10 @@
+name: groq
+version: "1.0.0"
+description: "Groq backend — AI chat via Groq's LPU-hosted OpenAI-compatible API"
+
+provides:
+  - groq_ai
+
+requires: []
+
+depends_on: []

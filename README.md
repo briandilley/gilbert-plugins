@@ -30,6 +30,7 @@ The table below is an index — jump to each plugin's detail section for configu
 | [deepseek](#deepseek) | `AIBackend "deepseek"` | — (uses `httpx`) | Intelligence |
 | [elevenlabs](#elevenlabs) | `TTSBackend "elevenlabs"` | — (uses `httpx`) | Media |
 | [google](#google) | `AuthBackend "google"`, `UserProviderBackend "google_directory"`, `EmailBackend "gmail"`, `DocumentBackend "google_drive"` | `google-auth`, `google-api-python-client` | Identity / Communication / Knowledge |
+| [groq](#groq) | `AIBackend "groq"` | — (uses `httpx`) | Intelligence |
 | [guess-that-song](#guess-that-song) | `guess_game` service | — (pure stdlib) | Games |
 | [ngrok](#ngrok) | `TunnelBackend "ngrok"` | `pyngrok` | Infrastructure |
 | [openai](#openai) | `AIBackend "openai"` | — (uses `httpx`) | Intelligence |
@@ -147,6 +148,29 @@ Bundled Google Workspace integration suite. One plugin, four backends — they s
 Each backend exposes a `test_connection` config action that verifies credentials by making a one-off read call.
 
 **Third-party deps**: `google-auth`, `google-api-python-client`.
+
+---
+
+### groq
+
+Groq chat backend — runs open-weight models (Llama, Qwen, Mixtral, DeepSeek distills) on Groq's LPU hardware. Main selling point is inference latency: tokens/second is multiples higher than GPU-hosted providers. Speaks the [OpenAI-compatible endpoint](https://console.groq.com/docs/openai) at `api.groq.com/openai/v1` directly over `httpx`.
+
+**Backend registered** — `AIBackend.backend_name = "groq"`: tool-use capable, streaming, per-call model override.
+
+**Configure** (Settings → Intelligence → AI, with the `groq` backend selected)
+- `enabled` — Initialize this backend at startup (default `true`).
+- `api_key` *(sensitive)* — Groq API key (`gsk_…`).
+- `base_url` — API base URL (default `https://api.groq.com/openai/v1`).
+- `model` — Default model ID (default `llama-3.3-70b-versatile`).
+- `enabled_models` — Subset of advertised models the chat UI and AI profile editor expose. Defaults to the full list: `llama-3.3-70b-versatile`, `llama-3.1-8b-instant`, `qwen-2.5-32b`, `deepseek-r1-distill-llama-70b`, `gemma2-9b-it`.
+- `max_tokens` — Per-response cap (default `8192`).
+- `temperature` — Sampling temperature (default `0.7`).
+
+**Streaming.** OpenAI-compatible SSE — `delta.content` → `TEXT_DELTA`, streamed `tool_calls[i].function.arguments` deltas reassembled into complete `ToolCall`s. `capabilities()` reports `streaming=True, attachments_user=True`.
+
+**Attachments.** Groq's hosted chat models don't accept native image attachments, so every attachment becomes a text stub pointing the model at the workspace tools. Text attachments are inlined as `## <name>\n\n<body>`.
+
+**Config action** — `test_connection`: issues a one-word completion to verify credentials.
 
 ---
 
