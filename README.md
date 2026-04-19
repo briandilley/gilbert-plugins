@@ -34,6 +34,7 @@ The table below is an index — jump to each plugin's detail section for configu
 | [guess-that-song](#guess-that-song) | `guess_game` service | — (pure stdlib) | Games |
 | [mistral](#mistral) | `AIBackend "mistral"` | — (uses `httpx`) | Intelligence |
 | [ngrok](#ngrok) | `TunnelBackend "ngrok"` | `pyngrok` | Infrastructure |
+| [ollama](#ollama) | `AIBackend "ollama"` | — (uses `httpx`) | Intelligence |
 | [openai](#openai) | `AIBackend "openai"` | — (uses `httpx`) | Intelligence |
 | [openrouter](#openrouter) | `AIBackend "openrouter"` | — (uses `httpx`) | Intelligence |
 | [qwen](#qwen) | `AIBackend "qwen"` | — (uses `httpx`) | Intelligence |
@@ -229,6 +230,31 @@ Tunnel backend that gives Gilbert a public HTTPS URL via [ngrok](https://ngrok.c
 **Config action** — `test_connection`: reports the current public URL if the tunnel is live.
 
 **Third-party deps**: `pyngrok`.
+
+---
+
+### ollama
+
+Local Ollama AI backend — chat against any open-weight model you've `ollama pull`ed, running inference on your own machine. Speaks [Ollama's OpenAI-compatible endpoint](https://github.com/ollama/ollama/blob/main/docs/openai.md) at `http://localhost:11434/v1` directly over `httpx`. No API key required for local usage; proxied/remote instances can set one and it flows through as a Bearer token.
+
+**Backend registered** — `AIBackend.backend_name = "ollama"`: tool-use capable (model-dependent), streaming, image-input capable on multimodal tags (`llava`, `llama3.2-vision`, `qwen2.5-vl`), per-call model override.
+
+**Models.** Whatever the user has pulled locally — `ollama pull llama3.3`, `ollama pull qwen2.5-coder:32b`, etc. The `model` field is free-text because the available set depends on local installs. A curated list of common tool-capable tags ships as suggestions in the `enabled_models` dropdown: `llama3.3`, `llama3.2`, `qwen2.5`, `qwen2.5-coder`, `deepseek-r1`, `mistral`, `mistral-nemo`, `phi4`, `gemma3`.
+
+**Configure** (Settings → Intelligence → AI, with the `ollama` backend selected)
+- `enabled` — Initialize this backend at startup (default `true`).
+- `api_key` *(sensitive, optional)* — Leave blank for local Ollama. Populate only when Ollama sits behind a reverse proxy that gates access.
+- `base_url` — Ollama server URL (default `http://localhost:11434/v1`). Point at another host/port if Ollama runs elsewhere on your LAN.
+- `model` — Default model tag (default `llama3.3`). Must be a tag you've pulled — Ollama rejects unknown tags.
+- `enabled_models` — Suggested subset shown in the chat UI / AI profile editor.
+- `max_tokens` — Per-response cap (default `8192`).
+- `temperature` — Sampling temperature (default `0.7`).
+
+**Streaming.** OpenAI-compatible SSE — `delta.content` → `TEXT_DELTA`, streamed `tool_calls[i].function.arguments` deltas reassembled into complete `ToolCall`s. `capabilities()` reports `streaming=True, attachments_user=True`.
+
+**Attachments.** Multimodal Ollama models accept `image_url` content parts with base64 data URLs. Text-only models ignore vision parts, so the same payload is safe regardless of which tag is selected.
+
+**Config action** — `test_connection`: issues a one-word completion to verify the server is reachable and the default model tag is installed.
 
 ---
 

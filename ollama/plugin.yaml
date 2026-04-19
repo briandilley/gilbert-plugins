@@ -1,0 +1,10 @@
+name: ollama
+version: "1.0.0"
+description: "Ollama backend — local LLM inference via Ollama's OpenAI-compatible API"
+
+provides:
+  - ollama_ai
+
+requires: []
+
+depends_on: []
