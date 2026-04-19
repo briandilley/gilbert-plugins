@@ -27,6 +27,7 @@ The table below is an index — jump to each plugin's detail section for configu
 |---|---|---|---|
 | [anthropic](#anthropic) | `AIBackend "anthropic"`, `VisionBackend "anthropic"` | `anthropic` | Intelligence |
 | [arr](#arr) | `radarr` service, `sonarr` service | — (uses `httpx`) | Media |
+| [deepseek](#deepseek) | `AIBackend "deepseek"` | — (uses `httpx`) | Intelligence |
 | [elevenlabs](#elevenlabs) | `TTSBackend "elevenlabs"` | — (uses `httpx`) | Media |
 | [google](#google) | `AuthBackend "google"`, `UserProviderBackend "google_directory"`, `EmailBackend "gmail"`, `DocumentBackend "google_drive"` | `google-auth`, `google-api-python-client` | Identity / Communication / Knowledge |
 | [guess-that-song](#guess-that-song) | `guess_game` service | — (pure stdlib) | Games |
@@ -79,6 +80,29 @@ Radarr + Sonarr integration for browsing, searching, and managing your movie and
 - `default_root_folder` — Root folder path for new downloads.
 
 **Requires**: nothing on the Gilbert side beyond `httpx`, which is already a core dep.
+
+---
+
+### deepseek
+
+DeepSeek chat backend, speaking the [OpenAI-compatible DeepSeek API](https://api-docs.deepseek.com/) directly over `httpx`. Runs alongside the other AI backends — pick per-profile in the AI profile editor.
+
+**Backend registered** — `AIBackend.backend_name = "deepseek"`: tool-use capable, streaming, per-call model override.
+
+**Configure** (Settings → Intelligence → AI, with the `deepseek` backend selected)
+- `enabled` — Initialize this backend at startup (default `true`).
+- `api_key` *(sensitive)* — DeepSeek API key (`sk-…`).
+- `base_url` — API base URL (default `https://api.deepseek.com/v1`).
+- `model` — Default model ID (default `deepseek-chat`). Choices: `deepseek-chat` (DeepSeek V3), `deepseek-reasoner` (DeepSeek R1).
+- `enabled_models` — Subset of advertised models that the chat UI and AI profile editor expose for selection.
+- `max_tokens` — Per-response cap (default `8192`).
+- `temperature` — Sampling temperature (default `0.7`).
+
+**Streaming.** OpenAI-compatible SSE — `delta.content` → `TEXT_DELTA`, streamed `tool_calls[i].function.arguments` deltas reassembled into complete `ToolCall`s. `capabilities()` reports `streaming=True, attachments_user=True`.
+
+**Attachments.** DeepSeek's current chat models don't accept native image attachments, so every attachment becomes a text stub pointing the model at the workspace tools (`read_workspace_file`, `run_workspace_script`). Text attachments are inlined as `## <name>\n\n<body>`.
+
+**Config action** — `test_connection`: issues a one-word completion to verify credentials.
 
 ---
 

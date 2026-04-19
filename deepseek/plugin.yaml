@@ -1,0 +1,10 @@
+name: deepseek
+version: "1.0.0"
+description: "DeepSeek backend — AI chat via the OpenAI-compatible DeepSeek API"
+
+provides:
+  - deepseek_ai
+
+requires: []
+
+depends_on: []
