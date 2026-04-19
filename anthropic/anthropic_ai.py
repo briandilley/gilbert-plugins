@@ -539,34 +539,65 @@ class AnthropicAI(AIBackend):
                     image_atts = [a for a in msg.attachments if a.kind == "image"]
                     doc_atts = [a for a in msg.attachments if a.kind == "document"]
                     text_atts = [a for a in msg.attachments if a.kind == "text"]
-                    file_atts = [a for a in msg.attachments if a.kind == "file"]
+                    ref_atts = [a for a in msg.attachments if a.kind == "file"]
                     for img in image_atts:
-                        user_content.append(
-                            {
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": img.media_type,
-                                    "data": img.data,
-                                },
-                            }
-                        )
+                        if img.data:
+                            user_content.append(
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": img.media_type,
+                                        "data": img.data,
+                                    },
+                                }
+                            )
+                        else:
+                            user_content.append(
+                                {
+                                    "type": "text",
+                                    "text": f"[Attached image: {img.name or 'image'} ({img.media_type}, {img.size} bytes) — use read_workspace_file or run_workspace_script to access]",
+                                }
+                            )
                     for doc in doc_atts:
-                        user_content.append(
-                            {
-                                "type": "document",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": doc.media_type or "application/pdf",
-                                    "data": doc.data,
-                                },
-                            }
-                        )
+                        if doc.data:
+                            user_content.append(
+                                {
+                                    "type": "document",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": doc.media_type or "application/pdf",
+                                        "data": doc.data,
+                                    },
+                                }
+                            )
+                        else:
+                            user_content.append(
+                                {
+                                    "type": "text",
+                                    "text": f"[Attached document: {doc.name or 'document'} ({doc.media_type}, {doc.size} bytes) — use read_workspace_file or run_workspace_script to access]",
+                                }
+                            )
                     for txt in text_atts:
+                        if txt.text:
+                            user_content.append(
+                                {
+                                    "type": "text",
+                                    "text": f"## {txt.name}\n\n{txt.text}",
+                                }
+                            )
+                        else:
+                            user_content.append(
+                                {
+                                    "type": "text",
+                                    "text": f"[Attached file: {txt.name or 'file'} ({txt.media_type}, {txt.size} bytes) — use read_workspace_file or run_workspace_script to access]",
+                                }
+                            )
+                    for ref in ref_atts:
                         user_content.append(
                             {
                                 "type": "text",
-                                "text": f"## {txt.name}\n\n{txt.text}",
+                                "text": f"[Attached file: {ref.name or 'file'} ({ref.media_type}, {ref.size} bytes) — use read_workspace_file or run_workspace_script to access]",
                             }
                         )
                     # ``kind="file"`` is the catch-all for attachments
