@@ -39,21 +39,6 @@ _DEFAULT_MODEL = "claude-sonnet-4-20250514"
 _API_VERSION = "2023-06-01"
 
 
-def _format_bytes(n: int) -> str:
-    """Render a byte count as a short human-readable label (``1.2 MB``).
-
-    Used only for the opaque-file attachment stub the model sees so it
-    has a sense of scale when the user uploads a non-readable file.
-    """
-    if n < 1024:
-        return f"{n} B"
-    if n < 1024 * 1024:
-        return f"{n / 1024:.1f} KB"
-    if n < 1024 * 1024 * 1024:
-        return f"{n / (1024 * 1024):.1f} MB"
-    return f"{n / (1024 * 1024 * 1024):.1f} GB"
-
-
 class AnthropicAI(AIBackend):
     """AI backend using the Anthropic Messages API via httpx."""
 
@@ -626,75 +611,6 @@ class AnthropicAI(AIBackend):
                     # synthetic skill name because the user uploaded
                     # the file, which is itself an explicit "look at
                     # this" signal.
-                    for f in file_atts:
-                        # Prefer the explicit ``size`` field (filled
-                        # in by the upload endpoint and by the parser
-                        # for inline files) so we don't re-decode a
-                        # potentially huge base64 string on every
-                        # turn.
-                        if f.size:
-                            size_label = _format_bytes(f.size)
-                        elif f.data:
-                            import base64 as _b64
-
-                            try:
-                                size = len(_b64.b64decode(f.data, validate=False))
-                                size_label = _format_bytes(size)
-                            except Exception:
-                                size_label = "unknown size"
-                        else:
-                            size_label = "unknown size"
-                        mime = f.media_type or "application/octet-stream"
-                        # Show the workspace coordinates when the
-                        # file was uploaded via the HTTP endpoint
-                        # (reference mode). The AI uses these to
-                        # write scripts that read the file — the
-                        # ``skill_name`` is the pseudo-skill name and
-                        # the ``path`` is how the script addresses
-                        # the file from within the workspace (which
-                        # is also its ``cwd``).
-                        if f.workspace_skill and f.workspace_path:
-                            location_hint = (
-                                f"It lives on disk at workspace "
-                                f"skill='{f.workspace_skill}' "
-                                f"path='{f.workspace_path}'. Use "
-                                "``run_workspace_script`` with "
-                                f"skill_name='{f.workspace_skill}' "
-                                "to write and execute a Python or "
-                                "bash script against it — the "
-                                "script runs with the workspace as "
-                                "its working directory, so it can "
-                                f"open '{f.workspace_path}' by its "
-                                "bare relative path. Do NOT try to "
-                                "read the whole file into context; "
-                                "write a script that extracts what "
-                                "you need (a count, a summary, a "
-                                "parsed structure) and return the "
-                                "result. If you need a script file "
-                                "on disk first, use "
-                                "``write_skill_workspace_file`` to "
-                                "create it, then run it."
-                            )
-                        else:
-                            # Legacy inline-file fallback — there's
-                            # no disk path; the bytes ride in the
-                            # frame and there's nothing the AI can
-                            # do with them beyond acknowledging.
-                            location_hint = (
-                                "(Inline legacy upload — no "
-                                "workspace path; you can't run "
-                                "scripts against this one.)"
-                            )
-                        user_content.append(
-                            {
-                                "type": "text",
-                                "text": (
-                                    f"[Attached file: {f.name} "
-                                    f"({size_label}, {mime}). "
-                                    f"{location_hint}]"
-                                ),
-                            }
-                        )
                     if msg.content:
                         user_content.append({"type": "text", "text": msg.content})
                     if not user_content:
