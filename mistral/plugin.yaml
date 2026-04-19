@@ -1,0 +1,10 @@
+name: mistral
+version: "1.0.0"
+description: "Mistral La Plateforme backend — AI chat via Mistral's OpenAI-compatible API"
+
+provides:
+  - mistral_ai
+
+requires: []
+
+depends_on: []

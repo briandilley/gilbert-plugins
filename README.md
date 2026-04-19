@@ -32,6 +32,7 @@ The table below is an index — jump to each plugin's detail section for configu
 | [google](#google) | `AuthBackend "google"`, `UserProviderBackend "google_directory"`, `EmailBackend "gmail"`, `DocumentBackend "google_drive"` | `google-auth`, `google-api-python-client` | Identity / Communication / Knowledge |
 | [groq](#groq) | `AIBackend "groq"` | — (uses `httpx`) | Intelligence |
 | [guess-that-song](#guess-that-song) | `guess_game` service | — (pure stdlib) | Games |
+| [mistral](#mistral) | `AIBackend "mistral"` | — (uses `httpx`) | Intelligence |
 | [ngrok](#ngrok) | `TunnelBackend "ngrok"` | `pyngrok` | Infrastructure |
 | [openai](#openai) | `AIBackend "openai"` | — (uses `httpx`) | Intelligence |
 | [qwen](#qwen) | `AIBackend "qwen"` | — (uses `httpx`) | Intelligence |
@@ -187,6 +188,29 @@ Multiplayer music guessing game managed by the AI. The AI picks a track, plays a
 - `hint_threshold` — Seconds remaining before a hint drops (default `10.0`).
 
 **No third-party Python dependencies.**
+
+---
+
+### mistral
+
+Mistral AI chat backend, speaking the [OpenAI-compatible La Plateforme API](https://docs.mistral.ai/api/) at `api.mistral.ai/v1` directly over `httpx`. Runs the Mistral Large / Medium / Small lineup plus Codestral and the multimodal Pixtral.
+
+**Backend registered** — `AIBackend.backend_name = "mistral"`: tool-use capable, streaming, image-input capable on Pixtral models, per-call model override.
+
+**Configure** (Settings → Intelligence → AI, with the `mistral` backend selected)
+- `enabled` — Initialize this backend at startup (default `true`).
+- `api_key` *(sensitive)* — Mistral La Plateforme API key.
+- `base_url` — API base URL (default `https://api.mistral.ai/v1`).
+- `model` — Default model ID (default `mistral-large-latest`). Choices include `mistral-large-latest`, `mistral-medium-latest`, `mistral-small-latest`, `codestral-latest`, `open-mistral-nemo`, `pixtral-large-latest`.
+- `enabled_models` — Subset exposed to the chat UI and AI profile editor.
+- `max_tokens` — Per-response cap (default `8192`).
+- `temperature` — Sampling temperature (default `0.7`).
+
+**Streaming.** OpenAI-compatible SSE — `delta.content` → `TEXT_DELTA`, streamed `tool_calls[i].function.arguments` deltas reassembled into complete `ToolCall`s. `capabilities()` reports `streaming=True, attachments_user=True`.
+
+**Attachments.** Pixtral models accept `image_url` content parts with base64 data URLs (same shape as OpenAI). Non-vision models receive images as text stubs. Document (PDF) attachments become text stubs pointing the model at the workspace tools.
+
+**Config action** — `test_connection`: issues a one-word completion to verify credentials.
 
 ---
 
