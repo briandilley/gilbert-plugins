@@ -52,6 +52,7 @@ class SlackService(Service):
         self._ai: Any = None
         self._user_svc: Any = None
         self._resolver: ServiceResolver | None = None
+        self._ai_profile: str = "standard"
 
         # In-memory conversation mapping
         self._channel_conversations: dict[str, str] = {}  # channel_id -> conv_id (DMs)
@@ -188,10 +189,17 @@ class SlackService(Service):
                 restart_required=True,
                 sensitive=True,
             ),
+            ConfigParam(
+                key="ai_profile",
+                type=ToolParameterType.STRING,
+                description="AI profile for Slack chat.",
+                default="standard",
+                choices_from="ai_profiles",
+            ),
         ]
 
     async def on_config_changed(self, config: dict[str, Any]) -> None:
-        pass  # All Slack params are restart_required
+        self._ai_profile = config.get("ai_profile", self._ai_profile)
 
     # -- Event handling --
 
@@ -258,7 +266,7 @@ class SlackService(Service):
                 user_message=text,
                 conversation_id=conversation_id,
                 user_ctx=user_ctx,
-                ai_call="human_chat",
+                ai_profile=self._ai_profile,
             )
         except Exception:
             logger.exception("AI chat failed for Slack message ts=%s", ts)

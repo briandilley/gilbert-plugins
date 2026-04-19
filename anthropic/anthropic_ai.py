@@ -15,6 +15,7 @@ from gilbert.interfaces.ai import (
     AIResponse,
     Message,
     MessageRole,
+    ModelInfo,
     StopReason,
     StreamEvent,
     StreamEventType,
@@ -38,6 +39,24 @@ _BASE_URL = "https://api.anthropic.com/v1"
 _DEFAULT_MODEL = "claude-sonnet-4-20250514"
 _API_VERSION = "2023-06-01"
 
+_AVAILABLE_MODELS = [
+    ModelInfo(
+        id="claude-opus-4-20250514",
+        name="Claude Opus 4",
+        description="Most capable model — complex reasoning, nuanced writing, advanced coding.",
+    ),
+    ModelInfo(
+        id="claude-sonnet-4-20250514",
+        name="Claude Sonnet 4",
+        description="Balanced performance and speed — strong all-around model.",
+    ),
+    ModelInfo(
+        id="claude-haiku-4-5-20251001",
+        name="Claude Haiku 4.5",
+        description="Fastest and most cost-effective — ideal for simple tasks.",
+    ),
+]
+
 
 class AnthropicAI(AIBackend):
     """AI backend using the Anthropic Messages API via httpx."""
@@ -46,19 +65,32 @@ class AnthropicAI(AIBackend):
 
     @classmethod
     def backend_config_params(cls) -> list[ConfigParam]:
+        all_model_ids = [m.id for m in _AVAILABLE_MODELS]
         return [
             ConfigParam(
                 key="api_key",
                 type=ToolParameterType.STRING,
                 description="Anthropic API key.",
                 sensitive=True,
-                restart_required=True,
             ),
             ConfigParam(
                 key="model",
                 type=ToolParameterType.STRING,
-                description="Model ID (e.g., claude-sonnet-4-20250514).",
+                description=(
+                    "Default model ID used when no per-request model is specified."
+                ),
                 default=_DEFAULT_MODEL,
+                choices=tuple(all_model_ids),
+            ),
+            ConfigParam(
+                key="enabled_models",
+                type=ToolParameterType.ARRAY,
+                description=(
+                    "Models available for selection in the chat UI and model "
+                    "tier mappings. Only enabled models can be assigned to tiers."
+                ),
+                default=all_model_ids,
+                choices=tuple(all_model_ids),
             ),
             ConfigParam(
                 key="max_tokens",
@@ -135,6 +167,7 @@ class AnthropicAI(AIBackend):
     def __init__(self) -> None:
         self._client: httpx.AsyncClient | None = None
         self._model: str = _DEFAULT_MODEL
+        self._enabled_models: list[str] = [m.id for m in _AVAILABLE_MODELS]
         self._max_tokens: int = 16384
         self._temperature: float = 0.7
 
@@ -144,6 +177,9 @@ class AnthropicAI(AIBackend):
             raise ValueError("AnthropicAI requires 'api_key' in config")
 
         self._model = str(config.get("model", _DEFAULT_MODEL))
+        raw_enabled = config.get("enabled_models")
+        if isinstance(raw_enabled, list) and raw_enabled:
+            self._enabled_models = [str(m) for m in raw_enabled]
         self._max_tokens = int(config.get("max_tokens", 16384))
         self._temperature = float(config.get("temperature", 0.7))
 
@@ -163,12 +199,10 @@ class AnthropicAI(AIBackend):
             await self._client.aclose()
             self._client = None
 
+    def available_models(self) -> list[ModelInfo]:
+        return [m for m in _AVAILABLE_MODELS if m.id in self._enabled_models]
+
     def capabilities(self) -> AIBackendCapabilities:
-        """Anthropic's Messages API supports both true SSE streaming and
-        multimodal user attachments (images, documents). Advertise both
-        so the AIService agentic loop can publish text deltas to the
-        event bus for live rendering in the chat UI.
-        """
         return AIBackendCapabilities(
             streaming=True,
             attachments_user=True,
@@ -181,7 +215,7 @@ class AnthropicAI(AIBackend):
         body = self._build_request_body(request)
 
         ai_logger.debug(
-            "Anthropic request: model=%s messages=%d", self._model, len(body["messages"])
+            "Anthropic request: model=%s messages=%d", body["model"], len(body["messages"])
         )
 
         resp = await self._client.post("/messages", json=body)
@@ -489,7 +523,7 @@ class AnthropicAI(AIBackend):
 
     def _build_request_body(self, request: AIRequest) -> dict[str, Any]:
         body: dict[str, Any] = {
-            "model": self._model,
+            "model": request.model or self._model,
             "max_tokens": self._max_tokens,
             "messages": self._build_messages(request.messages),
         }

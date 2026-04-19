@@ -34,6 +34,7 @@ async def check_guess_ai(
     guess: str,
     title: str,
     artist: str,
+    ai_profile: str = "light",
 ) -> dict[str, bool]:
     """Use AI to judge if the guess matches the song title and/or artist.
 
@@ -56,7 +57,7 @@ async def check_guess_ai(
             f"Reply with EXACTLY one of: 'both' (got title and artist), "
             f"'title' (got the song name), 'artist' (got only the artist), 'no'."
         )
-        response, *_ = await ai_svc.chat(prompt, ai_call="guess_song_validate")
+        response, *_ = await ai_svc.chat(prompt, ai_profile=ai_profile)
         answer = response.strip().lower()
         if answer.startswith("both"):
             return {"title": True, "artist": True}
