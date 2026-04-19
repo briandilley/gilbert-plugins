@@ -27,6 +27,7 @@ The table below is an index — jump to each plugin's detail section for configu
 |---|---|---|---|
 | [anthropic](#anthropic) | `AIBackend "anthropic"`, `VisionBackend "anthropic"` | `anthropic` | Intelligence |
 | [arr](#arr) | `radarr` service, `sonarr` service | — (uses `httpx`) | Media |
+| [bedrock](#bedrock) | `AIBackend "bedrock"` | `boto3` | Intelligence |
 | [deepseek](#deepseek) | `AIBackend "deepseek"` | — (uses `httpx`) | Intelligence |
 | [elevenlabs](#elevenlabs) | `TTSBackend "elevenlabs"` | — (uses `httpx`) | Media |
 | [gemini](#gemini) | `AIBackend "gemini"` | — (uses `httpx`) | Intelligence |
@@ -86,6 +87,33 @@ Radarr + Sonarr integration for browsing, searching, and managing your movie and
 - `default_root_folder` — Root folder path for new downloads.
 
 **Requires**: nothing on the Gilbert side beyond `httpx`, which is already a core dep.
+
+---
+
+### bedrock
+
+AWS Bedrock chat backend — unlike every other AI plugin this one doesn't speak an OpenAI-compatible API. Bedrock's [Converse API](https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html) gives us a unified request shape across Anthropic Claude, Meta Llama, Mistral, and Amazon Nova models, with AWS SigV4 authentication. Useful for installations that already run on AWS and want their model traffic to stay in-VPC / billed through AWS.
+
+**Backend registered** — `AIBackend.backend_name = "bedrock"`: tool-use capable, streaming via `converse_stream`, image-input capable on vision-capable models (Claude, Nova), per-call model override.
+
+**Configure** (Settings → Intelligence → AI, with the `bedrock` backend selected)
+- `enabled` — Initialize this backend at startup (default `true`).
+- `aws_region` — AWS region for the Bedrock runtime endpoint (default `us-east-1`). Cross-region inference-profile IDs (`us.` / `eu.` prefixed) route automatically within the partition.
+- `aws_access_key_id` — Optional. Leave blank to use boto3's default credential chain (env vars, `~/.aws/credentials`, EC2/ECS/Lambda IAM role).
+- `aws_secret_access_key` *(sensitive)* — Optional. Paired with the access key.
+- `aws_session_token` *(sensitive)* — Optional. For temporary credentials (STS AssumeRole, SSO).
+- `model` — Default Bedrock model ID or inference profile ID (default `us.anthropic.claude-sonnet-4-5-20250929-v1:0`). Free-text because the available catalog varies per account and region — paste any model ID from the Bedrock console.
+- `enabled_models` — Suggested subset shown in the chat UI and AI profile editor. Ships with common Claude / Llama / Mistral / Nova IDs.
+- `max_tokens` — Per-response cap (default `8192`). Sent as `inferenceConfig.maxTokens`.
+- `temperature` — Sampling temperature (default `0.7`).
+
+**Streaming.** The backend drives `converse_stream`'s blocking iterator in a background thread and forwards events onto an `asyncio.Queue`. The main coroutine consumes the queue and maps `contentBlockStart` / `contentBlockDelta` / `contentBlockStop` / `messageStop` / `metadata` events to neutral `StreamEvent`s — `TEXT_DELTA`, `TOOL_CALL_START`, `TOOL_CALL_DELTA`, `TOOL_CALL_END`, and finally `MESSAGE_COMPLETE` with the assembled `AIResponse`.
+
+**Attachments.** Vision-capable Bedrock models (Claude, Nova) accept image content blocks with raw bytes (not base64 strings — the plugin decodes). Supported formats: `png`, `jpeg`, `gif`, `webp`. Documents and text attachments become text stubs pointing the model at the workspace tools.
+
+**Config action** — `test_connection`: issues a one-word completion to verify credentials and region.
+
+**Third-party deps**: `boto3` (for AWS SigV4 signing, credential resolution, and the Converse / ConverseStream APIs).
 
 ---
 

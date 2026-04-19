@@ -1,0 +1,16 @@
+[project]
+name = "gilbert-plugin-bedrock"
+version = "1.0.0"
+description = "AWS Bedrock AI backend for Gilbert"
+requires-python = ">=3.12"
+# boto3 handles AWS SigV4 signing, credential resolution, and the
+# Bedrock Converse / ConverseStream APIs. We wrap the sync calls with
+# ``asyncio.to_thread`` rather than pulling in ``aiobotocore`` — boto3
+# is already a common transitive dep in most Python envs, and
+# ``aiobotocore`` drags in an incompatible aiohttp pin.
+dependencies = [
+    "boto3>=1.35",
+]
+
+[tool.uv]
+package = false

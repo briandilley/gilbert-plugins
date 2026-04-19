@@ -1,0 +1,10 @@
+name: bedrock
+version: "1.0.0"
+description: "AWS Bedrock backend — AI chat via the Bedrock Converse API"
+
+provides:
+  - bedrock_ai
+
+requires: []
+
+depends_on: []
