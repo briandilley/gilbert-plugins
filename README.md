@@ -49,7 +49,8 @@ Claude-powered AI chat and vision backends, speaking the Anthropic Messages API 
 
 **Configure** (Settings → AI and Settings → Vision)
 - `api_key` *(sensitive)* — Anthropic API key (`sk-ant-…`).
-- `model` — Claude model ID (default `claude-sonnet-4-20250514` for chat, `claude-sonnet-4-5-20250929` for vision).
+- `model` — Default Claude model ID used when a request specifies no per-call model (default `claude-sonnet-4-20250514` for chat, `claude-sonnet-4-5-20250929` for vision).
+- `enabled_models` — Subset of advertised models that the chat UI and AI profile editor expose for selection. Defaults to every model the backend knows about.
 - `max_tokens` — Per-response cap (default `16384`). Sonnet/Opus 4.x comfortably support higher; the AIService recovers from a `max_tokens` cut-off on a text-only response via bounded continuation, but a `tool_use` that gets truncated mid-JSON is unrecoverable, so keep this comfortably above the largest tool input you expect.
 - `temperature` — Sampling temperature (chat only).
 
@@ -163,6 +164,7 @@ Socket Mode bot that routes Slack DMs and `@Gilbert` mentions to the AI service.
 **Configure** (Settings → Communication → Slack)
 - `bot_token` *(sensitive)* — Slack bot token (`xoxb-…`).
 - `app_token` *(sensitive)* — Slack app-level token (`xapp-…`). Required for Socket Mode.
+- `ai_profile` — AI profile name routing Slack chat through a specific tier/backend/model (default `standard`).
 
 Slack signing secrets aren't needed — Socket Mode doesn't use HTTP webhooks, so there's nothing for Slack to sign.
 
