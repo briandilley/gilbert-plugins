@@ -31,6 +31,7 @@ The table below is an index — jump to each plugin's detail section for configu
 | [google](#google) | `AuthBackend "google"`, `UserProviderBackend "google_directory"`, `EmailBackend "gmail"`, `DocumentBackend "google_drive"` | `google-auth`, `google-api-python-client` | Identity / Communication / Knowledge |
 | [guess-that-song](#guess-that-song) | `guess_game` service | — (pure stdlib) | Games |
 | [ngrok](#ngrok) | `TunnelBackend "ngrok"` | `pyngrok` | Infrastructure |
+| [openai](#openai) | `AIBackend "openai"` | — (uses `httpx`) | Intelligence |
 | [slack](#slack) | `slack` service (Socket Mode bot) | `slack-bolt` | Communication |
 | [sonos](#sonos) | `SpeakerBackend "sonos"`, `MusicBackend "sonos"` | `soco` | Media |
 | [tavily](#tavily) | `WebSearchBackend "tavily"` | — (uses `httpx`) | Intelligence |
@@ -152,6 +153,29 @@ Tunnel backend that gives Gilbert a public HTTPS URL via [ngrok](https://ngrok.c
 **Config action** — `test_connection`: reports the current public URL if the tunnel is live.
 
 **Third-party deps**: `pyngrok`.
+
+---
+
+### openai
+
+OpenAI GPT chat backend, speaking the [Chat Completions API](https://platform.openai.com/docs/api-reference/chat) directly over `httpx` (no `openai` SDK dependency). Runs alongside the `anthropic` backend — configure either or both, then pick per-profile in the AI profile editor.
+
+**Backend registered** — `AIBackend.backend_name = "openai"`: tool-use capable, streaming, image-input capable on vision models (`gpt-4o`, `gpt-4-turbo`), per-call model override.
+
+**Configure** (Settings → Intelligence → AI, with the `openai` backend selected)
+- `api_key` *(sensitive)* — OpenAI API key (`sk-…`).
+- `base_url` — API base URL (default `https://api.openai.com/v1`). Override to point at an OpenAI-compatible proxy (Azure OpenAI, a local gateway, …).
+- `organization` — Optional OpenAI organization ID sent as the `OpenAI-Organization` header. Leave blank unless your account belongs to multiple orgs.
+- `model` — Default model ID used when a request specifies no per-call model (default `gpt-4o`).
+- `enabled_models` — Subset of advertised models that the chat UI and AI profile editor expose for selection. Defaults to every model the backend knows about (`gpt-4o`, `gpt-4o-mini`, `gpt-4-turbo`, `o1`, `o1-mini`, `o3-mini`).
+- `max_tokens` — Per-response cap, sent as `max_completion_tokens` so it works for both classic chat models and the `o`-series reasoning models (default `16384`).
+- `temperature` — Sampling temperature (default `0.7`). Automatically omitted from requests when the selected model is in the `o`-series, which only accepts the default sampling.
+
+**Streaming.** The backend implements `generate_stream` over OpenAI's SSE chunks, translating `delta.content` into `TEXT_DELTA` events and assembling incremental `tool_calls[i].function.arguments` deltas back into complete `ToolCall`s at the end of the stream. All OpenAI-specific SSE parsing stays inside `openai_ai.py`; `capabilities()` reports `streaming=True, attachments_user=True`.
+
+**Attachments.** Image attachments are rendered as `image_url` content parts with `data:<mime>;base64,…` URLs, which the vision-capable models (`gpt-4o`, `gpt-4-turbo`) understand natively. Document (PDF) attachments become text stubs pointing the model at the workspace tools (`read_workspace_file`, `run_workspace_script`) — Chat Completions doesn't accept PDFs directly. Text attachments are inlined as `## <name>\n\n<body>`.
+
+**Config action** — `test_connection`: issues a one-word completion to verify credentials.
 
 ---
 

@@ -1,0 +1,10 @@
+name: openai
+version: "1.0.0"
+description: "OpenAI GPT backend — AI chat via the OpenAI Chat Completions API"
+
+provides:
+  - openai_ai
+
+requires: []
+
+depends_on: []

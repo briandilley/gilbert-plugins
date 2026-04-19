@@ -1,0 +1,12 @@
+[project]
+name = "gilbert-plugin-openai"
+version = "1.0.0"
+description = "OpenAI GPT AI backend for Gilbert"
+requires-python = ">=3.12"
+# No third-party deps — the backend talks to the OpenAI REST API
+# directly via ``httpx`` (already a core Gilbert dep). Keeps the
+# ``openai`` SDK off the dependency tree entirely.
+dependencies = []
+
+[tool.uv]
+package = false
