@@ -91,6 +91,19 @@ def test_available_models_filtered_by_enabled() -> None:
     assert [m.id for m in models] == ["gpt-4o-mini"]
 
 
+def test_backend_config_params_includes_enabled_toggle() -> None:
+    """Every AI backend advertises an ``enabled`` boolean ConfigParam so
+    the settings UI can offer a per-backend toggle. The frontend looks
+    for a param key ending in ``.enabled`` and collapses the rest of
+    the group when it's false; AIService skips init for disabled
+    backends entirely."""
+    params = OpenAIAI.backend_config_params()
+    enabled_param = next((p for p in params if p.key == "enabled"), None)
+    assert enabled_param is not None
+    assert enabled_param.type == ToolParameterType.BOOLEAN
+    assert enabled_param.default is True
+
+
 # --- Request building ---
 
 

@@ -89,6 +89,15 @@ class OpenAIAI(AIBackend):
         all_model_ids = [m.id for m in _AVAILABLE_MODELS]
         return [
             ConfigParam(
+                key="enabled",
+                type=ToolParameterType.BOOLEAN,
+                description=(
+                    "Initialize this backend at startup. Uncheck to hide its "
+                    "settings and skip initialization."
+                ),
+                default=True,
+            ),
+            ConfigParam(
                 key="api_key",
                 type=ToolParameterType.STRING,
                 description="OpenAI API key (``sk-…``).",

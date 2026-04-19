@@ -49,6 +49,7 @@ Claude-powered AI chat and vision backends, speaking the Anthropic Messages API 
 - `VisionBackend.backend_name = "anthropic"` — image understanding via Claude's vision API.
 
 **Configure** (Settings → AI and Settings → Vision)
+- `enabled` — Initialize this backend at startup (default `true`). Uncheck to hide its settings and stop it being offered in profile dropdowns.
 - `api_key` *(sensitive)* — Anthropic API key (`sk-ant-…`).
 - `model` — Default Claude model ID used when a request specifies no per-call model (default `claude-sonnet-4-20250514` for chat, `claude-sonnet-4-5-20250929` for vision).
 - `enabled_models` — Subset of advertised models that the chat UI and AI profile editor expose for selection. Defaults to every model the backend knows about.
@@ -163,6 +164,7 @@ OpenAI GPT chat backend, speaking the [Chat Completions API](https://platform.op
 **Backend registered** — `AIBackend.backend_name = "openai"`: tool-use capable, streaming, image-input capable on vision models (`gpt-4o`, `gpt-4-turbo`), per-call model override.
 
 **Configure** (Settings → Intelligence → AI, with the `openai` backend selected)
+- `enabled` — Initialize this backend at startup (default `true`). Uncheck to hide its settings and stop it being offered in profile dropdowns.
 - `api_key` *(sensitive)* — OpenAI API key (`sk-…`).
 - `base_url` — API base URL (default `https://api.openai.com/v1`). Override to point at an OpenAI-compatible proxy (Azure OpenAI, a local gateway, …).
 - `organization` — Optional OpenAI organization ID sent as the `OpenAI-Organization` header. Leave blank unless your account belongs to multiple orgs.
