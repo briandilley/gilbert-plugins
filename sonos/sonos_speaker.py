@@ -636,15 +636,24 @@ class SonosSpeaker(SpeakerBackend):
         """Invoke a play operation, retrying on a group-topology race.
 
         Sonos returns ``FailedCommand: groupCoordinatorChanged`` when
-        the local ``SonosGroup`` reference has gone stale — typically
-        right after ``set_group_members`` / ``leave_group`` reshuffles
-        the topology, during the window before the WebSocket topology
-        event has updated our side. aiosonos's push-event latency
-        empirically runs 300ms–2s on a busy household, so a one-shot
-        0.5s retry isn't enough: we retry up to 3 times with backoff
-        (0.5s, 1.0s, 2.0s) and re-fetch the group each time so
-        ``group.id`` / ``coordinator_id`` tracks whatever Sonos
-        actually settled on.
+        the ``SonosGroup`` reference has gone stale — typically right
+        after ``set_group_members`` / ``leave_group`` reshuffles the
+        topology, during the window before the WebSocket topology
+        event has updated our side. aiosonos push-event latency
+        empirically runs 300ms–2s on a busy household, so a single
+        retry isn't enough: we retry up to 4 times with backoff
+        (0.5s, 1.0s, 2.0s, 3.0s).
+
+        Crucially, we do NOT read ``coord_client.player.group`` each
+        retry — that reference is updated by
+        ``SonosPlayer.check_active_group``, which only fires on *that
+        player's* own data updates, not on every household-level
+        topology event. Meanwhile ``client._groups`` is refreshed on
+        every push event. So we look the fresh group up from
+        ``client.groups`` (via ``_current_group_for_player``) and, on
+        each retry, also force-pull the household topology via
+        ``api.groups.get_groups(household_id)`` to make sure the
+        cache is as fresh as Sonos's own state.
 
         The ``play`` callable receives the current ``SonosGroup``
         instance and is responsible for executing the actual playback
@@ -654,17 +663,31 @@ class SonosSpeaker(SpeakerBackend):
         retrying all FailedCommands would swallow legitimate errors
         (invalid track id, missing permissions, …).
         """
-        backoffs = [0.5, 1.0, 2.0]
+        backoffs = [0.5, 1.0, 2.0, 3.0]
         last_exc: FailedCommand | None = None
+        coord_player_id = coord_client.player_id
+        household_id = coord_client.household_id
         for attempt, backoff in enumerate([0.0, *backoffs]):
             if backoff > 0:
                 await asyncio.sleep(backoff)
-            group = coord_client.player.group
+                # Force-pull the groups cache directly from the
+                # speaker so we don't have to wait on the push-event
+                # path to close the race. get_groups returns the raw
+                # dict; the subscription we registered in
+                # start_listening processes it into our cache.
+                try:
+                    await coord_client.api.groups.get_groups(household_id)
+                except Exception:  # noqa: BLE001 - diagnostic-only
+                    logger.debug(
+                        "Sonos get_groups force-refresh failed on retry",
+                        exc_info=True,
+                    )
+            group = _current_group_for_player(coord_client, coord_player_id)
             if group is None:
                 if last_exc is not None:
                     raise last_exc
                 raise RuntimeError(
-                    f"Coordinator speaker {coord_client.player_id} "
+                    f"Coordinator speaker {coord_player_id} "
                     f"has no active group"
                 )
             try:
@@ -676,9 +699,12 @@ class SonosSpeaker(SpeakerBackend):
                 last_exc = exc
                 logger.debug(
                     "Sonos groupCoordinatorChanged on play attempt %d "
-                    "(group=%s) — backing off %.1fs and retrying",
+                    "(group=%s, coord=%s, members=%s) — backing off "
+                    "%.1fs and retrying",
                     attempt + 1,
                     group.id,
+                    group.coordinator_id,
+                    group.player_ids,
                     backoffs[attempt] if attempt < len(backoffs) else 0,
                 )
         # Ran out of attempts.
@@ -1004,6 +1030,32 @@ class SonosSpeaker(SpeakerBackend):
     def _name_for(self, player_id: str) -> str:
         meta = self._player_metadata.get(player_id)
         return meta.name if meta else player_id
+
+
+# ── Group lookup ─────────────────────────────────────────────────────
+
+
+def _current_group_for_player(
+    client: SonosLocalApiClient, player_id: str
+) -> Any:
+    """Find the fresh group containing ``player_id`` in ``client.groups``.
+
+    We deliberately do NOT use ``client.player.group`` here — that
+    attribute is only refreshed when ``SonosPlayer.check_active_group``
+    fires, which happens on the player's own data events, not on
+    every household-level topology event. ``client.groups`` (i.e.
+    ``client._groups``) IS refreshed on every topology push event
+    plus whenever anyone calls ``api.groups.get_groups``.
+
+    Matches either a coordinator (``group.coordinator_id == player_id``)
+    or a member (``player_id in group.player_ids``). Returns ``None``
+    if the player isn't in any group — which happens only briefly
+    during topology reshuffles; the retry loop above handles it.
+    """
+    for group in client.groups:
+        if group.coordinator_id == player_id or player_id in group.player_ids:
+            return group
+    return None
 
 
 # ── Spotify URI parsing ──────────────────────────────────────────────

@@ -80,28 +80,31 @@ def _make_backend_with_mock_speaker(
     """
     backend = SonosSpeaker()
 
+    # When ``group_in`` is provided the caller has already pre-seeded
+    # the fields it cares about; only fill in the ones they missed.
+    # For a fresh MagicMock we always overwrite identity fields because
+    # ``hasattr(MagicMock, x)`` is unconditionally True (every attr
+    # returns a child MagicMock), which makes guarded fallbacks silently
+    # leave MagicMock objects where the retry path expects real strings.
+    fresh = group_in is None
     group = group_in if group_in is not None else MagicMock()
-    if not hasattr(group, "id") or not group.id:
+    if fresh or not isinstance(getattr(group, "id", None), str):
         group.id = "group-1"
-    if not hasattr(group, "name") or not group.name:
+    if fresh or not isinstance(getattr(group, "name", None), str):
         group.name = "Kitchen"
-    if not hasattr(group, "player_ids"):
+    if fresh or not isinstance(getattr(group, "player_ids", None), list):
         group.player_ids = [player_id]
-    if not hasattr(group, "coordinator_id"):
+    if fresh or not isinstance(getattr(group, "coordinator_id", None), str):
         group.coordinator_id = player_id
-    if not hasattr(group, "playback_state"):
+    if fresh or not isinstance(getattr(group, "playback_state", None), str):
         group.playback_state = "PLAYBACK_STATE_IDLE"
-    if not hasattr(group, "playback_metadata"):
+    if fresh:
         group.playback_metadata = None
-    if not hasattr(group, "play_stream_url") or not isinstance(
-        group.play_stream_url, AsyncMock
-    ):
+    if not isinstance(getattr(group, "play_stream_url", None), AsyncMock):
         group.play_stream_url = AsyncMock()
-    if not hasattr(group, "pause") or not isinstance(group.pause, AsyncMock):
+    if not isinstance(getattr(group, "pause", None), AsyncMock):
         group.pause = AsyncMock()
-    if not hasattr(group, "set_group_members") or not isinstance(
-        group.set_group_members, AsyncMock
-    ):
+    if not isinstance(getattr(group, "set_group_members", None), AsyncMock):
         group.set_group_members = AsyncMock()
 
     player = MagicMock()
@@ -116,9 +119,20 @@ def _make_backend_with_mock_speaker(
 
     client = MagicMock()
     client.player = player
+    # Identity fields used by the topology-retry path — without these
+    # the retry logic sees MagicMock objects where it expects strings
+    # and never finds the player in the mock groups list.
+    client.player_id = player_id
+    client.household_id = "HH-TEST"
     client.groups = [group]
     client.create_group = AsyncMock()
     client.disconnect = AsyncMock()
+    # Mid-retry force-refresh of the groups cache goes through
+    # ``client.api.groups.get_groups`` — give it an AsyncMock so it
+    # completes cleanly without perturbing mock state.
+    client.api = MagicMock()
+    client.api.groups = MagicMock()
+    client.api.groups.get_groups = AsyncMock()
 
     backend._clients[player_id] = client
     backend._player_metadata[player_id] = _PlayerMetadata(
@@ -305,8 +319,11 @@ async def test_play_eventually_raises_when_topology_never_settles(
                 speaker_ids=["RINCON_COORD"],
             )
         )
-    # 1 initial + 3 retries = 4 attempts before giving up.
-    assert call_count["n"] == 4
+    # 1 initial + 4 retries = 5 attempts before giving up. We run the
+    # loop this long because aiosonos push-event latency on a busy
+    # household runs up to 2–3s; anything shorter and we'd fail before
+    # the topology event catches up on the worst-case reshuffle.
+    assert call_count["n"] == 5
 
 
 async def test_http_uri_applies_volume_before_play() -> None:
