@@ -271,6 +271,44 @@ async def test_play_reraises_unrelated_failed_command() -> None:
     group.play_stream_url.assert_awaited_once()
 
 
+async def test_play_eventually_raises_when_topology_never_settles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If Sonos keeps returning ``groupCoordinatorChanged`` across all
+    retries (topology never settles in our window), surface the last
+    error rather than hanging forever or swallowing silently."""
+    import asyncio as _asyncio
+
+    from aiosonos.exceptions import FailedCommand
+
+    # Patch sleep to no-op so the test doesn't wait 3.5s.
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(_asyncio, "sleep", _no_sleep)
+
+    backend, _client, _player, group = _make_backend_with_mock_speaker()
+    call_count = {"n": 0}
+
+    async def always_fail(url: str, metadata: dict) -> None:
+        call_count["n"] += 1
+        raise FailedCommand(
+            "Command failed: groupCoordinatorChanged"
+        )
+
+    group.play_stream_url = always_fail  # type: ignore[assignment]
+
+    with pytest.raises(FailedCommand, match="groupCoordinatorChanged"):
+        await backend.play_uri(
+            PlayRequest(
+                uri="http://gilbert/song.mp3",
+                speaker_ids=["RINCON_COORD"],
+            )
+        )
+    # 1 initial + 3 retries = 4 attempts before giving up.
+    assert call_count["n"] == 4
+
+
 async def test_http_uri_applies_volume_before_play() -> None:
     backend, _client, player, group = _make_backend_with_mock_speaker()
 

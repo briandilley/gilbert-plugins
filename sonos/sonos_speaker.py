@@ -633,38 +633,57 @@ class SonosSpeaker(SpeakerBackend):
         coord_client: SonosLocalApiClient,
         play: Any,
     ) -> None:
-        """Invoke a play operation, retrying once on a group-topology race.
+        """Invoke a play operation, retrying on a group-topology race.
 
         Sonos returns ``FailedCommand: groupCoordinatorChanged`` when
         the local ``SonosGroup`` reference has gone stale — typically
-        right after ``set_group_members`` reshuffles and before the
-        WebSocket topology event has updated our side. Brief wait +
-        re-fetch of the current group + one retry handles the race
-        without adding a blanket sleep to every play call.
+        right after ``set_group_members`` / ``leave_group`` reshuffles
+        the topology, during the window before the WebSocket topology
+        event has updated our side. aiosonos's push-event latency
+        empirically runs 300ms–2s on a busy household, so a one-shot
+        0.5s retry isn't enough: we retry up to 3 times with backoff
+        (0.5s, 1.0s, 2.0s) and re-fetch the group each time so
+        ``group.id`` / ``coordinator_id`` tracks whatever Sonos
+        actually settled on.
 
         The ``play`` callable receives the current ``SonosGroup``
         instance and is responsible for executing the actual playback
-        command (``play_stream_url``, ``load_content``, etc.).
+        command (``play_stream_url``, ``load_content``, etc.). Any
+        ``FailedCommand`` with a reason *other than*
+        ``groupCoordinatorChanged`` re-raises immediately — blanket-
+        retrying all FailedCommands would swallow legitimate errors
+        (invalid track id, missing permissions, …).
         """
-        group = coord_client.player.group
-        if group is None:
-            raise RuntimeError(
-                f"Coordinator speaker {coord_client.player_id} has no active group"
-            )
-        try:
-            await play(group)
-        except FailedCommand as exc:
-            if "groupCoordinatorChanged" not in str(exc):
-                raise
-            logger.debug(
-                "Sonos reported groupCoordinatorChanged on play — "
-                "waiting for topology to settle, then retrying once"
-            )
-            await asyncio.sleep(0.5)
+        backoffs = [0.5, 1.0, 2.0]
+        last_exc: FailedCommand | None = None
+        for attempt, backoff in enumerate([0.0, *backoffs]):
+            if backoff > 0:
+                await asyncio.sleep(backoff)
             group = coord_client.player.group
             if group is None:
-                raise
-            await play(group)
+                if last_exc is not None:
+                    raise last_exc
+                raise RuntimeError(
+                    f"Coordinator speaker {coord_client.player_id} "
+                    f"has no active group"
+                )
+            try:
+                await play(group)
+                return
+            except FailedCommand as exc:
+                if "groupCoordinatorChanged" not in str(exc):
+                    raise
+                last_exc = exc
+                logger.debug(
+                    "Sonos groupCoordinatorChanged on play attempt %d "
+                    "(group=%s) — backing off %.1fs and retrying",
+                    attempt + 1,
+                    group.id,
+                    backoffs[attempt] if attempt < len(backoffs) else 0,
+                )
+        # Ran out of attempts.
+        assert last_exc is not None
+        raise last_exc
 
     async def _load_spotify_content(
         self,
