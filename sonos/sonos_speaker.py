@@ -776,13 +776,16 @@ class SonosSpeaker(SpeakerBackend):
                 len(to_unjoin),
             )
 
-        # Join speakers to the coordinator. Same tolerance rule — a
-        # single speaker throwing UPnP 800 ("Transition not available",
-        # usually because it's in a non-idle state) shouldn't kill
-        # playback on all the other speakers. Fail only if *every*
-        # intended join failed and nothing else got un-grouped into
-        # the target zone either; in that case there's no group to
-        # play on and the caller deserves the original error.
+        # Join speakers to the coordinator. A speaker throwing UPnP 800
+        # ("Transition not available" — usually a non-idle transport
+        # state) shouldn't kill playback: the coordinator is already
+        # viable and any speakers that did join will still play. Even
+        # when *every* intended join fails we keep going — the
+        # coordinator itself can play the audio on its own, and if that
+        # too is broken ``play_uri`` below will surface a clearer error
+        # than re-raising here (which previously stopped playback even
+        # when the only "failed join" was a non-coordinator speaker
+        # that the coordinator didn't need).
         if to_join:
             join_results = await asyncio.gather(
                 *(asyncio.to_thread(d.join, coordinator) for d in to_join),
@@ -799,11 +802,6 @@ class SonosSpeaker(SpeakerBackend):
                     coordinator.player_name,
                     exc,
                 )
-            if join_failed and not join_ok:
-                # Every intended join failed; propagate the first error
-                # so the AI tool surfaces a real diagnostic rather than
-                # silently "succeeding" with an empty group.
-                raise join_failed[0][1]
             await asyncio.sleep(_GROUP_SETTLE_SECONDS)
             logger.debug(
                 "Joined %d/%d speakers to coordinator",

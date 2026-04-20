@@ -401,10 +401,15 @@ async def test_group_speakers_tolerates_single_join_failure(
     )
 
 
-async def test_group_speakers_raises_when_every_join_fails() -> None:
-    """If *every* speaker refuses the join there's nothing to play on,
-    so the caller deserves the original error rather than a silent
-    empty-group success."""
+async def test_group_speakers_continues_when_every_join_fails(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Even when every intended join fails, keep going — the coordinator
+    itself is still viable and the downstream ``play_uri`` will either
+    succeed (playing solo on the coordinator) or surface a clearer
+    error. Re-raising here would abort ``play_audio`` purely because a
+    non-coordinator speaker refused to join, which observed in practice
+    meant CAFE being unavailable blocked the entire speaker set."""
     from soco.exceptions import SoCoUPnPException
 
     backend = SonosSpeaker()
@@ -429,8 +434,16 @@ async def test_group_speakers_raises_when_every_join_fails() -> None:
         "RINCON_B": bad_b,
     }
 
-    with pytest.raises(SoCoUPnPException):
-        await backend._apply_group_changes(
-            ["RINCON_COORD", "RINCON_A", "RINCON_B"],
-            {"RINCON_COORD", "RINCON_A", "RINCON_B"},
-        )
+    caplog.set_level("WARNING", logger="gilbert_plugin_sonos.sonos_speaker")
+
+    # Must NOT raise even though both joins failed.
+    await backend._apply_group_changes(
+        ["RINCON_COORD", "RINCON_A", "RINCON_B"],
+        {"RINCON_COORD", "RINCON_A", "RINCON_B"},
+    )
+
+    # Both attempts were logged with the speaker names so the failure
+    # path is diagnosable from the logs.
+    warning_messages = [rec.message for rec in caplog.records]
+    assert any("CAFE" in m for m in warning_messages)
+    assert any("OFFICE" in m for m in warning_messages)
