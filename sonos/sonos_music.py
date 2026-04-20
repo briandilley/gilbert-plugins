@@ -417,15 +417,17 @@ class SonosMusic(MusicBackend, LinkedMusicServiceLister):
                 type=ToolParameterType.STRING,
                 description=(
                     "OAuth redirect URI. Must match one of the redirect "
-                    "URIs registered on your Spotify app. The default "
-                    "points at a non-existent localhost endpoint; after "
-                    "authorizing, Spotify will redirect there and the "
-                    "browser will show an error page — copy the URL (or "
-                    "just the ``?code=…`` part) into Spotify Auth Code "
-                    "below. We don't actually need the endpoint to work "
-                    "because we parse the code from whatever you paste."
+                    "URIs registered on your Spotify app exactly. "
+                    "Spotify now requires the ``https://`` scheme for "
+                    "most redirect URIs (plain ``http://localhost:…`` "
+                    "is no longer accepted). Default points at the "
+                    "Gilbert web port over HTTPS; the endpoint doesn't "
+                    "need to actually serve HTTPS — after authorizing, "
+                    "your browser will hit an error page with the "
+                    "``?code=…`` in the URL. Copy that URL (or just the "
+                    "code) into Spotify Auth Code below."
                 ),
-                default="http://localhost:8888/callback",
+                default="https://localhost:8000/callback",
             ),
             ConfigParam(
                 key="refresh_token",
@@ -521,7 +523,7 @@ class SonosMusic(MusicBackend, LinkedMusicServiceLister):
     def __init__(self) -> None:
         self._client_id: str = ""
         self._client_secret: str = ""
-        self._redirect_uri: str = "http://localhost:8888/callback"
+        self._redirect_uri: str = "https://localhost:8000/callback"
         self._refresh_token: str = ""
         self._spotify: _SpotifyClient | None = None
         # Pending-link state — held in memory between link_spotify and
@@ -535,7 +537,7 @@ class SonosMusic(MusicBackend, LinkedMusicServiceLister):
         self._client_id = str(config.get("client_id") or "")
         self._client_secret = str(config.get("client_secret") or "")
         self._redirect_uri = str(
-            config.get("redirect_uri") or "http://localhost:8888/callback"
+            config.get("redirect_uri") or "https://localhost:8000/callback"
         )
         self._refresh_token = str(config.get("refresh_token") or "")
 
