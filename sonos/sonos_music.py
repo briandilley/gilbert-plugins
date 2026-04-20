@@ -686,6 +686,16 @@ class SonosMusic(MusicBackend, LinkedMusicServiceLister):
             state=self._pending_state,
             scope=_DEFAULT_SCOPES,
         )
+        # Log both the redirect_uri and the full authorize URL so
+        # "redirect_uri: Insecure" / "Not matching configuration"
+        # rejections can be diagnosed against what Spotify actually
+        # received — without this it's a guessing game between stale
+        # config, unreloaded code, and a mismatched registered URI.
+        logger.info(
+            "Spotify link flow starting — redirect_uri=%s authorize_url=%s",
+            self._redirect_uri,
+            url,
+        )
         return ConfigActionResult(
             status="pending",
             message=(
