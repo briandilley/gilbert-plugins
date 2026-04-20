@@ -757,11 +757,19 @@ class SonosSpeaker(SpeakerBackend):
     ) -> tuple[str, str]:
         """Shape topology so ``target_ids`` form one group.
 
-        Returns ``(coordinator_player_id, authoritative_group_id)``.
-        The group id comes straight from Sonos's response to whichever
-        topology-change command we just issued (``modifyGroupMembers``
-        / ``createGroup``), so callers using it for ``createSession``
-        don't race against the local cache's push-event refresh.
+        Returns ``(coordinator_player_id, authoritative_group_id)``
+        — both taken straight from Sonos's response to the topology-
+        change command (``modifyGroupMembers`` / ``createGroup``).
+
+        The coordinator bit matters: Sonos's local WebSocket API
+        requires ``createSession`` to be issued through the
+        **coordinator's** WebSocket, not any group member's. When our
+        anchor (first target) isn't the coordinator after the
+        reshuffle — Sonos elects based on its own heuristics — we
+        return the elected coordinator's id so ``_dispatch_play`` can
+        route the session command through the right client. This is
+        the fix for the persistent ``groupCoordinatorChanged`` we saw
+        even after adopting authoritative group ids.
 
         Dedupes ``target_ids`` defensively before hitting Sonos —
         repeated player ids trigger "Effective set of new group members
@@ -781,7 +789,7 @@ class SonosSpeaker(SpeakerBackend):
             client = self._clients[pid]
             current = _current_group_for_player(client, pid)
 
-            # Already solo — no change, cached id is authoritative.
+            # Already solo — the speaker is its own coordinator.
             if current is not None and list(current.player_ids) == [pid]:
                 return pid, current.id
 
@@ -789,6 +797,7 @@ class SonosSpeaker(SpeakerBackend):
             # response's ``GroupInfo`` describes the *remnant* group
             # (the one pid left), not the new solo group, so we have
             # to wait for the push event that creates the solo group.
+            # A solo group is its own coordinator by definition.
             if current is not None:
                 try:
                     await client.api.groups.modify_group_members(
@@ -810,27 +819,29 @@ class SonosSpeaker(SpeakerBackend):
             )
             return pid, solo_id
 
-        # Multi-speaker. Use first target as the anchor for the group;
-        # Sonos may elect a different player as coordinator after the
-        # modify, but we only need our anchor to remain a member so
-        # its client can issue commands for the group.
-        coord_id = target_ids[0]
-        client = self._clients[coord_id]
-        current = _current_group_for_player(client, coord_id)
+        # Multi-speaker. We anchor on the first target for the
+        # initial modify call, but we honor whatever coordinator
+        # Sonos elects in the response — critically important so
+        # we route ``createSession`` through the right WebSocket.
+        anchor_id = target_ids[0]
+        client = self._clients[anchor_id]
+        current = _current_group_for_player(client, anchor_id)
 
         if current is None:
-            # Edge case: coordinator has no group membership at all.
-            # createGroup returns a ``GroupInfo`` we can read directly.
             info = await client.api.groups.create_group(
                 client.household_id,
                 player_ids=target_ids,
             )
-            return coord_id, info["group"]["id"]
+            group_data = info["group"]
+            return (
+                group_data.get("coordinatorId") or anchor_id,
+                group_data["id"],
+            )
 
         current_set = set(current.player_ids)
         wanted_set = set(target_ids)
         if current_set == wanted_set:
-            return coord_id, current.id
+            return current.coordinator_id or anchor_id, current.id
 
         to_add = [pid for pid in target_ids if pid not in current_set]
         to_remove = [
@@ -841,7 +852,11 @@ class SonosSpeaker(SpeakerBackend):
             player_ids_to_add=to_add,
             player_ids_to_remove=to_remove,
         )
-        return coord_id, info["group"]["id"]
+        group_data = info["group"]
+        return (
+            group_data.get("coordinatorId") or anchor_id,
+            group_data["id"],
+        )
 
     async def _set_group_volume(
         self, speaker_ids: list[str], volume: int

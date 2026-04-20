@@ -622,6 +622,77 @@ def test_backend_name() -> None:
 # ── Duplicate player_id handling ─────────────────────────────────────
 
 
+async def test_create_session_uses_elected_coordinator_not_anchor() -> None:
+    """Sonos's local WebSocket API requires ``createSession`` to be
+    issued through the **coordinator's** WebSocket — not through any
+    group member. When ``modifyGroupMembers`` re-elects a different
+    coordinator than our anchor (first target), the dispatch must
+    route the session-create call through the elected coordinator's
+    client. This is the root fix for the persistent
+    ``groupCoordinatorChanged`` seen on real hardware."""
+    group = MagicMock()
+    group.id = "group-1"
+    group.player_ids = ["RINCON_A"]
+    group.coordinator_id = "RINCON_A"
+    group.playback_state = "PLAYBACK_STATE_IDLE"
+
+    backend, anchor_client, _p, _g = _make_backend_with_mock_speaker(
+        player_id="RINCON_A",
+        group_in=group,
+    )
+    # Build a second client for RINCON_B — this is the speaker Sonos
+    # will elect as coordinator in the modify response.
+    backend._player_metadata["RINCON_B"] = _PlayerMetadata(
+        player_id="RINCON_B",
+        household_id="HH-TEST",
+        name="Lounge",
+        ip_address="192.168.1.21",
+        model="Sonos One",
+    )
+    b_client = MagicMock()
+    b_client.player_id = "RINCON_B"
+    b_client.player = MagicMock(group=group, set_volume=AsyncMock())
+    b_client.groups = [group]
+    b_client.api = MagicMock()
+    b_client.api.playback_session = MagicMock()
+    b_client.api.playback_session.create_session = AsyncMock(
+        return_value={"sessionId": "session-from-B"}
+    )
+    b_client.api.playback_session.load_stream_url = AsyncMock()
+    backend._clients["RINCON_B"] = b_client
+
+    # Arrange: modify_group_members returns a GroupInfo where Sonos
+    # elected RINCON_B as coordinator, not our RINCON_A anchor.
+    anchor_client.api.groups.modify_group_members = AsyncMock(
+        return_value={
+            "_objectType": "groupInfo",
+            "group": {
+                "_objectType": "group",
+                "id": "group-new",
+                "name": "Group",
+                "coordinatorId": "RINCON_B",
+                "playerIds": ["RINCON_A", "RINCON_B"],
+            },
+        }
+    )
+
+    await backend.play_uri(
+        PlayRequest(
+            uri="http://gilbert/song.mp3",
+            speaker_ids=["RINCON_A", "RINCON_B"],
+        )
+    )
+
+    # The session-create call went through B's WebSocket, not A's —
+    # because Sonos elected B as the coordinator.
+    b_client.api.playback_session.create_session.assert_awaited_once()
+    assert (
+        b_client.api.playback_session.create_session.call_args.args[0]
+        == "group-new"
+    )
+    anchor_client.api.playback_session.create_session.assert_not_awaited()
+
+
 async def test_duplicate_target_ids_deduped_before_sonos() -> None:
     """Callers sometimes produce lists with the same player_id twice
     (e.g. a speaker addressed by both its real name and an alias).
