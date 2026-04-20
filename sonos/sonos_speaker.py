@@ -188,6 +188,13 @@ class SonosSpeaker(SpeakerBackend):
         self._http_session: aiohttp.ClientSession | None = None
         # Lock so zeroconf callbacks don't race against each other.
         self._discovery_lock = asyncio.Lock()
+        # IPs we've already brought up (or decided to skip) — zeroconf
+        # fires Added/Updated repeatedly as records refresh, and we
+        # don't want to re-probe the info endpoint + reconnect every
+        # time. The set survives for the lifetime of the backend since
+        # a Sonos speaker's IP+identity binding is stable across
+        # mDNS refreshes.
+        self._known_ips: set[str] = set()
 
     # ── Lifecycle ────────────────────────────────────────────────────
 
@@ -329,7 +336,15 @@ class SonosSpeaker(SpeakerBackend):
         logger.debug("Zeroconf reported service removal: %s", service_name)
 
     async def _bring_up_speaker(self, ip: str) -> None:
-        """Probe the S2 info endpoint, then open an aiosonos client."""
+        """Probe the S2 info endpoint, then open an aiosonos client.
+
+        Idempotent by IP: zeroconf re-fires Added/Updated for the same
+        speaker as its mDNS records refresh, and we don't want to
+        re-probe + reconnect on every firing.
+        """
+        if ip in self._known_ips:
+            return
+        self._known_ips.add(ip)
         # Probe /api/v1/players/local/info — this gives us the stable
         # playerId + householdId identifiers that aiosonos expects,
         # plus model/name for UI listings.
@@ -357,12 +372,24 @@ class SonosSpeaker(SpeakerBackend):
 
         self._clients[metadata.player_id] = client
 
+        # aiosonos's ``start_listening`` is typed as accepting an
+        # optional ``init_ready: asyncio.Event | None = None`` but then
+        # unconditionally calls ``init_ready.set()`` at the end of
+        # initial setup — so we MUST pass an Event or it raises
+        # ``AttributeError: 'NoneType' object has no attribute 'set'``
+        # and the listener task dies before dispatching any events.
+        # The Event is useful beyond the bug-workaround anyway: it
+        # signals "initial household state is loaded" so a request
+        # arriving right after ``_bring_up_speaker`` returns doesn't
+        # race against an empty ``client.groups``.
+        init_ready = asyncio.Event()
+
         async def _listen() -> None:
             # ``start_listening`` fetches initial state + keeps the
             # connection alive, dispatching push events to subscribers.
             # Runs until the WebSocket closes or the task is cancelled.
             try:
-                await client.start_listening()
+                await client.start_listening(init_ready)
             except (ConnectionClosed, SonosException):
                 logger.debug(
                     "Sonos listener for %s closed", metadata.name, exc_info=True
@@ -378,6 +405,21 @@ class SonosSpeaker(SpeakerBackend):
             _listen(), name=f"sonos-listen-{metadata.player_id}"
         )
         self._listen_tasks[metadata.player_id] = task
+
+        # Wait (bounded) for initial setup so callers see populated
+        # groups/player state when they start querying. If the handshake
+        # stalls we still let discovery continue — the speaker just
+        # won't be usable until it catches up.
+        try:
+            await asyncio.wait_for(init_ready.wait(), timeout=_CONNECT_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Sonos speaker '%s' (%s) didn't complete initial setup in "
+                "%.1fs — marking as degraded",
+                metadata.name,
+                ip,
+                _CONNECT_TIMEOUT,
+            )
 
         logger.info(
             "Connected to Sonos speaker '%s' (%s, %s)",
