@@ -433,7 +433,7 @@ class SonosMusic(MusicBackend, LinkedMusicServiceLister):
                     "paste that URL (or just the code) into Spotify "
                     "Auth Code below."
                 ),
-                default="http://127.0.0.1:8000/callback",
+                default="https://127.0.0.1:8000/callback",
             ),
             ConfigParam(
                 key="refresh_token",
@@ -529,7 +529,7 @@ class SonosMusic(MusicBackend, LinkedMusicServiceLister):
     def __init__(self) -> None:
         self._client_id: str = ""
         self._client_secret: str = ""
-        self._redirect_uri: str = "http://127.0.0.1:8000/callback"
+        self._redirect_uri: str = "https://127.0.0.1:8000/callback"
         self._refresh_token: str = ""
         self._spotify: _SpotifyClient | None = None
         # Pending-link state — held in memory between link_spotify and
@@ -543,7 +543,7 @@ class SonosMusic(MusicBackend, LinkedMusicServiceLister):
         self._client_id = str(config.get("client_id") or "")
         self._client_secret = str(config.get("client_secret") or "")
         self._redirect_uri = str(
-            config.get("redirect_uri") or "http://127.0.0.1:8000/callback"
+            config.get("redirect_uri") or "https://127.0.0.1:8000/callback"
         )
         self._refresh_token = str(config.get("refresh_token") or "")
 
