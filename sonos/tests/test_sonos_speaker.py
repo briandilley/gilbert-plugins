@@ -20,6 +20,7 @@ a real WebSocket; the behaviours we care about are:
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -527,6 +528,36 @@ async def test_ensure_group_reforms_when_membership_differs() -> None:
     b_client.groups = [group]
     backend._clients["RINCON_B"] = b_client
 
+    # Simulate the server applying the group change — after modify,
+    # the group's player_ids should reflect the request. Real aiosonos
+    # does this via a push event; here we just mutate the mock's
+    # ``player_ids`` in the side_effect so ``_wait_for_group``'s
+    # predicate matches on its initial check.
+    async def simulated_modify(
+        group_id: str,
+        player_ids_to_add: list[str],
+        player_ids_to_remove: list[str],
+    ) -> dict:
+        new_members = [
+            *(p for p in group.player_ids if p not in player_ids_to_remove),
+            *player_ids_to_add,
+        ]
+        group.player_ids = new_members
+        return {
+            "_objectType": "groupInfo",
+            "group": {
+                "_objectType": "group",
+                "id": "group-1",
+                "name": "Zone",
+                "coordinatorId": "RINCON_A",
+                "playerIds": new_members,
+            },
+        }
+
+    client.api.groups.modify_group_members = AsyncMock(
+        side_effect=simulated_modify
+    )
+
     await backend.play_uri(
         PlayRequest(
             uri="http://gilbert/song.mp3",
@@ -622,6 +653,108 @@ def test_backend_name() -> None:
 # ── Duplicate player_id handling ─────────────────────────────────────
 
 
+async def test_ensure_group_waits_for_membership_to_settle() -> None:
+    """``_ensure_group`` must verify that all requested speakers have
+    actually joined the group before returning — otherwise callers
+    can start streaming before stragglers are audible. Simulate Sonos
+    accepting the modify but only landing ``RINCON_B`` in the group
+    a moment later (via a push-style event to the subscriber), and
+    assert that ``create_session`` is issued *after* B appears."""
+    group = MagicMock()
+    group.id = "group-1"
+    group.player_ids = ["RINCON_A"]
+    group.coordinator_id = "RINCON_A"
+    group.playback_state = "PLAYBACK_STATE_IDLE"
+
+    backend, client, _p, _g = _make_backend_with_mock_speaker(
+        player_id="RINCON_A",
+        group_in=group,
+    )
+    backend._player_metadata["RINCON_B"] = _PlayerMetadata(
+        player_id="RINCON_B",
+        household_id="HH-TEST",
+        name="Lounge",
+        ip_address="192.168.1.21",
+        model="Sonos One",
+    )
+    b_client = MagicMock()
+    b_client.player = MagicMock(group=group)
+    b_client.groups = [group]
+    backend._clients["RINCON_B"] = b_client
+
+    # Track the subscription callback so the test can fire a simulated
+    # "group updated" event AFTER modify returns — mimicking Sonos's
+    # push-event arrival that actually lands the new member.
+    captured_callbacks: list = []
+
+    def fake_subscribe(callback, event_filter=None, object_id_filter=None):
+        captured_callbacks.append(callback)
+        return lambda: None
+
+    client.subscribe = fake_subscribe
+
+    async def simulated_modify(
+        _group_id: str,
+        player_ids_to_add: list[str],
+        player_ids_to_remove: list[str],
+    ) -> dict:
+        # Return the GroupInfo but do NOT yet update group.player_ids —
+        # that happens asynchronously when the push event fires.
+        new_members = [
+            *(p for p in group.player_ids if p not in player_ids_to_remove),
+            *player_ids_to_add,
+        ]
+
+        # Schedule the cache update on the event loop so it lands
+        # after modify_group_members returns — same shape as real
+        # aiosonos push latency.
+        async def _delayed_push() -> None:
+            await asyncio.sleep(0.05)
+            group.player_ids = new_members
+            for cb in captured_callbacks:
+                cb(None)
+
+        asyncio.create_task(_delayed_push())
+        return {
+            "_objectType": "groupInfo",
+            "group": {
+                "_objectType": "group",
+                "id": "group-1",
+                "name": "Zone",
+                "coordinatorId": "RINCON_A",
+                "playerIds": new_members,
+            },
+        }
+
+    client.api.groups.modify_group_members = AsyncMock(
+        side_effect=simulated_modify
+    )
+
+    # Observation hook: record whether B was in the group at the
+    # moment create_session was called.
+    observed_members: list[list[str]] = []
+
+    async def observing_create_session(_group_id: str, **_kwargs: object) -> dict:
+        observed_members.append(list(group.player_ids))
+        return {"sessionId": "session-1"}
+
+    client.api.playback_session.create_session = AsyncMock(
+        side_effect=observing_create_session
+    )
+
+    await backend.play_uri(
+        PlayRequest(
+            uri="http://gilbert/song.mp3",
+            speaker_ids=["RINCON_A", "RINCON_B"],
+        )
+    )
+
+    # Membership had converged before create_session fired.
+    assert observed_members == [["RINCON_A", "RINCON_B"]], (
+        f"create_session observed partial membership: {observed_members}"
+    )
+
+
 async def test_create_session_uses_elected_coordinator_not_anchor() -> None:
     """Sonos's local WebSocket API requires ``createSession`` to be
     issued through the **coordinator's** WebSocket — not through any
@@ -662,18 +795,33 @@ async def test_create_session_uses_elected_coordinator_not_anchor() -> None:
     backend._clients["RINCON_B"] = b_client
 
     # Arrange: modify_group_members returns a GroupInfo where Sonos
-    # elected RINCON_B as coordinator, not our RINCON_A anchor.
-    anchor_client.api.groups.modify_group_members = AsyncMock(
-        return_value={
+    # elected RINCON_B as coordinator, not our RINCON_A anchor. Also
+    # mutate the group's player_ids in-place so _wait_for_group's
+    # post-modify verification sees the fresh membership.
+    async def simulated_modify(
+        _group_id: str,
+        player_ids_to_add: list[str],
+        player_ids_to_remove: list[str],
+    ) -> dict:
+        group.player_ids = [
+            *(p for p in group.player_ids if p not in player_ids_to_remove),
+            *player_ids_to_add,
+        ]
+        group.id = "group-new"
+        group.coordinator_id = "RINCON_B"
+        return {
             "_objectType": "groupInfo",
             "group": {
                 "_objectType": "group",
                 "id": "group-new",
                 "name": "Group",
                 "coordinatorId": "RINCON_B",
-                "playerIds": ["RINCON_A", "RINCON_B"],
+                "playerIds": list(group.player_ids),
             },
         }
+
+    anchor_client.api.groups.modify_group_members = AsyncMock(
+        side_effect=simulated_modify
     )
 
     await backend.play_uri(
@@ -720,6 +868,30 @@ async def test_duplicate_target_ids_deduped_before_sonos() -> None:
     b_client.player = MagicMock(group=group)
     b_client.groups = [group]
     backend._clients["RINCON_B"] = b_client
+
+    async def simulated_modify(
+        _group_id: str,
+        player_ids_to_add: list[str],
+        player_ids_to_remove: list[str],
+    ) -> dict:
+        group.player_ids = [
+            *(p for p in group.player_ids if p not in player_ids_to_remove),
+            *player_ids_to_add,
+        ]
+        return {
+            "_objectType": "groupInfo",
+            "group": {
+                "_objectType": "group",
+                "id": "group-1",
+                "name": "Zone",
+                "coordinatorId": "RINCON_A",
+                "playerIds": list(group.player_ids),
+            },
+        }
+
+    client.api.groups.modify_group_members = AsyncMock(
+        side_effect=simulated_modify
+    )
 
     await backend.play_uri(
         PlayRequest(

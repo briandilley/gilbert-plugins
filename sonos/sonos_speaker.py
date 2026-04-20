@@ -826,6 +826,7 @@ class SonosSpeaker(SpeakerBackend):
         anchor_id = target_ids[0]
         client = self._clients[anchor_id]
         current = _current_group_for_player(client, anchor_id)
+        wanted_set = set(target_ids)
 
         if current is None:
             info = await client.api.groups.create_group(
@@ -833,30 +834,48 @@ class SonosSpeaker(SpeakerBackend):
                 player_ids=target_ids,
             )
             group_data = info["group"]
-            return (
-                group_data.get("coordinatorId") or anchor_id,
-                group_data["id"],
+            group_id = group_data["id"]
+            coord_id = group_data.get("coordinatorId") or anchor_id
+        else:
+            current_set = set(current.player_ids)
+            if current_set == wanted_set:
+                return current.coordinator_id or anchor_id, current.id
+
+            to_add = [pid for pid in target_ids if pid not in current_set]
+            to_remove = [
+                pid for pid in current.player_ids if pid not in wanted_set
+            ]
+            info = await client.api.groups.modify_group_members(
+                current.id,
+                player_ids_to_add=to_add,
+                player_ids_to_remove=to_remove,
             )
+            group_data = info["group"]
+            group_id = group_data["id"]
+            coord_id = group_data.get("coordinatorId") or anchor_id
 
-        current_set = set(current.player_ids)
-        wanted_set = set(target_ids)
-        if current_set == wanted_set:
-            return current.coordinator_id or anchor_id, current.id
-
-        to_add = [pid for pid in target_ids if pid not in current_set]
-        to_remove = [
-            pid for pid in current.player_ids if pid not in wanted_set
-        ]
-        info = await client.api.groups.modify_group_members(
-            current.id,
-            player_ids_to_add=to_add,
-            player_ids_to_remove=to_remove,
+        # Verify all target speakers actually landed in the group
+        # before handing control back. Sonos's response confirms the
+        # command was accepted, but with many speakers (e.g. household-
+        # wide groups) some members can take up to a second or two to
+        # fully join, and callers that immediately issue playback
+        # commands can start streaming before stragglers are audible.
+        #
+        # We prefer matching by ``group.id == group_id`` (the
+        # authoritative id Sonos just handed us), falling back to
+        # matching by coordinator when the cache hasn't seen the new
+        # id yet. The predicate requires every target_id to be in the
+        # group's player_ids so no speaker is left behind.
+        coord_client = self._clients.get(coord_id, client)
+        await _wait_for_group(
+            coord_client,
+            lambda g: (
+                (g.id == group_id or g.coordinator_id == coord_id)
+                and wanted_set.issubset(set(g.player_ids))
+            ),
+            timeout=_TOPOLOGY_SETTLE_TIMEOUT,
         )
-        group_data = info["group"]
-        return (
-            group_data.get("coordinatorId") or anchor_id,
-            group_data["id"],
-        )
+        return coord_id, group_id
 
     async def _set_group_volume(
         self, speaker_ids: list[str], volume: int
