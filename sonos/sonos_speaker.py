@@ -30,9 +30,6 @@ import httpx
 from aiosonos import SonosLocalApiClient
 from aiosonos.api.models import (
     Container,
-    LoadContentRequest,
-    MetadataId,
-    MusicService as AioMusicService,
     PlayBackState,
 )
 from aiosonos.const import EventType
@@ -56,6 +53,8 @@ from gilbert.interfaces.speaker import (
     SpeakerGroup,
     SpeakerInfo,
 )
+
+from .sonos_smapi import SmapiError, SonosSmapiClient
 
 logger = logging.getLogger(__name__)
 
@@ -204,6 +203,12 @@ class SonosSpeaker(SpeakerBackend):
         # a Sonos speaker's IP+identity binding is stable across
         # mDNS refreshes.
         self._known_ips: set[str] = set()
+        # Spotify (and other SMAPI) playback goes through the legacy
+        # UPnP SOAP AVTransport endpoint on port 1400 — aiosonos's
+        # ``loadContent`` path doesn't resolve music-service URIs on
+        # current firmware (see ``sonos_smapi`` docstring). Lazy-
+        # initialised in ``initialize()`` so tests can swap it.
+        self._smapi: SonosSmapiClient | None = None
 
     # ── Lifecycle ────────────────────────────────────────────────────
 
@@ -229,6 +234,7 @@ class SonosSpeaker(SpeakerBackend):
         self._ssl_ctx.verify_mode = ssl.CERT_NONE
 
         self._http_session = aiohttp.ClientSession()
+        self._smapi = SonosSmapiClient()
 
         self._zeroconf = AsyncZeroconf()
         self._browser = AsyncServiceBrowser(
@@ -276,6 +282,10 @@ class SonosSpeaker(SpeakerBackend):
         if self._zeroconf is not None:
             await self._zeroconf.async_close()
             self._zeroconf = None
+
+        if self._smapi is not None:
+            await self._smapi.aclose()
+            self._smapi = None
 
         if self._http_session is not None:
             await self._http_session.close()
@@ -566,6 +576,14 @@ class SonosSpeaker(SpeakerBackend):
         - ``spotify:…`` URI or ``open.spotify.com`` link →
           ``playback.load_content`` with a Spotify ``MetadataId``.
         """
+        logger.info(
+            "Sonos play_uri: uri=%s title=%r speaker_ids=%s volume=%s announce=%s",
+            request.uri,
+            request.title,
+            request.speaker_ids,
+            request.volume,
+            request.announce,
+        )
         target_ids = request.speaker_ids or list(self._player_metadata.keys())
         if not target_ids:
             raise RuntimeError("No speakers available")
@@ -651,7 +669,7 @@ class SonosSpeaker(SpeakerBackend):
         spotify = _extract_spotify_ref(request.uri)
         if spotify is not None:
             await self._load_spotify_content(
-                coord_client, group_id, spotify, request.title
+                coord_player_id, spotify, request.title
             )
             return
 
@@ -680,36 +698,64 @@ class SonosSpeaker(SpeakerBackend):
 
     async def _load_spotify_content(
         self,
-        client: SonosLocalApiClient,
-        group_id: str,
+        coord_player_id: str,
         spotify: _SpotifyRef,
         title: str,
     ) -> None:
-        """Load Spotify content via the speaker's linked account.
+        """Play Spotify content via SMAPI on the group coordinator.
 
-        The speaker's own Spotify binding (configured through the
-        Sonos mobile app, not Gilbert) handles the actual streaming —
-        Gilbert just tells it *which* Spotify URI to play using the
-        household's SPOTIFY service entry. ``accountId`` is omitted;
-        Sonos resolves the default linked Spotify account on the
-        household, which is correct for the typical single-account
-        household we target.
+        Uses the legacy UPnP SOAP AVTransport endpoint on port 1400,
+        not aiosonos's ``playback.loadContent`` — the latter returns
+        ``ERROR_COMMAND_FAILED: Failed to enqueue track`` for every
+        music-service URI on current S2 firmware, because that API
+        path doesn't actually resolve music-service objects. See
+        ``sonos_smapi`` for the full rationale and references.
+
+        The coordinator's IP (for SOAP) and RINCON id (for the
+        ``x-rincon-queue:`` transport pointer) both come from our
+        per-player metadata cache. ``coord_player_id`` is the
+        authoritative RINCON id returned by ``_ensure_group`` after
+        the topology settle — using the cached ``SonosGroup.id``
+        would risk pointing at a stale coordinator.
         """
-        content_type = _SPOTIFY_KIND_TO_LOAD_TYPE.get(spotify.kind)
-        if content_type is None:
-            raise ValueError(
-                f"Unsupported Spotify content kind for playback: {spotify.kind}"
+        if self._smapi is None:
+            raise RuntimeError("Sonos SMAPI client is not initialized")
+
+        meta = self._player_metadata.get(coord_player_id)
+        if meta is None:
+            raise RuntimeError(
+                f"Cannot play Spotify — no metadata for coordinator "
+                f"{coord_player_id!r}"
             )
-        metadata_id: MetadataId = {
-            "serviceId": str(AioMusicService.SPOTIFY.value),
-            "objectId": spotify.uri,
-        }
-        request: LoadContentRequest = {
-            "type": content_type,
-            "id": metadata_id,
-            "playbackAction": "PLAY",
-        }
-        await client.api.playback.load_content(group_id, request)
+
+        logger.info(
+            "Sonos SMAPI play: coord=%s(%s) title=%r spotify=%s",
+            coord_player_id,
+            meta.ip_address,
+            title,
+            spotify.uri,
+        )
+        try:
+            await self._smapi.play_spotify(
+                coord_ip=meta.ip_address,
+                coord_rincon_id=coord_player_id,
+                kind=spotify.kind,
+                spotify_id=spotify.id,
+                title=title,
+            )
+        except SmapiError as exc:
+            logger.error(
+                "Sonos SMAPI play FAILED: coord=%s spotify=%s error=%s",
+                coord_player_id,
+                spotify.uri,
+                exc,
+            )
+            raise
+        logger.info(
+            "Sonos SMAPI play succeeded: coord=%s spotify=%s",
+            coord_player_id,
+            spotify.uri,
+        )
 
     async def _play_audio_clip(
         self,
@@ -957,32 +1003,23 @@ class SonosSpeaker(SpeakerBackend):
             return NowPlaying(state=state)
 
         meta = group.playback_metadata
-        if meta is None:
+        if not meta:
             return NowPlaying(state=state)
 
-        # aiosonos's MetadataStatus exposes ``currentItem`` with a
-        # ``track`` object, plus the current ``positionMillis`` and
-        # queue position. Fields are optional — fall back to empty.
-        current_item = getattr(meta, "currentItem", None)
-        track = getattr(current_item, "track", None) if current_item else None
-        title = str(getattr(track, "name", "") or "") if track else ""
-        artist = ""
-        if track is not None:
-            artist_obj = getattr(track, "artist", None)
-            artist = str(getattr(artist_obj, "name", "") or "") if artist_obj else ""
-        album = ""
-        if track is not None:
-            album_obj = getattr(track, "album", None)
-            album = str(getattr(album_obj, "name", "") or "") if album_obj else ""
-        album_art = ""
-        if track is not None:
-            images = getattr(track, "images", None) or []
-            if images:
-                album_art = str(getattr(images[0], "url", "") or "")
-        duration_ms = (
-            int(getattr(track, "durationMillis", 0) or 0) if track else 0
-        )
-        position_ms = int(getattr(meta, "positionMillis", 0) or 0)
+        # aiosonos's ``MetadataStatus`` is a ``TypedDict`` — at runtime
+        # it's a plain dict, so fields MUST be accessed via ``.get(...)``
+        # (not ``getattr``, which always returns the default because
+        # dicts don't expose keys as attributes). Track/Album/Artist
+        # objects inside it are also TypedDicts — same rule.
+        current_item = meta.get("currentItem") or {}
+        track = current_item.get("track") or {}
+        title = str(track.get("name") or "")
+        artist = str((track.get("artist") or {}).get("name") or "")
+        album = str((track.get("album") or {}).get("name") or "")
+        images = track.get("images") or []
+        album_art = str((images[0].get("url") if images else "") or "")
+        duration_ms = int(track.get("durationMillis") or 0)
+        position_ms = int(meta.get("positionMillis") or 0)
 
         return NowPlaying(
             state=state,

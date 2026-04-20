@@ -1,108 +1,133 @@
-# Sonos Spotify Playback — Tracks vs Containers
+# Sonos Spotify Playback — SMAPI SOAP Bridge
 
 ## Summary
-Single items (tracks/episodes/shows) and containers (playlists/albums/artists)
-take *different* playback paths on Sonos. Sending a container URI to
-`SetAVTransportURI`/`play_uri` silently no-ops — the SOAP call returns 200,
-nothing throws, and no audio plays. Containers must be routed through
-`AddURIToQueue` + `play_from_queue`.
+Spotify playback on Sonos does NOT go through aiosonos's
+`playback.loadContent` API — that path is broken on current S2
+firmware for music-service URIs. Instead, Gilbert's Sonos plugin
+issues legacy UPnP SOAP calls against `http://<coord_ip>:1400/MediaRenderer/AVTransport/Control`
+to enqueue + play Spotify content via the SMAPI service descriptor.
+The aiosonos library is still used for everything else: discovery,
+grouping, volume, audio-clip announcements, HTTP(S) stream playback.
 
 ## Details
 
-**The silent-no-op footgun.** `coordinator.play_uri(uri, title=…)` with no
-`meta=` argument makes SoCo fabricate a default DIDL envelope whose
-`upnp:class` is `object.item.audioItem.musicTrack`. Sonos therefore treats
-whatever URI it gets as a single track. For `spotify:track:…` that works.
-For `spotify:playlist:…` / `spotify:album:…` / `spotify:artist:…` Sonos
-accepts the AVTransport action, logs nothing, and plays nothing — it has
-a container URI but metadata saying it's a single track, so there's no
-queue to start from. The Radio DJ's "Playing … on Lobby" info line fires
-because the `play_uri` call completed without raising, even though no
-audio ever reached the speakers.
+### Why aiosonos.loadContent doesn't work
 
-**The two paths.**
-
-*Tracks* — direct `play_uri`:
-
-```
-x-sonos-spotify:spotify%3atrack%3a<ID>?sid=12&flags=8232&sn=<n>
-```
-
-Built by `sonos_speaker._to_sonos_spotify_uri`. Fed straight to
-`coordinator.play_uri(uri, title=…)` via SoCo; SoCo's default DIDL
-envelope (musicTrack class) is correct for this case.
-
-*Containers* — enqueue and play from queue:
-
-```
-x-rincon-cpcontainer:<smapi_item_id>
-```
-
-Use the raw SMAPI item id (with its 8-char flags prefix like `0fffffff`
-and uppercase `%3A` encoding) *verbatim* as the URI tail. `SoCo.to_element()`
-for a Spotify playlist SMAPI result returns this same form, so it's the
-shape the ecosystem agrees on.
-
-The URI alone isn't enough — it must be paired with a DIDL-Lite envelope:
-
-```xml
-<DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/"
-           xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/"
-           xmlns:r="urn:schemas-rinconnetworks-com:metadata-1-0/"
-           xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/">
-  <item id="<smapi_item_id>" parentID="-1" restricted="true">
-    <dc:title><escaped title></dc:title>
-    <upnp:class>object.container.playlistContainer</upnp:class>
-    <desc id="cdudn" nameSpace="urn:schemas-rinconnetworks-com:metadata-1-0/">SA_RINCON3079_X_#Svc3079-0-Token</desc>
-  </item>
-</DIDL-Lite>
-```
-
-The `upnp:class` varies by kind:
-- playlist → `object.container.playlistContainer`
-- album → `object.container.album.musicAlbum`
-- artist → `object.container.person.musicArtist`
-
-The `<desc>` service descriptor uses Spotify's SMAPI service type (3079).
-The literal `SA_RINCON3079_X_#Svc3079-0-Token` is correct — `_X_` is a
-placeholder Sonos substitutes at runtime, and no account serial goes in
-this string (the `sn=` that shows up in track URIs isn't needed here).
-
-**Playback sequence.** Clear the queue, enqueue, play from the first
-newly-enqueued index (1-based → 0-based conversion):
+We tried the "obvious" path first:
 
 ```python
-coordinator.clear_queue()
-resp = coordinator.avTransport.AddURIToQueue([
-    ("InstanceID", 0),
-    ("EnqueuedURI", container_uri),
-    ("EnqueuedURIMetaData", didl),
-    ("DesiredFirstTrackNumberEnqueued", 0),
-    ("EnqueueAsNext", 0),
-])
-first = int(resp["FirstTrackNumberEnqueued"])  # 1-based
-coordinator.play_from_queue(first - 1)
+request = {
+    "type": "track",
+    "id": {"serviceId": "9", "objectId": "spotify:track:<ID>"},
+    "playbackAction": "PLAY",
+}
+await client.api.playback.load_content(group_id, request)
 ```
 
-Experimentally verified against real Lobby hardware: `AddURIToQueue`
-for a typical Spotify playlist returns `NumTracksAdded=50` —
-Sonos expands the container into individual tracks on the queue —
-and `play_from_queue(0)` starts the first one.
+On S16 firmware 94.1-75110 this reliably returned
+`FailedCommand: ERROR_COMMAND_FAILED — Failed to enqueue track`.
+After deep investigation:
 
-**Where the split lives in code.**
-- `sonos_music.SonosMusic.resolve_playable` — dispatches on
-  `_spotify_kind(item.id)`. Container kinds go through
-  `_build_spotify_container_playable` (returns a ready-made
-  `x-rincon-cpcontainer:` URI + DIDL). Track/episode/show kinds
-  return the clean `spotify:<kind>:<id>` URI for the speaker backend
-  to wrap with `_to_sonos_spotify_uri`.
-- `sonos_speaker.SonosSpeaker.play_uri` — dispatches on URI scheme.
-  `x-rincon-cpcontainer:` routes to `_play_container` (queue path);
-  everything else uses the existing direct `play_uri` path.
+- Music Assistant (primary consumer of aiosonos) doesn't use
+  `loadContent` at all. It proxies Spotify audio through its own
+  HTTP server with librespot, uses `play_stream_url` with
+  `service.id = "mass"`.
+- A Sonos developer confirmed on their own community forum: the
+  Cloud Control API "is pretty lame… you cannot queue [music
+  services'] items, you can only play Favorites and a few other
+  limited things."
+- aiosonos itself has zero Spotify-specific code — the
+  `LoadContentRequest` docstring example is aspirational/stale.
+- Legacy `/status/accounts` HTTP endpoint is empty on current
+  firmware, so we can't even discover the `accountId` the
+  `loadContent` docstring suggests passing.
+
+Conclusion: loadContent-with-serviceId=9 is a dead API path; there is
+no local WebSocket API for playing arbitrary Spotify tracks on current
+firmware.
+
+### The working path — SMAPI via SOAP
+
+The UPnP SOAP endpoints on port 1400 are still alive in every current
+Sonos firmware's device description (confirmed via
+`http://<ip>:1400/xml/device_description.xml`). The SMAPI flow SoCo's
+`sharelink` plugin uses still works and is what `sonos_smapi.py`
+implements — without importing SoCo.
+
+Request shape for a Spotify track:
+
+```
+EnqueuedURI:         spotify%3atrack%3a<ID>        (no scheme prefix)
+EnqueuedURIMetaData: <DIDL-Lite>…
+                       <item id="00032020spotify%3atrack%3a<ID>" …>
+                         <dc:title>…</dc:title>
+                         <upnp:class>object.item.audioItem.musicTrack</upnp:class>
+                         <desc id="cdudn" …>SA_RINCON{sn}_X_#Svc{sn}-0-Token</desc>
+                       </item>
+                     </DIDL-Lite>
+```
+
+The `<desc>` descriptor routes the URI to Sonos's Spotify SMAPI
+service — `sn` is the SMAPI service number (2311 world / 3079 US),
+NOT the `serviceId=9` used by the cloud Control API. Different
+households are registered against different numbers; the client
+tries 2311 first and falls back to 3079 on failure.
+
+Containers (playlist, album, show) use an `x-rincon-cpcontainer:`
+prefix + kind-specific item_id key + `<upnp:class>` container
+variant. Tracks have no scheme prefix — Sonos infers the service
+from the DIDL descriptor alone.
+
+### SOAP sequence per fire
+
+1. `RemoveAllTracksFromQueue(InstanceID=0)` — start clean
+2. `AddURIToQueue(EnqueuedURI, EnqueuedURIMetaData, DesiredFirstTrackNumberEnqueued=0, EnqueueAsNext=0)` — returns `FirstTrackNumberEnqueued`
+3. `SetAVTransportURI(CurrentURI="x-rincon-queue:<coord_rincon_id>#0")` — point the transport at the coordinator's queue
+4. `Seek(Unit="TRACK_NR", Target=1)` — jump to the track we just enqueued
+5. `Play(Speed=1)`
+
+All five target the group coordinator's IP (not any speaker IP) —
+AVTransport is a coordinator-only service. `coord_rincon_id` and
+`coord_ip` both come from the existing aiosonos-driven
+`_ensure_group` flow via `SonosSpeaker._player_metadata`.
+
+### Layout
+
+- `std-plugins/sonos/sonos_smapi.py` — standalone module.
+  - `build_spotify_enqueue(kind, spotify_id, title, service_number)` —
+    pure function that returns `(enqueue_uri, didl_metadata)`.
+  - `SonosSmapiClient` — async httpx wrapper with one public method,
+    `play_spotify(coord_ip, coord_rincon_id, kind, spotify_id, title)`.
+    Owns an internal `httpx.AsyncClient` unless one is injected.
+  - `SmapiError` — raised on HTTP non-200 or SOAP fault; surfaces UPnP
+    `errorCode` + `errorDescription` when present.
+- `std-plugins/sonos/sonos_speaker.py::_load_spotify_content` —
+  thin wrapper that looks up the coordinator's IP via
+  `self._player_metadata[coord_player_id].ip_address`, then delegates
+  to `self._smapi.play_spotify(...)`.
+- `SonosSpeaker.__init__` creates `self._smapi` lazily;
+  `initialize()` constructs it; `close()` calls `aclose()`.
+
+### Gotchas
+
+- The SOAP endpoint is HTTP (port 1400), not HTTPS (port 1443). No
+  SSL context needed; a plain `httpx.AsyncClient` works.
+- `RemoveAllTracksFromQueue` is only valid on the group coordinator.
+  If you call it against a follower the call succeeds but nothing
+  happens — tracks stay on the coordinator's queue. Same for
+  `AddURIToQueue`. Always target `coord_player_id`'s IP.
+- `x-rincon-queue:<id>#0` uses the bare RINCON id (e.g.
+  `RINCON_542A1BE1908601400`) — do NOT prefix with `uuid:` even
+  though the UDN in device_description does.
+- Titles go inside `<dc:title>…</dc:title>` and are XML-escaped for
+  `&`, `<`, `>`. Apostrophes don't need escaping in element text per
+  the XML spec; `xml.sax.saxutils.escape` leaves them alone by
+  default, which is correct here.
 
 ## Related
-- `std-plugins/sonos/sonos_music.py` — `_build_spotify_container_playable`, `_spotify_kind`, `resolve_playable`
-- `std-plugins/sonos/sonos_speaker.py` — `_play_container`, `_to_sonos_spotify_uri`, `play_uri`
-- `std-plugins/sonos/tests/test_sonos_music.py` — `TestBuildSpotifyContainerPlayable`, `test_resolve_playable_playlist_uses_container_fast_path`
-- `std-plugins/sonos/tests/test_sonos_speaker.py` — `test_play_container_*`, `test_play_uri_routes_cpcontainer_through_queue_path`
-- Prior commit `c5efe65` — "Fix Sonos-Spotify play_uri 714 Illegal MIME-Type" — introduced the Spotify fast path for tracks but didn't distinguish containers, which is how this bug slipped in.
+- `std-plugins/sonos/sonos_smapi.py` — SOAP + DIDL implementation
+- `std-plugins/sonos/sonos_speaker.py::_load_spotify_content` — call site
+- `std-plugins/sonos/tests/test_sonos_smapi.py` — DIDL shape + happy path + fallback coverage
+- `std-plugins/sonos/tests/test_sonos_speaker.py::test_spotify_uri_uses_smapi_bridge` — integration at the backend level
+- SoCo's `soco/plugins/sharelink.py` — reference implementation for the DIDL shape (we do not import SoCo; this is the shape we copy)
+- Sonos community forum, "How to queue a Spotify track through API" — Sonos staff confirmation that the Cloud API can't do this

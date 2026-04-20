@@ -405,45 +405,48 @@ async def test_http_uri_clamps_volume_to_valid_range() -> None:
     player.set_volume.assert_awaited_once_with(100)
 
 
-# ── Spotify URIs use load_content ────────────────────────────────────
+# ── Spotify URIs route through the SMAPI SOAP bridge ─────────────────
 
 
-async def test_spotify_uri_uses_load_content() -> None:
-    """Spotify URIs go through ``playback.load_content`` with a
-    MetadataId pointing at the speaker's linked Spotify account,
-    using the authoritative group id from ``_ensure_group``.
-    ``accountId`` is intentionally omitted — Sonos resolves the
-    default linked Spotify account on the household, which is the
-    correct behaviour for single-account setups."""
-    backend, client, _player, group = _make_backend_with_mock_speaker()
+async def test_spotify_uri_uses_smapi_bridge() -> None:
+    """Spotify URIs go through the SMAPI SOAP bridge, not aiosonos
+    ``loadContent`` — the latter is a dead API path on current S2
+    firmware (see ``sonos_smapi`` for the full rationale). The bridge
+    is called with the coordinator's cached IP and RINCON id plus the
+    parsed kind/id/title."""
+    backend, client, _player, _group = _make_backend_with_mock_speaker()
+    smapi = AsyncMock()
+    backend._smapi = smapi
 
     await backend.play_uri(
         PlayRequest(
             uri="spotify:track:3w0pyHgJJW9JN0cJxmi33Z",
             speaker_ids=["RINCON_COORD"],
+            title="Bitch Dont Kill My Vibe",
         )
     )
 
-    client.api.playback.load_content.assert_awaited_once()
-    args = client.api.playback.load_content.call_args.args
-    # load_content signature: (group_id, content).
-    group_id, content = args
-    assert group_id == group.id
-    # Payload shape per Sonos docs — lowercase type, Spotify service ID,
-    # canonical Spotify URI as objectId.
-    assert content["type"] == "track"
-    assert content["id"]["serviceId"] == "9"
-    assert content["id"]["objectId"] == "spotify:track:3w0pyHgJJW9JN0cJxmi33Z"
-    assert content["playbackAction"] == "PLAY"
-    # Spotify path does not go through the stream-URL session API.
+    smapi.play_spotify.assert_awaited_once_with(
+        coord_ip="192.168.1.20",
+        coord_rincon_id="RINCON_COORD",
+        kind="track",
+        spotify_id="3w0pyHgJJW9JN0cJxmi33Z",
+        title="Bitch Dont Kill My Vibe",
+    )
+    # Dead API path must not be touched — if it ever is, this test
+    # catches it immediately rather than producing mystery "Failed to
+    # enqueue track" errors at runtime.
+    client.api.playback.load_content.assert_not_awaited()
     client.api.playback_session.load_stream_url.assert_not_awaited()
 
 
-async def test_spotify_playlist_uses_playlist_type() -> None:
-    """``type`` maps to the Spotify content kind — passing a playlist
-    URI must produce ``"playlist"`` not ``"track"``. Wrong type =
-    Sonos plays nothing."""
-    backend, client, _player, _group = _make_backend_with_mock_speaker()
+async def test_spotify_playlist_uses_smapi_bridge() -> None:
+    """Playlist kind flows through the SMAPI bridge the same way
+    tracks do — the bridge internally picks the right DIDL item_class
+    and ``x-rincon-cpcontainer`` prefix."""
+    backend, _client, _player, _group = _make_backend_with_mock_speaker()
+    smapi = AsyncMock()
+    backend._smapi = smapi
 
     await backend.play_uri(
         PlayRequest(
@@ -452,9 +455,65 @@ async def test_spotify_playlist_uses_playlist_type() -> None:
         )
     )
 
-    content = client.api.playback.load_content.call_args.args[1]
-    assert content["type"] == "playlist"
-    assert content["id"]["objectId"] == "spotify:playlist:37i9dQZF1DX"
+    smapi.play_spotify.assert_awaited_once()
+    call = smapi.play_spotify.call_args
+    assert call.kwargs["kind"] == "playlist"
+    assert call.kwargs["spotify_id"] == "37i9dQZF1DX"
+
+
+# ── get_now_playing pulls real fields out of MetadataStatus ──────────
+
+
+async def test_get_now_playing_extracts_metadata_from_dict() -> None:
+    """``MetadataStatus`` is a TypedDict — at runtime it's a plain dict,
+    so every field access must use dict.get(), not getattr(). A prior
+    getattr()-based implementation silently returned empty strings for
+    every track because dicts don't expose keys as attributes. This
+    test locks in dict-access by handing the code a metadata dict
+    shaped exactly like aiosonos produces one and asserting the
+    populated fields flow through."""
+    backend, client, _player, group = _make_backend_with_mock_speaker()
+
+    group.playback_state = "PLAYBACK_STATE_PLAYING"
+    group.playback_metadata = {
+        "_objectType": "metadataStatus",
+        "positionMillis": 42_000,
+        "currentItem": {
+            "_objectType": "queueItem",
+            "track": {
+                "_objectType": "track",
+                "type": "track",
+                "name": "Bitch, Don't Kill My Vibe",
+                "durationMillis": 310_000,
+                "artist": {"_objectType": "artist", "name": "Kendrick Lamar"},
+                "album": {"_objectType": "album", "name": "good kid, m.A.A.d city"},
+                "images": [{"url": "https://img.example/kendrick.jpg"}],
+            },
+        },
+    }
+
+    np = await backend.get_now_playing("RINCON_COORD")
+    assert np.title == "Bitch, Don't Kill My Vibe"
+    assert np.artist == "Kendrick Lamar"
+    assert np.album == "good kid, m.A.A.d city"
+    assert np.album_art_url == "https://img.example/kendrick.jpg"
+    assert np.duration_seconds == pytest.approx(310.0)
+    assert np.position_seconds == pytest.approx(42.0)
+
+
+async def test_get_now_playing_empty_when_no_metadata() -> None:
+    """Idle speaker: aiosonos leaves playback_metadata as an empty
+    TypedDict (or None). Either must return a NowPlaying with empty
+    strings rather than raising — callers rely on ``NowPlaying`` being
+    a safe default they can always render."""
+    backend, _client, _player, group = _make_backend_with_mock_speaker()
+    group.playback_metadata = {}
+    group.playback_state = "PLAYBACK_STATE_IDLE"
+
+    np = await backend.get_now_playing("RINCON_COORD")
+    assert np.title == ""
+    assert np.artist == ""
+    assert np.album == ""
 
 
 # ── Declarative grouping ─────────────────────────────────────────────

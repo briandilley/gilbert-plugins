@@ -16,7 +16,7 @@ if _pkg_name not in sys.modules:
     pkg.__package__ = _pkg_name
     sys.modules[_pkg_name] = pkg
 
-    for _mod_name in ("sonos_speaker", "sonos_music", "plugin"):
+    for _mod_name in ("sonos_smapi", "sonos_speaker", "sonos_music", "plugin"):
         _spec = importlib.util.spec_from_file_location(
             f"{_pkg_name}.{_mod_name}",
             _plugin_dir / f"{_mod_name}.py",

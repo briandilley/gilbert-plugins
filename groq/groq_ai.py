@@ -241,6 +241,7 @@ class GroqAI(AIBackend):
         return AIBackendCapabilities(
             streaming=True,
             attachments_user=True,
+            parallel_tool_calls=True,
         )
 
     async def generate(self, request: AIRequest) -> AIResponse:
