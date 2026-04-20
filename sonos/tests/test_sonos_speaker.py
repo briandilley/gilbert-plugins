@@ -452,6 +452,71 @@ def test_backend_name() -> None:
     assert SonosSpeaker.backend_name == "sonos"
 
 
+# ── Duplicate player_id handling ─────────────────────────────────────
+
+
+async def test_duplicate_target_ids_deduped_before_sonos() -> None:
+    """Callers sometimes produce lists with the same player_id twice
+    (e.g. a speaker addressed by both its real name and an alias).
+    Sonos rejects ``set_group_members`` with "Effective set of new
+    group members has repeated player id" — the backend must dedupe
+    before forwarding."""
+    group = MagicMock()
+    group.id = "group-1"
+    group.player_ids = ["RINCON_A"]
+    group.coordinator_id = "RINCON_A"
+    group.playback_state = "PLAYBACK_STATE_IDLE"
+    group.set_group_members = AsyncMock()
+    group.play_stream_url = AsyncMock()
+
+    backend, _c, _p, _g = _make_backend_with_mock_speaker(
+        player_id="RINCON_A",
+        group_in=group,
+    )
+    backend._player_metadata["RINCON_B"] = _PlayerMetadata(
+        player_id="RINCON_B",
+        household_id="HH-TEST",
+        name="Lounge",
+        ip_address="192.168.1.21",
+        model="Sonos One",
+    )
+    b_client = MagicMock()
+    b_client.player = MagicMock(group=group)
+    backend._clients["RINCON_B"] = b_client
+
+    await backend.play_uri(
+        PlayRequest(
+            uri="http://gilbert/song.mp3",
+            # A (real name) + A (alias) + B — RINCON_A appears twice.
+            speaker_ids=["RINCON_A", "RINCON_A", "RINCON_B"],
+        )
+    )
+
+    # The list forwarded to Sonos contains each player_id exactly once.
+    forwarded = group.set_group_members.call_args.args[0]
+    assert forwarded == ["RINCON_A", "RINCON_B"]
+
+
+async def test_duplicate_announce_target_ids_deduped() -> None:
+    """Same dedupe applies on the announce path — otherwise we'd fire
+    ``play_audio_clip`` twice on the same speaker, which with slight
+    timing skew plays the clip twice or raises an overlap error."""
+    backend, _c, player, _g = _make_backend_with_mock_speaker(
+        player_id="RINCON_A"
+    )
+
+    await backend.play_uri(
+        PlayRequest(
+            uri="http://gilbert/ding.mp3",
+            speaker_ids=["RINCON_A", "RINCON_A", "RINCON_A"],
+            announce=True,
+        )
+    )
+
+    # Only one clip fired despite three appearances of the same id.
+    assert player.play_audio_clip.await_count == 1
+
+
 # ── list_speakers materialization ────────────────────────────────────
 
 

@@ -524,8 +524,19 @@ class SonosSpeaker(SpeakerBackend):
             raise RuntimeError("No speakers available")
 
         # Verify each target is actually connected before attempting
-        # to play — otherwise we get misleading KeyErrors.
-        live = [tid for tid in target_ids if tid in self._clients]
+        # to play — otherwise we get misleading KeyErrors. Dedupe while
+        # preserving order: callers sometimes pass the same player_id
+        # twice (e.g. a speaker resolved via both its real name and an
+        # alias), and Sonos rejects ``set_group_members`` with
+        # "Effective set of new group members has repeated player id"
+        # if duplicates survive that far.
+        seen: set[str] = set()
+        live: list[str] = []
+        for tid in target_ids:
+            if tid in seen or tid not in self._clients:
+                continue
+            seen.add(tid)
+            live.append(tid)
         if not live:
             raise RuntimeError(
                 f"None of the requested speakers ({target_ids}) are connected"
@@ -647,7 +658,17 @@ class SonosSpeaker(SpeakerBackend):
         set matches an existing group, Sonos no-ops; otherwise it
         re-forms the group atomically on the household. Returns the
         player_id of whoever ended up as coordinator.
+
+        Dedupes ``target_ids`` defensively before calling Sonos —
+        ``set_group_members`` rejects any list with a repeated
+        player_id ("Effective set of new group members has repeated
+        player id"), and the callers that feed us from resolved
+        speaker-name lists occasionally produce duplicates (e.g.
+        when a speaker is addressed by both its device name and an
+        alias).
         """
+        target_ids = list(dict.fromkeys(target_ids))
+
         if len(target_ids) == 1:
             # Singleton: make sure the speaker is alone in its group.
             pid = target_ids[0]
