@@ -508,6 +508,27 @@ def test_parse_no_usage() -> None:
     assert response.usage is None
 
 
+def test_parse_response_populates_cache_tokens() -> None:
+    backend = AnthropicAI()
+    data = {
+        "content": [{"type": "text", "text": "Hi"}],
+        "model": "claude-test",
+        "stop_reason": "end_turn",
+        "usage": {
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cache_creation_input_tokens": 200,
+            "cache_read_input_tokens": 500,
+        },
+    }
+    response = backend._parse_response(data)
+    assert response.usage is not None
+    assert response.usage.input_tokens == 100
+    assert response.usage.output_tokens == 50
+    assert response.usage.cache_creation_tokens == 200
+    assert response.usage.cache_read_tokens == 500
+
+
 def test_parse_multiple_tool_calls() -> None:
     backend = AnthropicAI()
     data = {
@@ -1075,6 +1096,87 @@ async def test_generate_stream_tool_use_reassembly(backend: AnthropicAI) -> None
     assert tc.tool_call_id == "toolu_01"
     assert tc.tool_name == "get_weather"
     assert tc.arguments == {"city": "Portland"}
+
+    await backend.close()
+
+
+async def test_generate_stream_accumulates_cache_tokens(
+    backend: AnthropicAI,
+) -> None:
+    """cache_creation_input_tokens + cache_read_input_tokens from message_start
+    carry through to the final AIResponse.usage."""
+    from gilbert.interfaces.ai import StreamEventType
+
+    await backend.initialize({"api_key": "sk-test"})
+    assert backend._client is not None
+
+    lines: list[str] = []
+    lines += _sse(
+        "message_start",
+        {
+            "type": "message_start",
+            "message": {
+                "id": "msg_cache",
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": "claude-sonnet-4-6",
+                "stop_reason": None,
+                "usage": {
+                    "input_tokens": 50,
+                    "output_tokens": 0,
+                    "cache_creation_input_tokens": 200,
+                    "cache_read_input_tokens": 1000,
+                },
+            },
+        },
+    )
+    lines += _sse(
+        "content_block_start",
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        },
+    )
+    lines += _sse(
+        "content_block_delta",
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "Hi"},
+        },
+    )
+    lines += _sse(
+        "content_block_stop",
+        {"type": "content_block_stop", "index": 0},
+    )
+    lines += _sse(
+        "message_delta",
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn"},
+            "usage": {"output_tokens": 3},
+        },
+    )
+    lines += _sse("message_stop", {"type": "message_stop"})
+
+    fake = _FakeStreamResponse(lines)
+    backend._client.stream = MagicMock(return_value=fake)  # type: ignore[method-assign]
+
+    final = None
+    async for ev in backend.generate_stream(
+        AIRequest(messages=[Message(role=MessageRole.USER, content="hi")])
+    ):
+        if ev.type == StreamEventType.MESSAGE_COMPLETE:
+            final = ev.response
+
+    assert final is not None
+    assert final.usage is not None
+    assert final.usage.input_tokens == 50
+    assert final.usage.output_tokens == 3
+    assert final.usage.cache_creation_tokens == 200
+    assert final.usage.cache_read_tokens == 1000
 
     await backend.close()
 

@@ -528,6 +528,32 @@ def test_parse_no_usage() -> None:
     assert response.usage is None
 
 
+def test_parse_response_splits_cached_tokens_out_of_prompt() -> None:
+    """OpenAI's ``prompt_tokens`` already includes cached tokens; the
+    backend must subtract so ``input_tokens`` is fresh-billed only."""
+    backend = OpenAIAI()
+    data = {
+        "choices": [
+            {
+                "message": {"role": "assistant", "content": "Hi"},
+                "finish_reason": "stop",
+            }
+        ],
+        "model": "gpt-4o",
+        "usage": {
+            "prompt_tokens": 1000,
+            "completion_tokens": 200,
+            "prompt_tokens_details": {"cached_tokens": 600},
+        },
+    }
+    response = backend._parse_response(data)
+    assert response.usage is not None
+    assert response.usage.input_tokens == 400  # 1000 - 600 cached
+    assert response.usage.output_tokens == 200
+    assert response.usage.cache_read_tokens == 600
+    assert response.usage.cache_creation_tokens == 0
+
+
 def test_parse_null_content_with_tool_calls() -> None:
     """OpenAI frequently returns ``"content": null`` alongside tool_calls.
     Treat that as empty text, not as an error."""

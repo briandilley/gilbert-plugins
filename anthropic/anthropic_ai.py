@@ -310,6 +310,8 @@ class AnthropicAI(AIBackend):
         stop_reason_raw = "end_turn"
         usage_input = 0
         usage_output = 0
+        usage_cache_creation = 0
+        usage_cache_read = 0
         model_id = self._model
 
         async with self._client.stream(
@@ -372,6 +374,12 @@ class AnthropicAI(AIBackend):
                                 usage = msg.get("usage") or {}
                                 usage_input += int(usage.get("input_tokens", 0) or 0)
                                 usage_output += int(usage.get("output_tokens", 0) or 0)
+                                usage_cache_creation += int(
+                                    usage.get("cache_creation_input_tokens", 0) or 0
+                                )
+                                usage_cache_read += int(
+                                    usage.get("cache_read_input_tokens", 0) or 0
+                                )
                                 raw = msg.get("stop_reason")
                                 if raw:
                                     stop_reason_raw = str(raw)
@@ -382,6 +390,16 @@ class AnthropicAI(AIBackend):
                                     stop_reason_raw = str(raw)
                                 usage = data.get("usage") or {}
                                 usage_output += int(usage.get("output_tokens", 0) or 0)
+                                # ``message_delta`` can also carry trailing cache
+                                # accounting on some model versions. Add (don't
+                                # overwrite) so partial counts from ``message_start``
+                                # aren't lost.
+                                usage_cache_creation += int(
+                                    usage.get("cache_creation_input_tokens", 0) or 0
+                                )
+                                usage_cache_read += int(
+                                    usage.get("cache_read_input_tokens", 0) or 0
+                                )
                     event_name = ""
                     data_lines = []
                     continue
@@ -428,6 +446,8 @@ class AnthropicAI(AIBackend):
         usage = TokenUsage(
             input_tokens=usage_input,
             output_tokens=usage_output,
+            cache_creation_tokens=usage_cache_creation,
+            cache_read_tokens=usage_cache_read,
         )
         final_response = AIResponse(
             message=final_message,
@@ -438,7 +458,12 @@ class AnthropicAI(AIBackend):
         ai_logger.debug(
             "Anthropic stream response: stop_reason=%s usage=%s",
             stop_reason_raw,
-            {"input_tokens": usage_input, "output_tokens": usage_output},
+            {
+                "input_tokens": usage_input,
+                "output_tokens": usage_output,
+                "cache_creation_input_tokens": usage_cache_creation,
+                "cache_read_input_tokens": usage_cache_read,
+            },
         )
         yield StreamEvent(
             type=StreamEventType.MESSAGE_COMPLETE,
@@ -923,6 +948,12 @@ class AnthropicAI(AIBackend):
             usage = TokenUsage(
                 input_tokens=raw_usage.get("input_tokens", 0),
                 output_tokens=raw_usage.get("output_tokens", 0),
+                cache_creation_tokens=int(
+                    raw_usage.get("cache_creation_input_tokens", 0) or 0
+                ),
+                cache_read_tokens=int(
+                    raw_usage.get("cache_read_input_tokens", 0) or 0
+                ),
             )
 
         message = Message(

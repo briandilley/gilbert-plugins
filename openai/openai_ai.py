@@ -334,6 +334,7 @@ class OpenAIAI(AIBackend):
         finish_reason_raw = "stop"
         usage_input = 0
         usage_output = 0
+        usage_cache_read = 0
         model_id = self._model
 
         async with self._client.stream(
@@ -370,7 +371,15 @@ class OpenAIAI(AIBackend):
                 model_id = str(data.get("model") or model_id)
                 usage = data.get("usage")
                 if isinstance(usage, dict):
-                    usage_input = int(usage.get("prompt_tokens", usage_input) or 0)
+                    prompt_total = int(
+                        usage.get("prompt_tokens", usage_input + usage_cache_read) or 0
+                    )
+                    details = usage.get("prompt_tokens_details") or {}
+                    if isinstance(details, dict):
+                        usage_cache_read = int(details.get("cached_tokens", 0) or 0)
+                    # ``prompt_tokens`` already includes ``cached_tokens`` —
+                    # subtract so ``input_tokens`` is the fresh-billed count.
+                    usage_input = max(0, prompt_total - usage_cache_read)
                     usage_output = int(
                         usage.get("completion_tokens", usage_output) or 0
                     )
@@ -447,6 +456,7 @@ class OpenAIAI(AIBackend):
         usage_obj = TokenUsage(
             input_tokens=usage_input,
             output_tokens=usage_output,
+            cache_read_tokens=usage_cache_read,
         )
         final_response = AIResponse(
             message=final_message,
@@ -457,7 +467,11 @@ class OpenAIAI(AIBackend):
         ai_logger.debug(
             "OpenAI stream response: finish_reason=%s usage=%s",
             finish_reason_raw,
-            {"prompt_tokens": usage_input, "completion_tokens": usage_output},
+            {
+                "prompt_tokens_fresh": usage_input,
+                "completion_tokens": usage_output,
+                "cached_tokens": usage_cache_read,
+            },
         )
         yield StreamEvent(
             type=StreamEventType.MESSAGE_COMPLETE,
@@ -862,9 +876,15 @@ class OpenAIAI(AIBackend):
         usage = None
         raw_usage = data.get("usage")
         if isinstance(raw_usage, dict):
+            prompt_total = int(raw_usage.get("prompt_tokens", 0) or 0)
+            details = raw_usage.get("prompt_tokens_details") or {}
+            cached = 0
+            if isinstance(details, dict):
+                cached = int(details.get("cached_tokens", 0) or 0)
             usage = TokenUsage(
-                input_tokens=int(raw_usage.get("prompt_tokens", 0) or 0),
+                input_tokens=max(0, prompt_total - cached),
                 output_tokens=int(raw_usage.get("completion_tokens", 0) or 0),
+                cache_read_tokens=cached,
             )
 
         assistant_msg = Message(
