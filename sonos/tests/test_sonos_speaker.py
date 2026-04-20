@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 import pytest
 from gilbert_plugin_sonos.sonos_speaker import (
     SonosSpeaker,
+    _build_music_track_didl,
     _parse_hms,
     _play_container,
     _speaker_info,
@@ -284,3 +285,152 @@ async def test_play_uri_track_still_uses_direct_play_path() -> None:
     called_uri = coordinator.play_uri.call_args[0][0]
     assert called_uri.startswith("x-sonos-spotify:")
     assert "spotify%3atrack%3a3w0pyHgJJW9JN0cJxmi33Z" in called_uri
+
+
+# ─── Music-track DIDL for share-URL playback ──────────────────────────
+#
+# soco's default DIDL generation (passing ``title`` with no ``meta``)
+# uses the ``object.item.audioItem.audioBroadcast`` class, i.e. a live
+# radio stream. Sonos then probes the URL and rejects plain HTTP file
+# responses (UPnP error 714 "Illegal MIME-Type") because the content
+# doesn't match its radio-stream whitelist. Covered here: the replacement
+# DIDL tags the resource as a music track with explicit ``protocolInfo``
+# so Sonos treats it as a finite file.
+
+
+def test_music_track_didl_uses_musictrack_class_not_audiobroadcast() -> None:
+    didl = _build_music_track_didl(
+        "http://192.168.1.20:8000/api/share/abc",
+        "fart_sound",
+        "audio/mpeg",
+    )
+    # The whole point of the override — if this line reappears we're
+    # back to Sonos 714.
+    assert "audioItem.audioBroadcast" not in didl
+    assert "object.item.audioItem.musicTrack" in didl
+
+
+def test_music_track_didl_carries_protocolinfo_with_real_mime() -> None:
+    """The third slot in ``protocolInfo`` is what Sonos matches against
+    its accepted-MIME whitelist. Has to carry the actual content type
+    — not ``*/*`` — for the skip-probe shortcut to work."""
+    didl = _build_music_track_didl(
+        "http://host/a.wav", "clip", "audio/wav"
+    )
+    assert 'protocolInfo="http-get:*:audio/wav:*"' in didl
+    # And the URI sits in the <res> body where Sonos expects it.
+    assert ">http://host/a.wav</res>" in didl
+
+
+def test_music_track_didl_escapes_title_and_uri() -> None:
+    """Titles and URIs in ``<dc:title>`` / ``<res>`` go into raw XML —
+    user-controllable content has to be escaped or a title like
+    ``</upnp:class>`` breaks parse-time validation on Sonos."""
+    didl = _build_music_track_didl(
+        'http://host/x?a=1&b="2"',
+        "<evil>",
+        "audio/mpeg",
+    )
+    assert "<evil>" not in didl
+    assert "&lt;evil&gt;" in didl
+    # Ampersand in the URI gets escaped too so the XML stays well-formed.
+    assert "a=1&amp;b=" in didl
+
+
+def test_music_track_didl_falls_back_on_blank_title() -> None:
+    """Blank title should still produce a valid ``<dc:title>`` node —
+    an empty element would cause some renderers to log parse warnings
+    and picking something generic keeps the debug story clearer."""
+    didl = _build_music_track_didl("http://host/x.mp3", "", "audio/mpeg")
+    assert "<dc:title>Gilbert audio</dc:title>" in didl
+
+
+# ─── Grouping resilience ──────────────────────────────────────────────
+#
+# Real-world Sonos installs have speakers that occasionally refuse a
+# ``join`` with UPnP 800 "Transition not available" — usually because
+# the speaker is mid-stream from line-in or in a weird transport state.
+# Before the fix, ``asyncio.gather`` failed fast and killed playback on
+# every speaker. After the fix, a single-speaker failure is logged and
+# the rest of the group still forms.
+
+
+async def test_group_speakers_tolerates_single_join_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from soco.exceptions import SoCoUPnPException
+
+    backend = SonosSpeaker()
+
+    # Three standalone speakers — the first is the coordinator (target
+    # of the join), the other two are supposed to join it. The middle
+    # one refuses with UPnP 800.
+    coord = _make_device(uid="RINCON_COORD", player_name="KITCHEN")
+    coord.join = MagicMock()
+    coord.group = SimpleNamespace(members=[coord], coordinator=coord)
+
+    bad = _make_device(uid="RINCON_BAD", player_name="CAFE")
+    bad.group = SimpleNamespace(members=[bad], coordinator=bad)
+    bad.unjoin = MagicMock()
+    bad.join = MagicMock(side_effect=SoCoUPnPException("800", 800, None))
+
+    good = _make_device(uid="RINCON_GOOD", player_name="GARAGE")
+    good.group = SimpleNamespace(members=[good], coordinator=good)
+    good.unjoin = MagicMock()
+    good.join = MagicMock()
+
+    backend._devices = {
+        "RINCON_COORD": coord,
+        "RINCON_BAD": bad,
+        "RINCON_GOOD": good,
+    }
+
+    caplog.set_level("WARNING", logger="gilbert_plugin_sonos.sonos_speaker")
+
+    # Should NOT raise — the good speaker still joined.
+    await backend._apply_group_changes(
+        ["RINCON_COORD", "RINCON_BAD", "RINCON_GOOD"],
+        {"RINCON_COORD", "RINCON_BAD", "RINCON_GOOD"},
+    )
+
+    bad.join.assert_called_once()
+    good.join.assert_called_once()
+    assert any(
+        "CAFE" in rec.message and "refused to join" in rec.message
+        for rec in caplog.records
+    )
+
+
+async def test_group_speakers_raises_when_every_join_fails() -> None:
+    """If *every* speaker refuses the join there's nothing to play on,
+    so the caller deserves the original error rather than a silent
+    empty-group success."""
+    from soco.exceptions import SoCoUPnPException
+
+    backend = SonosSpeaker()
+
+    coord = _make_device(uid="RINCON_COORD", player_name="KITCHEN")
+    coord.join = MagicMock()
+    coord.group = SimpleNamespace(members=[coord], coordinator=coord)
+
+    bad_a = _make_device(uid="RINCON_A", player_name="CAFE")
+    bad_a.group = SimpleNamespace(members=[bad_a], coordinator=bad_a)
+    bad_a.unjoin = MagicMock()
+    bad_a.join = MagicMock(side_effect=SoCoUPnPException("800", 800, None))
+
+    bad_b = _make_device(uid="RINCON_B", player_name="OFFICE")
+    bad_b.group = SimpleNamespace(members=[bad_b], coordinator=bad_b)
+    bad_b.unjoin = MagicMock()
+    bad_b.join = MagicMock(side_effect=SoCoUPnPException("800", 800, None))
+
+    backend._devices = {
+        "RINCON_COORD": coord,
+        "RINCON_A": bad_a,
+        "RINCON_B": bad_b,
+    }
+
+    with pytest.raises(SoCoUPnPException):
+        await backend._apply_group_changes(
+            ["RINCON_COORD", "RINCON_A", "RINCON_B"],
+            {"RINCON_COORD", "RINCON_A", "RINCON_B"},
+        )

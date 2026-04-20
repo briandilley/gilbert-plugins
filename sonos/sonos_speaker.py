@@ -1,9 +1,12 @@
 """Sonos speaker backend — speaker control via the SoCo library."""
 
 import asyncio
+import html
 import logging
 from typing import Any
+from urllib.parse import urlparse
 
+import httpx
 import soco
 from soco import SoCo
 
@@ -212,6 +215,68 @@ def _play_container(coordinator: SoCo, uri: str, didl: str) -> None:
     coordinator.play_from_queue(first - 1)
 
 
+async def _probe_http_audio_mime(url: str, timeout: float = 5.0) -> str:
+    """HEAD-probe an HTTP(S) URL and return its audio Content-Type.
+
+    Returns ``""`` when the URL isn't HTTP(S), the probe fails, the
+    server rejects HEAD, or the Content-Type isn't ``audio/*`` /
+    ``video/*``. In any of those cases the caller should fall back to
+    soco's default (radio-style) DIDL — probing is a best-effort
+    improvement, not a hard requirement. Timeout is short so a dead
+    URL doesn't stall the whole play request.
+    """
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return ""
+    if parsed.scheme not in ("http", "https"):
+        return ""
+    try:
+        async with httpx.AsyncClient(
+            timeout=timeout, follow_redirects=True
+        ) as client:
+            resp = await client.head(url)
+    except Exception:
+        return ""
+    if resp.status_code >= 400:
+        return ""
+    ctype = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
+    if ctype.startswith(("audio/", "video/")):
+        return ctype
+    return ""
+
+
+def _build_music_track_didl(uri: str, title: str, mime: str) -> str:
+    """Build a DIDL-Lite envelope that tags ``uri`` as a finite music track.
+
+    soco's default auto-generated DIDL (when we hand it a title but no
+    ``meta``) marks the resource as ``object.item.audioItem.audioBroadcast``
+    — a live radio stream. Sonos then probes the URL and rejects plain
+    HTTP file responses with UPnP error 714 "Illegal MIME-Type" because
+    the content doesn't look like a radio stream to its whitelist.
+
+    Emitting the ``musicTrack`` class with an explicit ``protocolInfo``
+    carrying the real MIME tells Sonos "this is a regular audio file",
+    skipping the radio-stream MIME check. Works for one-off playback of
+    arbitrary HTTP-hosted audio, which is exactly the
+    ``share_workspace_file``-style flow.
+    """
+    safe_title = html.escape(title or "Gilbert audio")
+    safe_uri = html.escape(uri, quote=True)
+    safe_mime = html.escape(mime, quote=True)
+    return (
+        '<DIDL-Lite '
+        'xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" '
+        'xmlns:dc="http://purl.org/dc/elements/1.1/" '
+        'xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">'
+        '<item id="gilbert-share" parentID="-1" restricted="true">'
+        f"<dc:title>{safe_title}</dc:title>"
+        "<upnp:class>object.item.audioItem.musicTrack</upnp:class>"
+        f'<res protocolInfo="http-get:*:{safe_mime}:*">{safe_uri}</res>'
+        "</item></DIDL-Lite>"
+    )
+
+
 class SonosSpeaker(SpeakerBackend):
     """Sonos speaker backend using the SoCo library."""
 
@@ -367,7 +432,27 @@ class SonosSpeaker(SpeakerBackend):
                         title=title,
                     )
                 else:
-                    await asyncio.to_thread(coordinator.play_uri, uri, title=title)
+                    # soco.play_uri(uri, title=X) with no meta generates a
+                    # radio-stream DIDL (class ``audioItem.audioBroadcast``)
+                    # — Sonos then rejects plain HTTP file URLs with UPnP
+                    # error 714 because the content MIME doesn't match its
+                    # radio-stream whitelist. Probe the URL ourselves;
+                    # when it's a regular audio file, emit a music-track
+                    # DIDL with an explicit ``protocolInfo`` so Sonos
+                    # treats it as a finite file, not a live stream.
+                    probed_mime = await _probe_http_audio_mime(uri)
+                    if probed_mime:
+                        didl = _build_music_track_didl(uri, title, probed_mime)
+                        await asyncio.to_thread(
+                            coordinator.play_uri,
+                            uri,
+                            meta=didl,
+                            title=title,
+                        )
+                    else:
+                        await asyncio.to_thread(
+                            coordinator.play_uri, uri, title=title
+                        )
             except Exception:
                 logger.exception(
                     "Sonos play_uri failed: uri=%s speaker=%s",
@@ -663,17 +748,68 @@ class SonosSpeaker(SpeakerBackend):
 
         to_unjoin, to_join = await asyncio.to_thread(compute_changes)
 
-        # Unjoin speakers that are in wrong groups
+        # Unjoin speakers that are in wrong groups. One speaker refusing
+        # to leave its current group (rare, but happens when the speaker
+        # is mid-stream from a line-in source or in a weird transport
+        # state) shouldn't abort the entire operation — log which ones
+        # failed and press on with the rest.
         if to_unjoin:
-            await asyncio.gather(*(asyncio.to_thread(d.unjoin) for d in to_unjoin))
+            unjoin_results = await asyncio.gather(
+                *(asyncio.to_thread(d.unjoin) for d in to_unjoin),
+                return_exceptions=True,
+            )
+            unjoin_failed = [
+                (d, r) for d, r in zip(to_unjoin, unjoin_results, strict=True)
+                if isinstance(r, Exception)
+            ]
+            for device, exc in unjoin_failed:
+                logger.warning(
+                    "Sonos speaker '%s' refused to unjoin its current group "
+                    "(%s) — continuing without it",
+                    getattr(device, "player_name", "?"),
+                    exc,
+                )
             await asyncio.sleep(_GROUP_SETTLE_SECONDS)
-            logger.debug("Unjoined %d speakers from other groups", len(to_unjoin))
+            logger.debug(
+                "Unjoined %d/%d speakers from other groups",
+                len(to_unjoin) - len(unjoin_failed),
+                len(to_unjoin),
+            )
 
-        # Join speakers to the coordinator
+        # Join speakers to the coordinator. Same tolerance rule — a
+        # single speaker throwing UPnP 800 ("Transition not available",
+        # usually because it's in a non-idle state) shouldn't kill
+        # playback on all the other speakers. Fail only if *every*
+        # intended join failed and nothing else got un-grouped into
+        # the target zone either; in that case there's no group to
+        # play on and the caller deserves the original error.
         if to_join:
-            await asyncio.gather(*(asyncio.to_thread(d.join, coordinator) for d in to_join))
+            join_results = await asyncio.gather(
+                *(asyncio.to_thread(d.join, coordinator) for d in to_join),
+                return_exceptions=True,
+            )
+            paired = list(zip(to_join, join_results, strict=True))
+            join_failed = [(d, r) for d, r in paired if isinstance(r, Exception)]
+            join_ok = [d for d, r in paired if not isinstance(r, Exception)]
+            for device, exc in join_failed:
+                logger.warning(
+                    "Sonos speaker '%s' refused to join %s's group (%s) — "
+                    "continuing without it",
+                    getattr(device, "player_name", "?"),
+                    coordinator.player_name,
+                    exc,
+                )
+            if join_failed and not join_ok:
+                # Every intended join failed; propagate the first error
+                # so the AI tool surfaces a real diagnostic rather than
+                # silently "succeeding" with an empty group.
+                raise join_failed[0][1]
             await asyncio.sleep(_GROUP_SETTLE_SECONDS)
-            logger.debug("Joined %d speakers to coordinator", len(to_join))
+            logger.debug(
+                "Joined %d/%d speakers to coordinator",
+                len(join_ok),
+                len(to_join),
+            )
 
     async def _poll_until_grouped(
         self,
