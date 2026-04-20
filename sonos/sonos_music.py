@@ -418,18 +418,15 @@ class SonosMusic(MusicBackend, LinkedMusicServiceLister):
                 description=(
                     "OAuth redirect URI. Must match one of the redirect "
                     "URIs registered on your Spotify app exactly. "
-                    "Spotify's current policy: must be either a real "
-                    "``https://`` URL OR the numeric loopback IP "
-                    "``http://127.0.0.1:PORT/…``. ``localhost`` by name "
-                    "is rejected as 'Insecure' because DNS can redirect "
-                    "it. Default is the numeric loopback on Gilbert's "
-                    "web port; the endpoint doesn't need to actually "
-                    "respond — after authorizing, the browser will hit "
-                    "an error page with the ``?code=…`` in the URL. "
-                    "Copy that URL (or just the code) into Spotify Auth "
-                    "Code below."
+                    "Spotify requires ``https://`` for the scheme (plain "
+                    "``http://localhost:…`` is rejected as 'Insecure'). "
+                    "The default points at Gilbert's web port over HTTPS; "
+                    "the endpoint doesn't need to actually serve HTTPS "
+                    "— after authorizing, the browser will hit an error "
+                    "page with the ``?code=…`` in the URL. Copy that "
+                    "URL (or just the code) into Spotify Auth Code below."
                 ),
-                default="http://127.0.0.1:8000/callback",
+                default="https://localhost:8000/callback",
             ),
             ConfigParam(
                 key="refresh_token",
@@ -525,7 +522,7 @@ class SonosMusic(MusicBackend, LinkedMusicServiceLister):
     def __init__(self) -> None:
         self._client_id: str = ""
         self._client_secret: str = ""
-        self._redirect_uri: str = "http://127.0.0.1:8000/callback"
+        self._redirect_uri: str = "https://localhost:8000/callback"
         self._refresh_token: str = ""
         self._spotify: _SpotifyClient | None = None
         # Pending-link state — held in memory between link_spotify and
@@ -539,7 +536,7 @@ class SonosMusic(MusicBackend, LinkedMusicServiceLister):
         self._client_id = str(config.get("client_id") or "")
         self._client_secret = str(config.get("client_secret") or "")
         self._redirect_uri = str(
-            config.get("redirect_uri") or "http://127.0.0.1:8000/callback"
+            config.get("redirect_uri") or "https://localhost:8000/callback"
         )
         self._refresh_token = str(config.get("refresh_token") or "")
 

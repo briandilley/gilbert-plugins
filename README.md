@@ -416,7 +416,7 @@ Sonos speaker control (S2 only) + Spotify-backed music search. Two backends regi
 *Music backend* — requires a registered Spotify developer app (one-time; free at https://developer.spotify.com/dashboard):
 - `client_id` — Spotify app client ID.
 - `client_secret` *(sensitive)* — Spotify app client secret.
-- `redirect_uri` — Must match one of the redirect URIs registered on your Spotify app exactly. Default `http://127.0.0.1:8000/callback` — Spotify's policy is HTTPS-only for named hosts OR numeric loopback IPs on plain HTTP. `http://localhost:…` is rejected as "Insecure" (DNS hijack risk) and `https://localhost:…` as "Not matching configuration". `127.0.0.1` works because it's a numeric loopback. The endpoint doesn't need to actually respond; we read the `?code=` back out of whatever URL the browser lands on.
+- `redirect_uri` — Must match one of the redirect URIs registered on your Spotify app exactly. Default `https://localhost:8000/callback`. Spotify requires HTTPS for named hosts (plain `http://localhost:…` is rejected as "Insecure"). The endpoint doesn't need to actually serve HTTPS — Spotify validates the scheme at authorize time, and Gilbert's manual-paste flow reads the `?code=` out of whatever URL the browser lands on after approval. If your registered URI differs (e.g. custom port, different path), change this field to match.
 - `refresh_token` *(sensitive)* — Auto-populated by the Link Spotify flow. Don't edit.
 - `spotify_auth_code` — Transient field used by the link flow; auto-cleared once tokens are issued.
 - Legacy fields (`preferred_service`, `auth_token`, `auth_key`) retained so existing configs don't fail validation but ignored by the new pipeline.
