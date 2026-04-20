@@ -4,7 +4,14 @@ version = "1.0.0"
 description = "Sonos speaker and music backends for Gilbert"
 requires-python = ">=3.12"
 dependencies = [
-    "soco>=0.30.15",
+    # aiosonos drives the Sonos S2 local WebSocket API (declarative
+    # groups, native audio_clip for announcements, event-driven state).
+    # Replaced soco in the aiosonos migration — S1 speakers are no
+    # longer supported; run scripts/check_sonos_s2.py to verify.
+    "aiosonos>=0.1.12",
+    # zeroconf drives Sonos LAN discovery (``_sonos._tcp.local.``).
+    # aiosonos has no discovery helper — we feed it IPs discovered here.
+    "zeroconf>=0.130",
 ]
 
 [tool.uv]

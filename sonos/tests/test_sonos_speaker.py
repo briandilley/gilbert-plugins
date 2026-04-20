@@ -1,449 +1,475 @@
-"""Tests for the Sonos speaker backend — focused on the tricky bits."""
+"""Tests for the aiosonos-backed Sonos speaker backend.
 
-from types import SimpleNamespace
-from typing import Any
-from unittest.mock import MagicMock
+The backend is a fairly thin adapter over aiosonos's WebSocket API —
+most of its job is wiring up zeroconf discovery, keeping a client per
+discovered player, and mapping between our SpeakerBackend interface and
+aiosonos's SonosPlayer / SonosGroup / audio_clip surfaces.
+
+Tests mock the aiosonos client/player/group objects. We don't spin up
+a real WebSocket; the behaviours we care about are:
+
+- Spotify URI / open.spotify.com URL detection.
+- ``announce=True`` routes to ``player.play_audio_clip``.
+- Plain HTTP URIs route to ``group.play_stream_url``.
+- Spotify URIs raise NotImplementedError (deferred to the music backend
+  so ``accountId`` resolution lives in one place).
+- ``_ensure_group`` uses declarative grouping and is a no-op when
+  membership already matches.
+- Snapshot/restore are no-ops (aiosonos ``audio_clip`` self-restores).
+"""
+
+from __future__ import annotations
+
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+
 from gilbert_plugin_sonos.sonos_speaker import (
     SonosSpeaker,
-    _build_music_track_didl,
-    _parse_hms,
-    _play_container,
-    _speaker_info,
+    _extract_spotify_ref,
+    _PlayerMetadata,
 )
 
-from gilbert.interfaces.speaker import PlaybackState, PlayRequest
+from gilbert.interfaces.speaker import PlayRequest
 
 
-def _make_device(
-    *,
-    uid: str = "RINCON_AAA",
-    player_name: str = "Kitchen",
-    ip_address: str = "192.168.1.10",
-    group: Any = None,
-    transport_state: str = "STOPPED",
-    model: str = "Sonos One",
-    volume: int = 30,
-) -> Any:
-    """Build a SoCo-shaped mock device with the attributes _speaker_info reads."""
-    device = SimpleNamespace()
-    device.uid = uid
-    device.player_name = player_name
-    device.ip_address = ip_address
-    device.group = group
-    device.volume = volume
-    device.get_current_transport_info = lambda: {
-        "current_transport_state": transport_state,
-    }
-    device.get_speaker_info = lambda: {"model_name": model}
-    return device
+# ── Spotify URI parsing ──────────────────────────────────────────────
 
 
-def _make_group(
-    uid: str = "RINCON_GRP",
-    label: str = "Living Zone",
-    coordinator: Any = None,
-) -> Any:
-    group = SimpleNamespace()
-    group.uid = uid
-    group.label = label
-    group.coordinator = coordinator
-    return group
+def test_extract_spotify_track_uri() -> None:
+    ref = _extract_spotify_ref("spotify:track:3w0pyHgJJW9JN0cJxmi33Z")
+    assert ref is not None
+    assert ref.kind == "track"
+    assert ref.id == "3w0pyHgJJW9JN0cJxmi33Z"
+    assert ref.uri == "spotify:track:3w0pyHgJJW9JN0cJxmi33Z"
 
 
-def test_speaker_info_with_normal_group() -> None:
-    """Standard case: device is in a group with a valid coordinator."""
-    coordinator = _make_device(uid="RINCON_CCC", player_name="Living Room")
-    group = _make_group(coordinator=coordinator)
+def test_extract_spotify_open_url() -> None:
+    """``https://open.spotify.com/playlist/…`` web URLs get canonicalized
+    to ``spotify:playlist:…`` so downstream handling doesn't need two
+    code paths."""
+    ref = _extract_spotify_ref(
+        "https://open.spotify.com/playlist/37i9dQZF1DX?si=abc"
+    )
+    assert ref is not None
+    assert ref.kind == "playlist"
+    assert ref.uri == "spotify:playlist:37i9dQZF1DX"
 
-    device = _make_device(uid="RINCON_AAA", player_name="Kitchen", group=group)
-    info = _speaker_info(device)
 
-    assert info.speaker_id == "RINCON_AAA"
-    assert info.name == "Kitchen"
-    assert info.is_group_coordinator is False
-    assert info.group_id == "RINCON_GRP"
+def test_extract_spotify_returns_none_for_plain_http() -> None:
+    assert (
+        _extract_spotify_ref("http://192.168.1.20:8000/api/share/abc") is None
+    )
+
+
+def test_extract_spotify_returns_none_for_empty() -> None:
+    assert _extract_spotify_ref("") is None
+    assert _extract_spotify_ref("   ") is None
+
+
+# ── Test scaffolding ─────────────────────────────────────────────────
+
+
+def _make_backend_with_mock_speaker(
+    player_id: str = "RINCON_COORD",
+    group_in: MagicMock | None = None,
+) -> tuple[SonosSpeaker, MagicMock, MagicMock, MagicMock]:
+    """Spin up a SonosSpeaker with one mock aiosonos client.
+
+    Returns ``(backend, client_mock, player_mock, group_mock)``.
+    """
+    backend = SonosSpeaker()
+
+    group = group_in if group_in is not None else MagicMock()
+    if not hasattr(group, "id") or not group.id:
+        group.id = "group-1"
+    if not hasattr(group, "name") or not group.name:
+        group.name = "Kitchen"
+    if not hasattr(group, "player_ids"):
+        group.player_ids = [player_id]
+    if not hasattr(group, "coordinator_id"):
+        group.coordinator_id = player_id
+    if not hasattr(group, "playback_state"):
+        group.playback_state = "PLAYBACK_STATE_IDLE"
+    if not hasattr(group, "playback_metadata"):
+        group.playback_metadata = None
+    if not hasattr(group, "play_stream_url") or not isinstance(
+        group.play_stream_url, AsyncMock
+    ):
+        group.play_stream_url = AsyncMock()
+    if not hasattr(group, "pause") or not isinstance(group.pause, AsyncMock):
+        group.pause = AsyncMock()
+    if not hasattr(group, "set_group_members") or not isinstance(
+        group.set_group_members, AsyncMock
+    ):
+        group.set_group_members = AsyncMock()
+
+    player = MagicMock()
+    player.id = player_id
+    player.name = "Kitchen"
+    player.volume_level = 30
+    player.is_coordinator = True
+    player.group = group
+    player.play_audio_clip = AsyncMock()
+    player.set_volume = AsyncMock()
+    player.leave_group = AsyncMock()
+
+    client = MagicMock()
+    client.player = player
+    client.groups = [group]
+    client.create_group = AsyncMock()
+    client.disconnect = AsyncMock()
+
+    backend._clients[player_id] = client
+    backend._player_metadata[player_id] = _PlayerMetadata(
+        player_id=player_id,
+        household_id="HH-TEST",
+        name="Kitchen",
+        ip_address="192.168.1.20",
+        model="Sonos One",
+    )
+    return backend, client, player, group
+
+
+# ── Announce routes to audio_clip ────────────────────────────────────
+
+
+async def test_announce_uses_audio_clip() -> None:
+    """``PlayRequest(announce=True)`` should hand the URL straight to
+    ``player.play_audio_clip`` — not go through the group-forming /
+    stream-loading path, and not require any snapshot/restore."""
+    backend, _client, player, group = _make_backend_with_mock_speaker()
+
+    await backend.play_uri(
+        PlayRequest(
+            uri="http://gilbert/api/share/abc.mp3",
+            speaker_ids=["RINCON_COORD"],
+            announce=True,
+            title="Ding",
+            volume=40,
+        )
+    )
+
+    player.play_audio_clip.assert_awaited_once()
+    assert (
+        player.play_audio_clip.call_args.args[0]
+        == "http://gilbert/api/share/abc.mp3"
+    )
+    assert player.play_audio_clip.call_args.kwargs.get("volume") == 40
+    assert player.play_audio_clip.call_args.kwargs.get("name") == "Ding"
+
+    group.play_stream_url.assert_not_awaited()
+    group.set_group_members.assert_not_awaited()
+
+
+async def test_announce_with_multiple_speakers_parallelizes() -> None:
+    backend, _, player_a, _ = _make_backend_with_mock_speaker(
+        player_id="RINCON_A"
+    )
+    backend._player_metadata["RINCON_B"] = _PlayerMetadata(
+        player_id="RINCON_B",
+        household_id="HH-TEST",
+        name="Lounge",
+        ip_address="192.168.1.21",
+        model="Sonos One",
+    )
+    client_b = MagicMock()
+    player_b = MagicMock()
+    player_b.play_audio_clip = AsyncMock()
+    client_b.player = player_b
+    backend._clients["RINCON_B"] = client_b
+
+    await backend.play_uri(
+        PlayRequest(
+            uri="http://gilbert/x.mp3",
+            speaker_ids=["RINCON_A", "RINCON_B"],
+            announce=True,
+        )
+    )
+
+    player_a.play_audio_clip.assert_awaited_once()
+    player_b.play_audio_clip.assert_awaited_once()
+
+
+# ── Plain HTTP URIs route to play_stream_url ─────────────────────────
+
+
+async def test_http_uri_uses_play_stream_url() -> None:
+    backend, _client, _player, group = _make_backend_with_mock_speaker()
+
+    await backend.play_uri(
+        PlayRequest(
+            uri="http://gilbert/api/share/song.mp3",
+            speaker_ids=["RINCON_COORD"],
+        )
+    )
+
+    group.play_stream_url.assert_awaited_once()
+    args, kwargs = group.play_stream_url.call_args
+    assert args[0] == "http://gilbert/api/share/song.mp3"
+    assert kwargs.get("play_on_completion") is False
+
+
+async def test_http_uri_applies_volume_before_play() -> None:
+    backend, _client, player, group = _make_backend_with_mock_speaker()
+
+    await backend.play_uri(
+        PlayRequest(
+            uri="http://gilbert/song.mp3",
+            speaker_ids=["RINCON_COORD"],
+            volume=55,
+        )
+    )
+
+    player.set_volume.assert_awaited_once_with(55)
+    group.play_stream_url.assert_awaited_once()
+
+
+async def test_http_uri_clamps_volume_to_valid_range() -> None:
+    backend, _client, player, _group = _make_backend_with_mock_speaker()
+
+    await backend.play_uri(
+        PlayRequest(
+            uri="http://gilbert/song.mp3",
+            speaker_ids=["RINCON_COORD"],
+            volume=150,
+        )
+    )
+
+    player.set_volume.assert_awaited_once_with(100)
+
+
+# ── Spotify URIs use load_content ────────────────────────────────────
+
+
+async def test_spotify_uri_uses_load_content() -> None:
+    """Spotify URIs go through ``playback.load_content`` with a
+    MetadataId pointing at the speaker's linked Spotify account.
+    ``accountId`` is intentionally omitted — Sonos resolves the
+    default linked Spotify account on the household, which is the
+    correct behaviour for single-account setups."""
+    backend, client, _player, group = _make_backend_with_mock_speaker()
+    client.api = MagicMock()
+    client.api.playback = MagicMock()
+    client.api.playback.load_content = AsyncMock()
+
+    await backend.play_uri(
+        PlayRequest(
+            uri="spotify:track:3w0pyHgJJW9JN0cJxmi33Z",
+            speaker_ids=["RINCON_COORD"],
+        )
+    )
+
+    client.api.playback.load_content.assert_awaited_once()
+    args = client.api.playback.load_content.call_args.args
+    # load_content signature: (group_id, content).
+    group_id, content = args
+    assert group_id == group.id
+    # Payload shape per Sonos docs — lowercase type, Spotify service ID,
+    # canonical Spotify URI as objectId.
+    assert content["type"] == "track"
+    assert content["id"]["serviceId"] == "9"
+    assert content["id"]["objectId"] == "spotify:track:3w0pyHgJJW9JN0cJxmi33Z"
+    assert content["playbackAction"] == "PLAY"
+    # No stream_url call for Spotify content.
+    group.play_stream_url.assert_not_awaited()
+
+
+async def test_spotify_playlist_uses_playlist_type() -> None:
+    """``type`` maps to the Spotify content kind — passing a playlist
+    URI must produce ``"playlist"`` not ``"track"``. Wrong type =
+    Sonos plays nothing."""
+    backend, client, _player, _group = _make_backend_with_mock_speaker()
+    client.api = MagicMock()
+    client.api.playback = MagicMock()
+    client.api.playback.load_content = AsyncMock()
+
+    await backend.play_uri(
+        PlayRequest(
+            uri="spotify:playlist:37i9dQZF1DX",
+            speaker_ids=["RINCON_COORD"],
+        )
+    )
+
+    content = client.api.playback.load_content.call_args.args[1]
+    assert content["type"] == "playlist"
+    assert content["id"]["objectId"] == "spotify:playlist:37i9dQZF1DX"
+
+
+# ── Declarative grouping ─────────────────────────────────────────────
+
+
+async def test_ensure_group_noop_when_membership_matches() -> None:
+    """If the coordinator's group already contains exactly the target
+    members, ``set_group_members`` shouldn't be called — avoiding an
+    unnecessary WebSocket round-trip that would briefly drop playback."""
+    group = MagicMock()
+    group.id = "group-1"
+    group.name = "Zone"
+    group.player_ids = ["RINCON_A", "RINCON_B"]
+    group.coordinator_id = "RINCON_A"
+    group.playback_state = "PLAYBACK_STATE_IDLE"
+    group.set_group_members = AsyncMock()
+    group.play_stream_url = AsyncMock()
+
+    backend, _client, _player, _g = _make_backend_with_mock_speaker(
+        player_id="RINCON_A",
+        group_in=group,
+    )
+    backend._player_metadata["RINCON_B"] = _PlayerMetadata(
+        player_id="RINCON_B",
+        household_id="HH-TEST",
+        name="Lounge",
+        ip_address="192.168.1.21",
+        model="Sonos One",
+    )
+    b_player = MagicMock()
+    b_player.group = group
+    b_client = MagicMock()
+    b_client.player = b_player
+    backend._clients["RINCON_B"] = b_client
+
+    await backend.play_uri(
+        PlayRequest(
+            uri="http://gilbert/song.mp3",
+            speaker_ids=["RINCON_A", "RINCON_B"],
+        )
+    )
+
+    group.set_group_members.assert_not_awaited()
+    group.play_stream_url.assert_awaited_once()
+
+
+async def test_ensure_group_reforms_when_membership_differs() -> None:
+    """If the target set doesn't match the coordinator's current group,
+    ``set_group_members`` gets called once with the desired list."""
+    group = MagicMock()
+    group.id = "group-1"
+    group.player_ids = ["RINCON_A"]
+    group.coordinator_id = "RINCON_A"
+    group.playback_state = "PLAYBACK_STATE_IDLE"
+    group.set_group_members = AsyncMock()
+    group.play_stream_url = AsyncMock()
+
+    backend, _c, _p, _g = _make_backend_with_mock_speaker(
+        player_id="RINCON_A",
+        group_in=group,
+    )
+    backend._player_metadata["RINCON_B"] = _PlayerMetadata(
+        player_id="RINCON_B",
+        household_id="HH-TEST",
+        name="Lounge",
+        ip_address="192.168.1.21",
+        model="Sonos One",
+    )
+    b_client = MagicMock()
+    b_client.player = MagicMock(group=group)
+    backend._clients["RINCON_B"] = b_client
+
+    await backend.play_uri(
+        PlayRequest(
+            uri="http://gilbert/song.mp3",
+            speaker_ids=["RINCON_A", "RINCON_B"],
+        )
+    )
+
+    group.set_group_members.assert_awaited_once_with(["RINCON_A", "RINCON_B"])
+
+
+# ── Snapshot/restore are no-ops ──────────────────────────────────────
+
+
+async def test_snapshot_and_restore_are_noops() -> None:
+    """Snapshot/restore are kept on the interface for backward compat
+    but aiosonos's ``audio_clip`` self-restores — the new backend
+    doesn't need them. Just verify they don't raise and don't poke the
+    client's mutating methods."""
+    backend, _client, player, group = _make_backend_with_mock_speaker()
+    await backend.snapshot(["RINCON_COORD"])
+    await backend.restore(["RINCON_COORD"])
+    player.set_volume.assert_not_called()
+    group.play_stream_url.assert_not_called()
+
+
+# ── Volume ───────────────────────────────────────────────────────────
+
+
+async def test_set_volume() -> None:
+    backend, _client, player, _group = _make_backend_with_mock_speaker()
+    await backend.set_volume("RINCON_COORD", 42)
+    player.set_volume.assert_awaited_once_with(42)
+
+
+async def test_set_volume_unknown_speaker_raises() -> None:
+    backend, *_ = _make_backend_with_mock_speaker()
+    with pytest.raises(KeyError, match="Unknown speaker"):
+        await backend.set_volume("RINCON_NOPE", 42)
+
+
+async def test_get_volume() -> None:
+    backend, _client, player, _group = _make_backend_with_mock_speaker()
+    player.volume_level = 73
+    assert await backend.get_volume("RINCON_COORD") == 73
+
+
+# ── Stop ─────────────────────────────────────────────────────────────
+
+
+async def test_stop_dedupes_across_group_members() -> None:
+    """When multiple speakers share a group, ``stop`` pauses the group
+    once — pausing the same group N times is wasteful and can race."""
+    group = MagicMock()
+    group.id = "group-1"
+    group.pause = AsyncMock()
+
+    backend, _c, _p, _g = _make_backend_with_mock_speaker(
+        player_id="RINCON_A", group_in=group
+    )
+    backend._player_metadata["RINCON_B"] = _PlayerMetadata(
+        player_id="RINCON_B",
+        household_id="HH-TEST",
+        name="Lounge",
+        ip_address="192.168.1.21",
+        model="Sonos One",
+    )
+    b_client = MagicMock()
+    b_client.player = MagicMock(group=group)
+    backend._clients["RINCON_B"] = b_client
+
+    await backend.stop(["RINCON_A", "RINCON_B"])
+
+    group.pause.assert_awaited_once()
+
+
+# ── Feature flags ────────────────────────────────────────────────────
+
+
+def test_supports_grouping_is_true() -> None:
+    assert SonosSpeaker().supports_grouping is True
+
+
+def test_backend_name() -> None:
+    assert SonosSpeaker.backend_name == "sonos"
+
+
+# ── list_speakers materialization ────────────────────────────────────
+
+
+async def test_list_speakers_reflects_live_state() -> None:
+    """list_speakers should pull the current volume + group from the
+    client, not a cached snapshot taken at discovery time — otherwise
+    a volume change via the Sonos app wouldn't show up until
+    reconnection."""
+    backend, _c, player, group = _make_backend_with_mock_speaker()
+    player.volume_level = 85
+    group.name = "Living Zone"
+    group.id = "live-group-id"
+    group.playback_state = "PLAYBACK_STATE_PLAYING"
+
+    infos = await backend.list_speakers()
+    assert len(infos) == 1
+    info = infos[0]
+    assert info.volume == 85
     assert info.group_name == "Living Zone"
-    assert info.state == PlaybackState.STOPPED
-
-
-def test_speaker_info_coordinator_is_self() -> None:
-    """Coordinator is the device itself — is_group_coordinator is True."""
-    device = _make_device(uid="RINCON_XYZ", player_name="Office")
-    group = _make_group(coordinator=device)
-    device.group = group
-
-    info = _speaker_info(device)
-    assert info.is_group_coordinator is True
-
-
-def test_speaker_info_with_no_group() -> None:
-    """Standalone speaker (no group) — falls back to self as coordinator."""
-    device = _make_device(uid="RINCON_AAA", player_name="Kitchen", group=None)
-    info = _speaker_info(device)
-
-    assert info.group_id == ""
-    assert info.group_name == ""
-    assert info.is_group_coordinator is True
-
-
-def test_parse_hms_standard_format() -> None:
-    """SoCo returns positions/durations as ``H:MM:SS``."""
-    assert _parse_hms("0:00:00") == 0.0
-    assert _parse_hms("0:01:23") == 83.0
-    assert _parse_hms("1:02:03") == 3723.0
-
-
-def test_parse_hms_empty_and_sentinels() -> None:
-    """Empty strings and SoCo's NOT_IMPLEMENTED sentinel return 0.0."""
-    assert _parse_hms("") == 0.0
-    assert _parse_hms("NOT_IMPLEMENTED") == 0.0
-
-
-def test_parse_hms_malformed_returns_zero() -> None:
-    """Malformed strings degrade gracefully to 0.0 rather than raising."""
-    assert _parse_hms("garbage") == 0.0
-    assert _parse_hms("a:b:c") == 0.0
-
-
-def test_speaker_info_with_none_coordinator_does_not_crash() -> None:
-    """Regression: during Sonos topology changes (e.g. just after an
-    unjoin), ``group.coordinator`` can be transiently None. Before the
-    fix this raised AttributeError on ``None.uid`` — now it gracefully
-    falls back to the device itself as its own coordinator."""
-    device = _make_device(uid="RINCON_AAA", player_name="Bedroom")
-    group = _make_group(coordinator=None)  # transient None
-    device.group = group
-
-    # Previously: AttributeError: 'NoneType' object has no attribute 'uid'
-    info = _speaker_info(device)
-
-    # Fallback: treat the device as its own coordinator
-    assert info.is_group_coordinator is True
-    # Group metadata from the group object is still surfaced
-    assert info.group_id == "RINCON_GRP"
-    assert info.group_name == "Living Zone"
-
-
-# ── Container playback (Spotify playlist/album/artist) ──────────────
-
-# Before this fix, the speaker backend sent every Spotify item — track
-# OR playlist — down the same ``coordinator.play_uri`` path. That works
-# for tracks but silently no-ops for containers: Sonos accepts the SOAP
-# call and logs "Playing spotify:playlist:… on Lobby" with no exception,
-# but no audio plays because a container URI without queue context gives
-# the player no track to start on. The fix dispatches
-# ``x-rincon-cpcontainer:`` URIs through the queue path (clear_queue →
-# AddURIToQueue → play_from_queue). These tests lock in that dispatch.
-
-
-def _make_avtransport_mock() -> MagicMock:
-    """A SoCo AVTransport service mock whose AddURIToQueue returns the
-    same dict shape soco itself sees from real hardware."""
-    av = MagicMock()
-    av.AddURIToQueue.return_value = {
-        "FirstTrackNumberEnqueued": "1",
-        "NumTracksAdded": "50",
-        "NewQueueLength": "50",
-    }
-    return av
-
-
-def _make_coordinator(uid: str = "RINCON_CCC") -> MagicMock:
-    coordinator = MagicMock()
-    coordinator.uid = uid
-    coordinator.player_name = "Living Room"
-    coordinator.avTransport = _make_avtransport_mock()
-    return coordinator
-
-
-def test_play_container_clears_queue_and_plays_from_first_enqueued() -> None:
-    """The happy path: clear, enqueue, play_from_queue with the right index."""
-    coordinator = _make_coordinator()
-    didl = (
-        '<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/">'
-        "<item><upnp:class>object.container.playlistContainer</upnp:class></item>"
-        "</DIDL-Lite>"
-    )
-    uri = "x-rincon-cpcontainer:0fffffffspotify%3Aplaylist%3AabcDEF"
-
-    _play_container(coordinator, uri, didl)
-
-    # Queue cleared first — otherwise the playlist appends after whatever's
-    # already there and the radio DJ starts on the wrong track.
-    coordinator.clear_queue.assert_called_once_with()
-
-    # AddURIToQueue got the URI *and* the DIDL blob. The DIDL is what
-    # tells Sonos "this is a container, expand into tracks" — without it
-    # the playlist silently no-ops even with the cpcontainer URI.
-    coordinator.avTransport.AddURIToQueue.assert_called_once()
-    args = coordinator.avTransport.AddURIToQueue.call_args[0][0]
-    arg_dict = dict(args)
-    assert arg_dict["EnqueuedURI"] == uri
-    assert arg_dict["EnqueuedURIMetaData"] == didl
-    assert arg_dict["InstanceID"] == 0
-
-    # play_from_queue is called with 0-based index; FirstTrackNumberEnqueued
-    # from SOAP is 1-based, so "1" → 0.
-    coordinator.play_from_queue.assert_called_once_with(0)
-
-
-def test_play_container_converts_1_based_queue_index() -> None:
-    """If the queue wasn't actually empty (e.g. clear_queue is a mock that
-    does nothing to the mock's state), FirstTrackNumberEnqueued could be
-    greater than 1. Verify the 1→0-based conversion still holds."""
-    coordinator = _make_coordinator()
-    coordinator.avTransport.AddURIToQueue.return_value = {
-        "FirstTrackNumberEnqueued": "11",  # 10 tracks already in queue
-        "NumTracksAdded": "50",
-        "NewQueueLength": "60",
-    }
-    _play_container(
-        coordinator,
-        "x-rincon-cpcontainer:foo",
-        "<DIDL-Lite></DIDL-Lite>",
-    )
-    coordinator.play_from_queue.assert_called_once_with(10)
-
-
-def test_play_container_rejects_empty_didl() -> None:
-    """A cpcontainer URI without DIDL is always a bug upstream —
-    Sonos won't expand the container without the metadata envelope.
-    Fail loudly rather than silently enqueueing an unplayable item."""
-    coordinator = _make_coordinator()
-    with pytest.raises(ValueError, match="requires DIDL metadata"):
-        _play_container(coordinator, "x-rincon-cpcontainer:foo", "")
-    # Shouldn't have touched the queue at all
-    coordinator.clear_queue.assert_not_called()
-    coordinator.avTransport.AddURIToQueue.assert_not_called()
-
-
-async def test_play_uri_routes_cpcontainer_through_queue_path() -> None:
-    """End-to-end: a ``PlayRequest`` with an ``x-rincon-cpcontainer:`` URI
-    from ``resolve_playable`` must reach ``_play_container``, not
-    ``coordinator.play_uri``. This is the bug the whole series fixes."""
-    backend = SonosSpeaker()
-    coordinator = _make_coordinator(uid="RINCON_CCC")
-
-    # Minimal device — its only job is to resolve back to the coordinator
-    # via the group property.
-    device = MagicMock()
-    device.uid = "RINCON_AAA"
-    device.player_name = "Kitchen"
-    device.group = SimpleNamespace(coordinator=coordinator)
-    backend._devices = {"RINCON_AAA": device}
-
-    didl = (
-        '<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/">'
-        "<item><upnp:class>object.container.playlistContainer</upnp:class></item>"
-        "</DIDL-Lite>"
-    )
-    request = PlayRequest(
-        uri="x-rincon-cpcontainer:0fffffffspotify%3Aplaylist%3AabcDEF",
-        speaker_ids=["RINCON_AAA"],
-        didl_meta=didl,
-        title="Blues Rock Mix",
-    )
-    await backend.play_uri(request)
-
-    # Container path: queue ops called, direct play_uri NOT called.
-    coordinator.clear_queue.assert_called_once_with()
-    coordinator.avTransport.AddURIToQueue.assert_called_once()
-    coordinator.play_from_queue.assert_called_once_with(0)
-    coordinator.play_uri.assert_not_called()
-
-
-async def test_play_uri_track_still_uses_direct_play_path() -> None:
-    """Regression guard: the fix must not break the track path. A bare
-    ``spotify:track:...`` URI should still be converted to
-    ``x-sonos-spotify:`` and played via ``coordinator.play_uri``, not
-    enqueued."""
-    backend = SonosSpeaker()
-    backend._spotify_sn = 5
-    coordinator = _make_coordinator(uid="RINCON_CCC")
-    device = MagicMock()
-    device.uid = "RINCON_AAA"
-    device.player_name = "Kitchen"
-    device.group = SimpleNamespace(coordinator=coordinator)
-    backend._devices = {"RINCON_AAA": device}
-
-    request = PlayRequest(
-        uri="spotify:track:3w0pyHgJJW9JN0cJxmi33Z",
-        speaker_ids=["RINCON_AAA"],
-        title="Always and Forever",
-    )
-    await backend.play_uri(request)
-
-    # Direct play_uri path — queue ops NOT touched.
-    coordinator.clear_queue.assert_not_called()
-    coordinator.avTransport.AddURIToQueue.assert_not_called()
-    coordinator.play_from_queue.assert_not_called()
-
-    # play_uri called with the converted x-sonos-spotify URI.
-    coordinator.play_uri.assert_called_once()
-    called_uri = coordinator.play_uri.call_args[0][0]
-    assert called_uri.startswith("x-sonos-spotify:")
-    assert "spotify%3atrack%3a3w0pyHgJJW9JN0cJxmi33Z" in called_uri
-
-
-# ─── Music-track DIDL for share-URL playback ──────────────────────────
-#
-# soco's default DIDL generation (passing ``title`` with no ``meta``)
-# uses the ``object.item.audioItem.audioBroadcast`` class, i.e. a live
-# radio stream. Sonos then probes the URL and rejects plain HTTP file
-# responses (UPnP error 714 "Illegal MIME-Type") because the content
-# doesn't match its radio-stream whitelist. Covered here: the replacement
-# DIDL tags the resource as a music track with explicit ``protocolInfo``
-# so Sonos treats it as a finite file.
-
-
-def test_music_track_didl_uses_musictrack_class_not_audiobroadcast() -> None:
-    didl = _build_music_track_didl(
-        "http://192.168.1.20:8000/api/share/abc",
-        "fart_sound",
-        "audio/mpeg",
-    )
-    # The whole point of the override — if this line reappears we're
-    # back to Sonos 714.
-    assert "audioItem.audioBroadcast" not in didl
-    assert "object.item.audioItem.musicTrack" in didl
-
-
-def test_music_track_didl_carries_protocolinfo_with_real_mime() -> None:
-    """The third slot in ``protocolInfo`` is what Sonos matches against
-    its accepted-MIME whitelist. Has to carry the actual content type
-    — not ``*/*`` — for the skip-probe shortcut to work."""
-    didl = _build_music_track_didl(
-        "http://host/a.wav", "clip", "audio/wav"
-    )
-    assert 'protocolInfo="http-get:*:audio/wav:*"' in didl
-    # And the URI sits in the <res> body where Sonos expects it.
-    assert ">http://host/a.wav</res>" in didl
-
-
-def test_music_track_didl_escapes_title_and_uri() -> None:
-    """Titles and URIs in ``<dc:title>`` / ``<res>`` go into raw XML —
-    user-controllable content has to be escaped or a title like
-    ``</upnp:class>`` breaks parse-time validation on Sonos."""
-    didl = _build_music_track_didl(
-        'http://host/x?a=1&b="2"',
-        "<evil>",
-        "audio/mpeg",
-    )
-    assert "<evil>" not in didl
-    assert "&lt;evil&gt;" in didl
-    # Ampersand in the URI gets escaped too so the XML stays well-formed.
-    assert "a=1&amp;b=" in didl
-
-
-def test_music_track_didl_falls_back_on_blank_title() -> None:
-    """Blank title should still produce a valid ``<dc:title>`` node —
-    an empty element would cause some renderers to log parse warnings
-    and picking something generic keeps the debug story clearer."""
-    didl = _build_music_track_didl("http://host/x.mp3", "", "audio/mpeg")
-    assert "<dc:title>Gilbert audio</dc:title>" in didl
-
-
-# ─── Grouping resilience ──────────────────────────────────────────────
-#
-# Real-world Sonos installs have speakers that occasionally refuse a
-# ``join`` with UPnP 800 "Transition not available" — usually because
-# the speaker is mid-stream from line-in or in a weird transport state.
-# Before the fix, ``asyncio.gather`` failed fast and killed playback on
-# every speaker. After the fix, a single-speaker failure is logged and
-# the rest of the group still forms.
-
-
-async def test_group_speakers_tolerates_single_join_failure(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    from soco.exceptions import SoCoUPnPException
-
-    backend = SonosSpeaker()
-
-    # Three standalone speakers — the first is the coordinator (target
-    # of the join), the other two are supposed to join it. The middle
-    # one refuses with UPnP 800.
-    coord = _make_device(uid="RINCON_COORD", player_name="KITCHEN")
-    coord.join = MagicMock()
-    coord.group = SimpleNamespace(members=[coord], coordinator=coord)
-
-    bad = _make_device(uid="RINCON_BAD", player_name="CAFE")
-    bad.group = SimpleNamespace(members=[bad], coordinator=bad)
-    bad.unjoin = MagicMock()
-    bad.join = MagicMock(side_effect=SoCoUPnPException("800", 800, None))
-
-    good = _make_device(uid="RINCON_GOOD", player_name="GARAGE")
-    good.group = SimpleNamespace(members=[good], coordinator=good)
-    good.unjoin = MagicMock()
-    good.join = MagicMock()
-
-    backend._devices = {
-        "RINCON_COORD": coord,
-        "RINCON_BAD": bad,
-        "RINCON_GOOD": good,
-    }
-
-    caplog.set_level("WARNING", logger="gilbert_plugin_sonos.sonos_speaker")
-
-    # Should NOT raise — the good speaker still joined.
-    await backend._apply_group_changes(
-        ["RINCON_COORD", "RINCON_BAD", "RINCON_GOOD"],
-        {"RINCON_COORD", "RINCON_BAD", "RINCON_GOOD"},
-    )
-
-    bad.join.assert_called_once()
-    good.join.assert_called_once()
-    assert any(
-        "CAFE" in rec.message and "refused to join" in rec.message
-        for rec in caplog.records
-    )
-
-
-async def test_group_speakers_continues_when_every_join_fails(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """Even when every intended join fails, keep going — the coordinator
-    itself is still viable and the downstream ``play_uri`` will either
-    succeed (playing solo on the coordinator) or surface a clearer
-    error. Re-raising here would abort ``play_audio`` purely because a
-    non-coordinator speaker refused to join, which observed in practice
-    meant CAFE being unavailable blocked the entire speaker set."""
-    from soco.exceptions import SoCoUPnPException
-
-    backend = SonosSpeaker()
-
-    coord = _make_device(uid="RINCON_COORD", player_name="KITCHEN")
-    coord.join = MagicMock()
-    coord.group = SimpleNamespace(members=[coord], coordinator=coord)
-
-    bad_a = _make_device(uid="RINCON_A", player_name="CAFE")
-    bad_a.group = SimpleNamespace(members=[bad_a], coordinator=bad_a)
-    bad_a.unjoin = MagicMock()
-    bad_a.join = MagicMock(side_effect=SoCoUPnPException("800", 800, None))
-
-    bad_b = _make_device(uid="RINCON_B", player_name="OFFICE")
-    bad_b.group = SimpleNamespace(members=[bad_b], coordinator=bad_b)
-    bad_b.unjoin = MagicMock()
-    bad_b.join = MagicMock(side_effect=SoCoUPnPException("800", 800, None))
-
-    backend._devices = {
-        "RINCON_COORD": coord,
-        "RINCON_A": bad_a,
-        "RINCON_B": bad_b,
-    }
-
-    caplog.set_level("WARNING", logger="gilbert_plugin_sonos.sonos_speaker")
-
-    # Must NOT raise even though both joins failed.
-    await backend._apply_group_changes(
-        ["RINCON_COORD", "RINCON_A", "RINCON_B"],
-        {"RINCON_COORD", "RINCON_A", "RINCON_B"},
-    )
-
-    # Both attempts were logged with the speaker names so the failure
-    # path is diagnosable from the logs.
-    warning_messages = [rec.message for rec in caplog.records]
-    assert any("CAFE" in m for m in warning_messages)
-    assert any("OFFICE" in m for m in warning_messages)
+    assert info.group_id == "live-group-id"
+    assert info.state.value == "playing"

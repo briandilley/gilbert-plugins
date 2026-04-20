@@ -1,14 +1,49 @@
-"""Sonos speaker backend — speaker control via the SoCo library."""
+"""Sonos speaker backend — S2 local WebSocket API via aiosonos.
+
+Replaces the previous SoCo implementation. aiosonos speaks Sonos's
+S2-only local WebSocket API on port 1443 — event-driven, declarative
+grouping, native short-clip announcements (no snapshot/restore dance,
+the ``audio_clip`` API auto-ducks + auto-restores). S1 speakers are
+NOT supported; run ``scripts/check_sonos_s2.py`` before relying on
+this plugin.
+
+Discovery is handled by zeroconf (Sonos advertises on
+``_sonos._tcp.local.``). Each discovered speaker gets a dedicated
+``SonosLocalApiClient`` connection — that's how aiosonos is designed
+in Music Assistant (its parent project): one client per player.
+Player-level operations go through that client's ``player`` object;
+group-level operations can be invoked through any client in the
+same household.
+"""
+
+from __future__ import annotations
 
 import asyncio
-import html
 import logging
+import re
+import ssl
+from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlparse
 
+import aiohttp
 import httpx
-import soco
-from soco import SoCo
+from aiosonos import SonosLocalApiClient
+from aiosonos.api.models import (
+    LoadContentRequest,
+    MetadataId,
+    MusicService as AioMusicService,
+    PlayBackState,
+)
+from aiosonos.exceptions import (
+    CannotConnect,
+    ConnectionClosed,
+    ConnectionFailed,
+    FailedCommand,
+    SonosException,
+)
+from aiosonos.utils import get_discovery_info
+from zeroconf import ServiceStateChange
+from zeroconf.asyncio import AsyncServiceBrowser, AsyncServiceInfo, AsyncZeroconf
 
 from gilbert.interfaces.configuration import ConfigAction, ConfigActionResult
 from gilbert.interfaces.speaker import (
@@ -22,263 +57,66 @@ from gilbert.interfaces.speaker import (
 
 logger = logging.getLogger(__name__)
 
-# Grouping timing constants
-_GROUP_SETTLE_SECONDS = 2.0
-_GROUP_POLL_INTERVAL = 1.0
-_GROUP_POLL_TIMEOUT = 5.0  # seconds to poll before retrying group command
-_GROUP_MAX_ATTEMPTS = 5  # max times to retry the whole group operation
+# Sonos speakers advertise over mDNS as ``_sonos._tcp.local.``. Zeroconf
+# fires a ServiceStateChange event for each discovered instance — we
+# don't need to broadcast SSDP ourselves.
+_SONOS_SERVICE_TYPE = "_sonos._tcp.local."
+_DISCOVERY_SETTLE_SECONDS = 3.0
+_CONNECT_TIMEOUT = 10.0
+_INFO_PROBE_TIMEOUT = 5.0
 
-# Map SoCo transport states to our enum
-_STATE_MAP: dict[str, PlaybackState] = {
-    "PLAYING": PlaybackState.PLAYING,
-    "PAUSED_PLAYBACK": PlaybackState.PAUSED,
-    "STOPPED": PlaybackState.STOPPED,
-    "TRANSITIONING": PlaybackState.TRANSITIONING,
+# Spotify URIs as they appear in MusicItem.uri: ``spotify:track:abc123``
+# etc. We route these to ``playback.load_content`` with a Spotify
+# ``MetadataId`` rather than ``load_stream_url``, because Sonos plays
+# Spotify content through the speaker's linked account rather than as
+# a plain HTTP stream.
+_SPOTIFY_URI_RE = re.compile(
+    r"^spotify:(track|album|playlist|artist|episode|show):([A-Za-z0-9]+)$"
+)
+_SPOTIFY_OPEN_URL_RE = re.compile(
+    r"https?://open\.spotify\.com/(track|album|playlist|artist|episode|show)/([A-Za-z0-9]+)"
+)
+
+# Sonos publishes this local-API token in every S2 speaker's firmware.
+# Not a secret — aiosonos itself uses it. Gates the info endpoint
+# against casual abuse, nothing more.
+_LOCAL_API_KEY = "123e4567-e89b-12d3-a456-426655440000"
+_LOCAL_INFO_URL = "https://{ip}:1443/api/v1/players/local/info"
+
+# Map aiosonos PlayBackState values to our PlaybackState enum.
+_PLAYBACK_STATE_MAP: dict[str, PlaybackState] = {
+    PlayBackState.PLAYBACK_STATE_PLAYING.value: PlaybackState.PLAYING,
+    PlayBackState.PLAYBACK_STATE_PAUSED.value: PlaybackState.PAUSED,
+    PlayBackState.PLAYBACK_STATE_IDLE.value: PlaybackState.STOPPED,
+    PlayBackState.PLAYBACK_STATE_BUFFERING.value: PlaybackState.TRANSITIONING,
 }
 
+# Audio-clip max length per Sonos's own API documentation. Anything
+# longer gets truncated. We don't enforce it on the Gilbert side —
+# announcements that fit comfortably don't need the ceiling, and
+# callers sending longer URLs get a clean Sonos-side error if it
+# exceeds.
+_AUDIO_CLIP_MAX_SECONDS = 60
 
-def _parse_hms(value: str) -> float:
-    """Parse a Sonos-style duration/position string (``H:MM:SS``) into seconds.
 
-    Returns 0.0 for empty, ``NOT_IMPLEMENTED``, or malformed values.
+@dataclass
+class _PlayerMetadata:
+    """Per-player info cached from zeroconf + the info endpoint.
+
+    aiosonos's ``SonosPlayer`` is tied to an open WebSocket connection;
+    we keep the static identity fields here so the plugin can list /
+    look up speakers without touching the live client.
     """
-    if not value or value == "NOT_IMPLEMENTED":
-        return 0.0
-    parts = value.split(":")
-    try:
-        if len(parts) == 3:
-            return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
-        if len(parts) == 2:
-            return int(parts[0]) * 60 + float(parts[1])
-        return float(parts[0])
-    except ValueError:
-        return 0.0
 
-
-def _speaker_id(device: SoCo) -> str:
-    """Canonical speaker ID — use the UID which is stable."""
-    return device.uid
-
-
-def _speaker_info(device: SoCo) -> SpeakerInfo:
-    """Build a SpeakerInfo from a SoCo device.
-
-    During Sonos topology changes (e.g. just after an ``unjoin``), a
-    device's ``group`` can exist while its ``coordinator`` is
-    temporarily ``None``. Treat those devices as their own coordinator
-    until the group state settles — otherwise ``coordinator.uid``
-    raises ``AttributeError`` on a ``None`` object.
-    """
-    group = device.group
-    if group is not None and group.coordinator is not None:
-        coordinator = group.coordinator
-    else:
-        coordinator = device
-    transport = device.get_current_transport_info()
-    state_str = transport.get("current_transport_state", "STOPPED")
-
-    return SpeakerInfo(
-        speaker_id=_speaker_id(device),
-        name=device.player_name,
-        ip_address=device.ip_address,
-        model=device.get_speaker_info().get("model_name", ""),
-        group_id=group.uid if group else "",
-        group_name=group.label if group else "",
-        is_group_coordinator=(device.uid == coordinator.uid),
-        volume=device.volume,
-        state=_STATE_MAP.get(state_str, PlaybackState.STOPPED),
-    )
-
-
-def _find_device(devices: dict[str, SoCo], speaker_id: str) -> SoCo:
-    """Find a device by speaker_id. Raises KeyError if not found."""
-    device = devices.get(speaker_id)
-    if device is None:
-        raise KeyError(f"Speaker not found: {speaker_id}")
-    return device
-
-
-def _spotify_url_to_uri(url: str) -> str:
-    """Convert a Spotify web URL to a ``spotify:`` URI.
-
-    ``https://open.spotify.com/track/abc123?si=xyz`` → ``spotify:track:abc123``
-    ``https://open.spotify.com/playlist/def456`` → ``spotify:playlist:def456``
-    """
-    from urllib.parse import urlparse
-
-    parsed = urlparse(url)
-    # Path is like /track/abc123 or /playlist/def456
-    parts = parsed.path.strip("/").split("/")
-    if len(parts) >= 2:
-        resource_type = parts[0]  # track, playlist, album, etc.
-        resource_id = parts[1]
-        return f"spotify:{resource_type}:{resource_id}"
-    return url  # Return original if we can't parse it
-
-
-def _detect_spotify_sn(devices: dict[str, SoCo]) -> int:
-    """Detect the Spotify account serial number from the Sonos system.
-
-    Tries multiple sources: the accounts API, currently-playing tracks,
-    and Sonos favorites.
-    """
-    import re
-
-    from soco.music_services.accounts import Account
-
-    def _extract_sn(uri: str) -> int | None:
-        if "spotify" in uri:
-            m = re.search(r"sn=(\d+)", uri)
-            if m:
-                return int(m.group(1))
-        return None
-
-    # Method 1: accounts API
-    for acct in Account.get_accounts().values():
-        if acct.service_type == 3079:
-            return int(acct.serial_number)
-
-    for speaker in devices.values():
-        # Method 2: currently-playing track
-        try:
-            track = speaker.get_current_track_info()
-            sn = _extract_sn(track.get("uri", ""))
-            if sn is not None:
-                return sn
-        except Exception:
-            pass
-
-        # Method 3: Sonos favorites
-        try:
-            favs = speaker.music_library.get_sonos_favorites()
-            for fav in favs:
-                res = fav.resources[0] if fav.resources else None
-                if res:
-                    sn = _extract_sn(res.uri)
-                    if sn is not None:
-                        return sn
-        except Exception:
-            pass
-
-    return 0
-
-
-def _to_sonos_spotify_uri(spotify_uri: str, sn: int = 0) -> str:
-    """Convert a ``spotify:track:ID`` URI to Sonos ``x-sonos-spotify:`` format.
-
-    Builds the URI with the correct service ID, flags, and serial number
-    for the local Sonos system's linked Spotify account.  SoCo's
-    ``play_uri`` will generate appropriate metadata from the title arg.
-
-    Only valid for *single items* (tracks, episodes, shows). Spotify
-    containers (playlists, albums, artists) must be routed through
-    ``_play_container`` instead — see ``sonos_music._build_spotify_container_playable``
-    for the upstream construction and ``_play_container`` for the
-    AVTransport queue-playback path.
-    """
-    from soco.music_services import MusicService
-
-    svc = MusicService("Spotify")
-    encoded = spotify_uri.replace(":", "%3a")
-    return f"x-sonos-spotify:{encoded}?sid={svc.service_id}&flags=8232&sn={sn}"
-
-
-def _play_container(coordinator: SoCo, uri: str, didl: str) -> None:
-    """Play a container URI (Spotify playlist/album/artist) via the queue.
-
-    Clears the current queue, enqueues the container with its DIDL-Lite
-    envelope, and plays from the first newly-enqueued track. This is the
-    *only* path that works for Spotify containers: handing a container
-    URI to ``SetAVTransportURI`` silently no-ops — the transport accepts
-    the call and Sonos logs it as successful, but no audio plays because
-    the container URI without queue context gives Sonos no track to
-    start on. ``AddURIToQueue`` with the proper container DIDL tells
-    Sonos to expand the container into individual tracks on the queue,
-    and ``play_from_queue`` then plays the first one.
-    """
-    if not didl:
-        raise ValueError(
-            f"Container URI requires DIDL metadata; got empty didl_meta for {uri}",
-        )
-    coordinator.clear_queue()
-    response = coordinator.avTransport.AddURIToQueue(
-        [
-            ("InstanceID", 0),
-            ("EnqueuedURI", uri),
-            ("EnqueuedURIMetaData", didl),
-            ("DesiredFirstTrackNumberEnqueued", 0),
-            ("EnqueueAsNext", 0),
-        ],
-    )
-    first = int(response.get("FirstTrackNumberEnqueued", "1"))
-    # FirstTrackNumberEnqueued is 1-based; play_from_queue takes 0-based.
-    coordinator.play_from_queue(first - 1)
-
-
-async def _probe_http_audio_mime(url: str, timeout: float = 5.0) -> str:
-    """HEAD-probe an HTTP(S) URL and return its audio Content-Type.
-
-    Returns ``""`` when the URL isn't HTTP(S), the probe fails, the
-    server rejects HEAD, or the Content-Type isn't ``audio/*`` /
-    ``video/*``. In any of those cases the caller should fall back to
-    soco's default (radio-style) DIDL — probing is a best-effort
-    improvement, not a hard requirement. Timeout is short so a dead
-    URL doesn't stall the whole play request.
-    """
-    try:
-        parsed = urlparse(url)
-    except ValueError:
-        return ""
-    if parsed.scheme not in ("http", "https"):
-        return ""
-    try:
-        async with httpx.AsyncClient(
-            timeout=timeout, follow_redirects=True
-        ) as client:
-            resp = await client.head(url)
-    except Exception:
-        return ""
-    if resp.status_code >= 400:
-        return ""
-    ctype = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
-    if ctype.startswith(("audio/", "video/")):
-        return ctype
-    return ""
-
-
-def _build_music_track_didl(uri: str, title: str, mime: str) -> str:
-    """Build a DIDL-Lite envelope that tags ``uri`` as a finite music track.
-
-    soco's default auto-generated DIDL (when we hand it a title but no
-    ``meta``) marks the resource as ``object.item.audioItem.audioBroadcast``
-    — a live radio stream. Sonos then probes the URL and rejects plain
-    HTTP file responses with UPnP error 714 "Illegal MIME-Type" because
-    the content doesn't look like a radio stream to its whitelist.
-
-    Emitting the ``musicTrack`` class with an explicit ``protocolInfo``
-    carrying the real MIME tells Sonos "this is a regular audio file",
-    skipping the radio-stream MIME check. Works for one-off playback of
-    arbitrary HTTP-hosted audio, which is exactly the
-    ``share_workspace_file``-style flow.
-    """
-    safe_title = html.escape(title or "Gilbert audio")
-    safe_uri = html.escape(uri, quote=True)
-    safe_mime = html.escape(mime, quote=True)
-    return (
-        '<DIDL-Lite '
-        'xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" '
-        'xmlns:dc="http://purl.org/dc/elements/1.1/" '
-        'xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">'
-        '<item id="gilbert-share" parentID="-1" restricted="true">'
-        f"<dc:title>{safe_title}</dc:title>"
-        "<upnp:class>object.item.audioItem.musicTrack</upnp:class>"
-        f'<res protocolInfo="http-get:*:{safe_mime}:*">{safe_uri}</res>'
-        "</item></DIDL-Lite>"
-    )
+    player_id: str
+    household_id: str
+    name: str
+    ip_address: str
+    model: str
 
 
 class SonosSpeaker(SpeakerBackend):
-    """Sonos speaker backend using the SoCo library."""
+    """Sonos speaker backend driven by aiosonos (S2 local WebSocket)."""
 
     backend_name = "sonos"
 
@@ -289,7 +127,9 @@ class SonosSpeaker(SpeakerBackend):
                 key="test_connection",
                 label="Test connection",
                 description=(
-                    "Run Sonos discovery and report how many speakers are reachable on the network."
+                    "Run Sonos zeroconf discovery and report how many "
+                    "S2 speakers responded with a valid local-API info "
+                    "endpoint."
                 ),
             ),
         ]
@@ -307,523 +147,780 @@ class SonosSpeaker(SpeakerBackend):
         )
 
     async def _action_test_connection(self) -> ConfigActionResult:
-        try:
-            found = await asyncio.to_thread(soco.discover)
-        except Exception as exc:
+        count = len(self._player_metadata)
+        households = {pm.household_id for pm in self._player_metadata.values()}
+        connected = sum(1 for c in self._clients.values() if c is not None)
+        if count == 0:
             return ConfigActionResult(
                 status="error",
-                message=f"Sonos discovery failed: {exc}",
+                message=(
+                    "No Sonos speakers discovered yet. Zeroconf discovery "
+                    "runs in the background on backend start; try again "
+                    "in a few seconds, or check that multicast isn't "
+                    "blocked on your LAN."
+                ),
             )
-        devices = list(found) if found else []
-        if not devices:
-            return ConfigActionResult(
-                status="error",
-                message="No Sonos speakers found on the network.",
-            )
-        # Refresh the cached device map so subsequent calls see them.
-        self._devices = {_speaker_id(d): d for d in devices}
         return ConfigActionResult(
             status="ok",
-            message=f"Found {len(devices)} Sonos speaker(s) on the network.",
+            message=(
+                f"{count} Sonos speaker(s) discovered across "
+                f"{len(households)} household(s); {connected} WebSocket "
+                f"connection(s) live."
+            ),
         )
 
     def __init__(self) -> None:
-        self._devices: dict[str, SoCo] = {}
-        self._spotify_sn: int = 0
-        self._snapshots: dict[str, Any] = {}
+        # One aiosonos client per discovered player. The client owns a
+        # persistent WebSocket connection to *its* speaker and dispatches
+        # commands through it; group-level commands target the group by
+        # id rather than the coordinator player.
+        self._clients: dict[str, SonosLocalApiClient] = {}
+        self._player_metadata: dict[str, _PlayerMetadata] = {}
+        self._zeroconf: AsyncZeroconf | None = None
+        self._browser: AsyncServiceBrowser | None = None
+        # Background tasks — ``start_listening`` is long-running per
+        # client and needs to be cancelled on shutdown.
+        self._listen_tasks: dict[str, asyncio.Task[Any]] = {}
+        # aiohttp session reused for both zeroconf probes and aiosonos
+        # client construction — avoids one-off session churn and
+        # (important) lets us pre-install the Sonos self-signed cert
+        # bypass once instead of per-probe.
+        self._http_session: aiohttp.ClientSession | None = None
+        # Lock so zeroconf callbacks don't race against each other.
+        self._discovery_lock = asyncio.Lock()
+
+    # ── Lifecycle ────────────────────────────────────────────────────
 
     async def initialize(self, config: dict[str, object]) -> None:
-        await self._discover()
-        self._spotify_sn = await asyncio.to_thread(_detect_spotify_sn, self._devices)
+        """Start zeroconf discovery and kick off an initial settle wait.
+
+        aiosonos has no LAN-scan helper — we depend on Sonos's own mDNS
+        advertisements. Zeroconf fires service-add events as speakers
+        respond, and ``_on_service_state_change`` resolves each one and
+        creates a client connection. The ``settle`` wait gives the
+        initial batch of speakers time to advertise before the caller
+        starts making requests; it's not load-bearing (subsequent
+        speakers are still picked up asynchronously).
+        """
+        # Self-signed cert context used for both HTTPS probes and the
+        # aiosonos WebSocket. Sonos speakers ship with untrusted certs;
+        # verifying them doesn't add security on a LAN-only control
+        # plane and would just break every connection. aiosonos itself
+        # passes ``ssl=False`` internally, but we use a context for our
+        # own httpx probes.
+        self._ssl_ctx = ssl.create_default_context()
+        self._ssl_ctx.check_hostname = False
+        self._ssl_ctx.verify_mode = ssl.CERT_NONE
+
+        self._http_session = aiohttp.ClientSession()
+
+        self._zeroconf = AsyncZeroconf()
+        self._browser = AsyncServiceBrowser(
+            self._zeroconf.zeroconf,
+            _SONOS_SERVICE_TYPE,
+            handlers=[self._on_service_state_change],
+        )
+
+        # Wait for the initial wave of advertisements so the first
+        # ``list_speakers`` call isn't empty. Callers that need to
+        # ensure discovery is complete can poll or await a longer
+        # timeout — this is just a best-effort settle.
+        await asyncio.sleep(_DISCOVERY_SETTLE_SECONDS)
+
         logger.info(
-            "Sonos backend initialized — %d speakers found (spotify sn=%d)",
-            len(self._devices),
-            self._spotify_sn,
+            "Sonos backend initialized — %d speaker(s) discovered in %.1fs",
+            len(self._player_metadata),
+            _DISCOVERY_SETTLE_SECONDS,
         )
 
     async def close(self) -> None:
-        self._devices.clear()
+        """Tear down all connections + discovery."""
+        if self._browser is not None:
+            await self._browser.async_cancel()
+            self._browser = None
 
-    # --- Discovery ---
+        # Cancel long-running listener tasks before disconnecting —
+        # otherwise disconnect races the listener and we log spurious
+        # ConnectionClosed errors.
+        for task in self._listen_tasks.values():
+            task.cancel()
+        if self._listen_tasks:
+            await asyncio.gather(
+                *self._listen_tasks.values(), return_exceptions=True
+            )
+        self._listen_tasks.clear()
 
-    async def _discover(self) -> None:
-        """Discover Sonos speakers on the network."""
-        devices = await asyncio.to_thread(soco.discover)
-        self._devices = {}
-        if devices:
-            for device in devices:
-                self._devices[_speaker_id(device)] = device
+        for client in self._clients.values():
+            try:
+                await client.disconnect()
+            except Exception:  # noqa: BLE001 - best-effort cleanup
+                logger.debug("Error disconnecting Sonos client", exc_info=True)
+        self._clients.clear()
+
+        if self._zeroconf is not None:
+            await self._zeroconf.async_close()
+            self._zeroconf = None
+
+        if self._http_session is not None:
+            await self._http_session.close()
+            self._http_session = None
+
+        self._player_metadata.clear()
+
+    # ── Discovery ────────────────────────────────────────────────────
+
+    def _on_service_state_change(
+        self,
+        zeroconf: Any,
+        service_type: str,
+        name: str,
+        state_change: ServiceStateChange,
+    ) -> None:
+        """Zeroconf callback — schedule resolution of the changed service.
+
+        Zeroconf delivers events synchronously from its own thread, so
+        we schedule an async handler on the main loop rather than doing
+        I/O here. Additions and updates both probe the speaker; removals
+        drop the cached metadata.
+        """
+        if state_change == ServiceStateChange.Removed:
+            asyncio.create_task(self._handle_service_removed(name))
+            return
+        if state_change in (
+            ServiceStateChange.Added,
+            ServiceStateChange.Updated,
+        ):
+            asyncio.create_task(
+                self._handle_service_added(zeroconf, service_type, name)
+            )
+
+    async def _handle_service_added(
+        self,
+        zeroconf: Any,
+        service_type: str,
+        service_name: str,
+    ) -> None:
+        """Resolve an mDNS record and bring up a client for the speaker."""
+        async with self._discovery_lock:
+            info = AsyncServiceInfo(service_type, service_name)
+            try:
+                resolved = await info.async_request(zeroconf, 3000)
+            except Exception:  # noqa: BLE001 - log and drop
+                logger.debug(
+                    "Zeroconf resolve failed for %s", service_name, exc_info=True
+                )
+                return
+            if not resolved or not info.addresses:
+                return
+
+            # Zeroconf returns IPv4 addresses as packed 4-byte strings —
+            # convert to dotted-quad strings for the info endpoint + WS.
+            ip = ".".join(str(b) for b in info.addresses[0])
+            await self._bring_up_speaker(ip)
+
+    async def _handle_service_removed(self, service_name: str) -> None:
+        """Clean up state when zeroconf reports a speaker has gone.
+
+        Removal is best-effort — Sonos speakers often advertise
+        ephemerally and come back under the same name. We don't tear
+        down the client eagerly; the listener task will notice the
+        WebSocket closing and we'll reconnect on the next Add event.
+        """
+        logger.debug("Zeroconf reported service removal: %s", service_name)
+
+    async def _bring_up_speaker(self, ip: str) -> None:
+        """Probe the S2 info endpoint, then open an aiosonos client."""
+        # Probe /api/v1/players/local/info — this gives us the stable
+        # playerId + householdId identifiers that aiosonos expects,
+        # plus model/name for UI listings.
+        metadata = await self._probe_player(ip)
+        if metadata is None:
+            return
+        if metadata.player_id in self._player_metadata:
+            # Already known — idempotent on repeated mDNS events.
+            return
+
+        self._player_metadata[metadata.player_id] = metadata
+
+        client = SonosLocalApiClient(ip, self._http_session)
+        try:
+            await asyncio.wait_for(client.connect(), timeout=_CONNECT_TIMEOUT)
+        except (asyncio.TimeoutError, CannotConnect, ConnectionFailed) as exc:
+            logger.warning(
+                "Failed to connect to Sonos speaker %s (%s): %s",
+                metadata.name,
+                ip,
+                exc,
+            )
+            self._player_metadata.pop(metadata.player_id, None)
+            return
+
+        self._clients[metadata.player_id] = client
+
+        async def _listen() -> None:
+            # ``start_listening`` fetches initial state + keeps the
+            # connection alive, dispatching push events to subscribers.
+            # Runs until the WebSocket closes or the task is cancelled.
+            try:
+                await client.start_listening()
+            except (ConnectionClosed, SonosException):
+                logger.debug(
+                    "Sonos listener for %s closed", metadata.name, exc_info=True
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - report once and exit
+                logger.exception(
+                    "Unexpected error in Sonos listener for %s", metadata.name
+                )
+
+        task = asyncio.create_task(
+            _listen(), name=f"sonos-listen-{metadata.player_id}"
+        )
+        self._listen_tasks[metadata.player_id] = task
+
+        logger.info(
+            "Connected to Sonos speaker '%s' (%s, %s)",
+            metadata.name,
+            metadata.model,
+            ip,
+        )
+
+    async def _probe_player(self, ip: str) -> _PlayerMetadata | None:
+        """Hit the S2 info endpoint to extract identity fields."""
+        url = _LOCAL_INFO_URL.format(ip=ip)
+        headers = {"X-Sonos-Api-Key": _LOCAL_API_KEY}
+        try:
+            async with httpx.AsyncClient(
+                verify=self._ssl_ctx, timeout=_INFO_PROBE_TIMEOUT
+            ) as client:
+                resp = await client.get(url, headers=headers)
+        except httpx.HTTPError:
+            logger.debug("S2 info probe failed for %s", ip, exc_info=True)
+            return None
+
+        if resp.status_code != 200:
+            logger.debug(
+                "S2 info probe %s returned HTTP %d", ip, resp.status_code
+            )
+            return None
+
+        try:
+            data = resp.json()
+        except ValueError:
+            return None
+
+        player_id = str(data.get("playerId") or "")
+        household_id = str(data.get("householdId") or "")
+        if not player_id or not household_id:
+            # Some S2 firmwares omit playerId on the info endpoint and
+            # require the caller to discover it via the WebSocket
+            # handshake. Fall back to the aiosonos helper which does
+            # exactly that.
+            try:
+                discovery = await get_discovery_info(
+                    self._require_http_session(), ip
+                )
+            except Exception:
+                logger.debug(
+                    "get_discovery_info fallback failed for %s", ip, exc_info=True
+                )
+                return None
+            player_id = str(discovery.get("playerId", player_id) or "")
+            household_id = str(
+                discovery.get("householdId", household_id) or ""
+            )
+            if not player_id or not household_id:
+                return None
+
+        return _PlayerMetadata(
+            player_id=player_id,
+            household_id=household_id,
+            name=str(data.get("device", {}).get("name", "") or "Unknown"),
+            ip_address=ip,
+            model=str(data.get("device", {}).get("model", "") or ""),
+        )
+
+    def _require_http_session(self) -> aiohttp.ClientSession:
+        if self._http_session is None:
+            raise RuntimeError("Sonos backend not initialized")
+        return self._http_session
+
+    # ── Discovery API ────────────────────────────────────────────────
 
     async def list_speakers(self) -> list[SpeakerInfo]:
-        await self._discover()
-        return await asyncio.to_thread(self._list_speakers_sync)
+        """Materialize SpeakerInfo for every known speaker.
 
-    def _list_speakers_sync(self) -> list[SpeakerInfo]:
-        return [_speaker_info(d) for d in self._devices.values()]
+        Pulls live volume + group membership from the client for each
+        player, so results reflect the current state of the system
+        (not a stale snapshot taken at discovery time).
+        """
+        infos: list[SpeakerInfo] = []
+        for player_id, meta in self._player_metadata.items():
+            client = self._clients.get(player_id)
+            volume = 0
+            group_id = ""
+            group_name = ""
+            is_coord = False
+            state = PlaybackState.STOPPED
+            if client is not None:
+                player = client.player
+                volume = int(player.volume_level or 0)
+                group = player.group
+                if group is not None:
+                    group_id = group.id
+                    group_name = group.name or ""
+                    is_coord = player.is_coordinator
+                    state = _PLAYBACK_STATE_MAP.get(
+                        str(group.playback_state or ""),
+                        PlaybackState.STOPPED,
+                    )
+            infos.append(
+                SpeakerInfo(
+                    speaker_id=player_id,
+                    name=meta.name,
+                    ip_address=meta.ip_address,
+                    model=meta.model,
+                    group_id=group_id,
+                    group_name=group_name,
+                    is_group_coordinator=is_coord,
+                    volume=volume,
+                    state=state,
+                )
+            )
+        infos.sort(key=lambda s: s.name.lower())
+        return infos
 
     async def get_speaker(self, speaker_id: str) -> SpeakerInfo | None:
-        device = self._devices.get(speaker_id)
-        if device is None:
-            await self._discover()
-            device = self._devices.get(speaker_id)
-        if device is None:
+        if speaker_id not in self._player_metadata:
             return None
-        return await asyncio.to_thread(_speaker_info, device)
+        # Reuse list_speakers's per-speaker materialization — small
+        # enough to be fine, and keeps state-derivation in one place.
+        infos = await self.list_speakers()
+        return next((i for i in infos if i.speaker_id == speaker_id), None)
 
-    # --- Playback ---
+    # ── Playback ─────────────────────────────────────────────────────
 
     async def play_uri(self, request: PlayRequest) -> None:
-        target_ids = request.speaker_ids or list(self._devices.keys())
-        if not target_ids:
-            raise ValueError("No speakers available")
+        """Play an audio URI on the requested speakers.
 
-        # Find the coordinator — after topology is prepared by the speaker
-        # service, the first target is standalone or the group coordinator.
-        coordinator = await self._find_coordinator(target_ids)
+        Dispatch table:
 
-        # Set volume if requested
-        if request.volume is not None:
-            for sid in target_ids:
-                dev = self._devices.get(sid)
-                if dev:
-                    await asyncio.to_thread(setattr, dev, "volume", request.volume)
-
-        # Play — Spotify URIs need conversion to Sonos format
-        title = request.title or ""
-        uri = request.uri
-
-        # Convert Spotify web URLs to spotify: URIs
-        # e.g. https://open.spotify.com/track/abc123 → spotify:track:abc123
-        if "open.spotify.com/" in uri:
-            uri = _spotify_url_to_uri(uri)
-
-        # Container URIs (Spotify playlists/albums/artists from the music
-        # backend's resolve_playable) must be enqueued, not handed to
-        # SetAVTransportURI directly — Sonos silently accepts the direct
-        # call and plays nothing. Route them through the queue path.
-        if uri.startswith("x-rincon-cpcontainer:"):
-            try:
-                await asyncio.to_thread(
-                    _play_container,
-                    coordinator,
-                    uri,
-                    request.didl_meta,
-                )
-            except Exception:
-                logger.exception(
-                    "Sonos container playback failed: uri=%s speaker=%s",
-                    uri,
-                    coordinator.player_name,
-                )
-                raise
-        else:
-            if uri.startswith("spotify:"):
-                uri = await asyncio.to_thread(
-                    _to_sonos_spotify_uri,
-                    uri,
-                    self._spotify_sn,
-                )
-            try:
-                if request.didl_meta:
-                    await asyncio.to_thread(
-                        coordinator.play_uri,
-                        uri,
-                        meta=request.didl_meta,
-                        title=title,
-                    )
-                else:
-                    # soco.play_uri(uri, title=X) with no meta generates a
-                    # radio-stream DIDL (class ``audioItem.audioBroadcast``)
-                    # — Sonos then rejects plain HTTP file URLs with UPnP
-                    # error 714 because the content MIME doesn't match its
-                    # radio-stream whitelist. Probe the URL ourselves;
-                    # when it's a regular audio file, emit a music-track
-                    # DIDL with an explicit ``protocolInfo`` so Sonos
-                    # treats it as a finite file, not a live stream.
-                    probed_mime = await _probe_http_audio_mime(uri)
-                    if probed_mime:
-                        didl = _build_music_track_didl(uri, title, probed_mime)
-                        await asyncio.to_thread(
-                            coordinator.play_uri,
-                            uri,
-                            meta=didl,
-                            title=title,
-                        )
-                    else:
-                        await asyncio.to_thread(
-                            coordinator.play_uri, uri, title=title
-                        )
-            except Exception:
-                logger.exception(
-                    "Sonos play_uri failed: uri=%s speaker=%s",
-                    uri,
-                    coordinator.player_name,
-                )
-                raise
-
-        # Seek to position if requested
-        if request.position_seconds is not None and request.position_seconds > 0:
-            pos = int(request.position_seconds)
-            timestamp = f"{pos // 3600}:{(pos % 3600) // 60:02d}:{pos % 60:02d}"
-            await asyncio.sleep(0.3)  # brief pause for transport to start
-            await asyncio.to_thread(coordinator.seek, timestamp)
-
-        logger.info("Playing %s on %s", request.uri, coordinator.player_name)
-
-    async def _find_coordinator(self, target_ids: list[str]) -> SoCo:
-        """Find the group coordinator for the given speakers.
-
-        If the speakers are grouped, returns the coordinator. If a single
-        standalone speaker, returns that device.
+        - ``request.announce=True`` → ``player.play_audio_clip``. Native
+          duck-and-restore on the speaker; ideal for TTS.
+        - HTTP(S) URL → ``group.play_stream_url``. Sonos probes the
+          URL's Content-Type and picks the right decoder.
+        - ``spotify:…`` URI or ``open.spotify.com`` link → raises
+          ``NotImplementedError``. Spotify playback via the local API
+          requires a ``MetadataId`` with an ``accountId`` discovered
+          from the speaker's linked-services list — that lookup lives
+          in the music backend (Phase 2 of the aiosonos migration), not
+          here. Callers should route Spotify content through
+          ``MusicService.play`` / ``MusicBackend.resolve_playable``
+          rather than ``SpeakerService.play_on_speakers``.
         """
-        device = _find_device(self._devices, target_ids[0])
-        group = await asyncio.to_thread(lambda: device.group)
-        return group.coordinator if group else device
+        target_ids = request.speaker_ids or list(self._player_metadata.keys())
+        if not target_ids:
+            raise RuntimeError("No speakers available")
 
-    async def clear_queue(self, speaker_ids: list[str] | None = None) -> None:
-        """Clear the playback queue on the specified speakers."""
-        targets = speaker_ids or list(self._devices.keys())
-        for sid in targets:
-            device = self._devices.get(sid)
-            if device:
+        # Verify each target is actually connected before attempting
+        # to play — otherwise we get misleading KeyErrors.
+        live = [tid for tid in target_ids if tid in self._clients]
+        if not live:
+            raise RuntimeError(
+                f"None of the requested speakers ({target_ids}) are connected"
+            )
+
+        if request.announce:
+            await self._play_audio_clip(live, request)
+            return
+
+        # Form a group if needed. aiosonos's declarative model: just
+        # ask for exactly these players in a group. No join/unjoin
+        # rodeo, no UPnP 800 retry logic.
+        coord_player_id = await self._ensure_group(live)
+        coord_client = self._clients[coord_player_id]
+        group = coord_client.player.group
+        if group is None:
+            raise RuntimeError(
+                f"Coordinator speaker {coord_player_id} has no active group"
+            )
+
+        # Set volume across the group before loading content so the
+        # playback opens at the intended level (Sonos will apply the
+        # volume to the next buffer, which is usually fast enough that
+        # nobody hears the wrong level).
+        if request.volume is not None:
+            await self._set_group_volume(live, request.volume)
+
+        spotify = _extract_spotify_ref(request.uri)
+        if spotify is not None:
+            await self._load_spotify_content(
+                coord_client, group.id, spotify, request.title
+            )
+            return
+
+        # Generic HTTP(S) stream — let Sonos probe the URL and pick.
+        await group.play_stream_url(
+            request.uri,
+            play_on_completion=False,
+        )
+
+    async def _load_spotify_content(
+        self,
+        client: SonosLocalApiClient,
+        group_id: str,
+        spotify: _SpotifyRef,
+        title: str,
+    ) -> None:
+        """Load Spotify content via the speaker's linked account.
+
+        The speaker's own Spotify binding (configured through the
+        Sonos mobile app, not Gilbert) handles the actual streaming —
+        Gilbert just tells it *which* Spotify URI to play using the
+        household's SPOTIFY service entry. ``accountId`` is omitted;
+        Sonos resolves the default linked Spotify account on the
+        household, which is correct for the typical single-account
+        household we target.
+        """
+        content_type = _SPOTIFY_KIND_TO_LOAD_TYPE.get(spotify.kind)
+        if content_type is None:
+            raise ValueError(
+                f"Unsupported Spotify content kind for playback: {spotify.kind}"
+            )
+        metadata_id: MetadataId = {
+            "serviceId": str(AioMusicService.SPOTIFY.value),
+            "objectId": spotify.uri,
+        }
+        request: LoadContentRequest = {
+            "type": content_type,
+            "id": metadata_id,
+            "playbackAction": "PLAY",
+        }
+        await client.api.playback.load_content(group_id, request)
+
+    async def _play_audio_clip(
+        self,
+        speaker_ids: list[str],
+        request: PlayRequest,
+    ) -> None:
+        """Fire a short overlay clip on each target speaker.
+
+        Sonos's ``audio_clip`` API is single-speaker — the speaker itself
+        handles the duck + restore. For multi-speaker announcements we
+        just fire the clip on every target in parallel; the sync is
+        good enough that listeners don't hear drift on short clips.
+        """
+        volume = request.volume
+        name = request.title or "Gilbert announcement"
+
+        async def _one(pid: str) -> None:
+            client = self._clients.get(pid)
+            if client is None:
+                return
+            try:
+                await client.player.play_audio_clip(
+                    request.uri,
+                    volume=volume,
+                    name=name,
+                )
+            except FailedCommand as exc:
+                logger.warning(
+                    "Audio clip failed on speaker %s: %s",
+                    self._name_for(pid),
+                    exc,
+                )
+
+        results = await asyncio.gather(
+            *(_one(pid) for pid in speaker_ids), return_exceptions=True
+        )
+        failures = [r for r in results if isinstance(r, Exception)]
+        if failures and len(failures) == len(results):
+            # Every speaker rejected the clip — surface the first error
+            # so the caller knows playback didn't happen.
+            raise failures[0]
+
+    async def _ensure_group(self, target_ids: list[str]) -> str:
+        """Make sure ``target_ids`` form a single group and return the coordinator.
+
+        Uses the declarative ``set_group_members`` API: if the target
+        set matches an existing group, Sonos no-ops; otherwise it
+        re-forms the group atomically on the household. Returns the
+        player_id of whoever ended up as coordinator.
+        """
+        if len(target_ids) == 1:
+            # Singleton: make sure the speaker is alone in its group.
+            pid = target_ids[0]
+            client = self._clients[pid]
+            player = client.player
+            group = player.group
+            if group is None or len(group.player_ids) != 1:
                 try:
-                    await asyncio.to_thread(device.clear_queue)
-                except Exception:
-                    logger.debug("Failed to clear queue on %s", sid)
+                    await player.leave_group()
+                except FailedCommand:
+                    logger.debug(
+                        "Sonos leave_group failed for %s — speaker may "
+                        "already be solo",
+                        pid,
+                        exc_info=True,
+                    )
+            return pid
+
+        # Multi-speaker: pick a coordinator (first target), call
+        # set_group_members on its current group with the full target
+        # list. Sonos merges + expels as needed.
+        coord_id = target_ids[0]
+        client = self._clients[coord_id]
+        player = client.player
+        group = player.group
+        if group is None:
+            # Edge case: coordinator has no group membership yet.
+            # Create one from scratch.
+            await client.create_group(target_ids)
+            return coord_id
+
+        current = set(group.player_ids)
+        wanted = set(target_ids)
+        if current == wanted:
+            return coord_id
+        await group.set_group_members(target_ids)
+        return coord_id
+
+    async def _set_group_volume(
+        self, speaker_ids: list[str], volume: int
+    ) -> None:
+        """Apply the same volume to every speaker in ``speaker_ids``."""
+        volume = max(0, min(100, int(volume)))
+
+        async def _one(pid: str) -> None:
+            client = self._clients.get(pid)
+            if client is None:
+                return
+            try:
+                await client.player.set_volume(volume)
+            except FailedCommand:
+                logger.debug(
+                    "set_volume failed for %s", self._name_for(pid), exc_info=True
+                )
+
+        await asyncio.gather(*(_one(pid) for pid in speaker_ids))
 
     async def stop(self, speaker_ids: list[str] | None = None) -> None:
-        targets = speaker_ids or list(self._devices.keys())
-        for sid in targets:
-            device = self._devices.get(sid)
-            if device:
-                await asyncio.to_thread(device.stop)
-
-    # --- Snapshot / Restore ---
-
-    async def snapshot(self, speaker_ids: list[str]) -> None:
-        """Save playback state of speakers so it can be restored after an announcement."""
-        from soco.snapshot import Snapshot
-
-        self._snapshots = {}
-        for sid in speaker_ids:
-            device = self._devices.get(sid)
-            if device:
-                try:
-                    snap = Snapshot(device)
-                    await asyncio.to_thread(snap.snapshot)
-                    self._snapshots[sid] = snap
-                except Exception:
-                    logger.debug("Failed to snapshot speaker %s", sid)
-
-    async def restore(self, speaker_ids: list[str]) -> None:
-        """Restore speakers to the state saved by snapshot()."""
-        for sid in speaker_ids:
-            snap = self._snapshots.pop(sid, None)
-            if snap:
-                try:
-                    await asyncio.to_thread(snap.restore)
-                except Exception:
-                    logger.debug("Failed to restore speaker %s", sid)
-
-    # --- Volume ---
-
-    async def get_playback_state(self, speaker_id: str) -> PlaybackState:
-        device = _find_device(self._devices, speaker_id)
-        transport = await asyncio.to_thread(device.get_current_transport_info)
-        state_str = transport.get("current_transport_state", "STOPPED")
-        return _STATE_MAP.get(state_str, PlaybackState.STOPPED)
-
-    async def get_now_playing(self, speaker_id: str) -> NowPlaying:
-        """Query Sonos for the currently playing track on a speaker.
-
-        Follows the group coordinator when the speaker is grouped — only the
-        coordinator has authoritative transport/track state.
-        """
-        device = _find_device(self._devices, speaker_id)
-
-        def _fetch() -> NowPlaying:
-            # Follow the group coordinator: in a Sonos group, only the
-            # coordinator reports the actual track being played.
-            group = device.group
-            coordinator = group.coordinator if group and group.coordinator else device
-            transport = coordinator.get_current_transport_info()
-            state = _STATE_MAP.get(
-                transport.get("current_transport_state", "STOPPED"),
-                PlaybackState.STOPPED,
-            )
+        """Stop playback on the targets (or everyone, if None)."""
+        targets = speaker_ids or list(self._player_metadata.keys())
+        seen_groups: set[str] = set()
+        for pid in targets:
+            client = self._clients.get(pid)
+            if client is None:
+                continue
+            group = client.player.group
+            if group is None or group.id in seen_groups:
+                continue
+            seen_groups.add(group.id)
             try:
-                track = coordinator.get_current_track_info()
-            except Exception:
-                return NowPlaying(state=state)
-            return NowPlaying(
-                state=state,
-                title=track.get("title", "") or "",
-                artist=track.get("artist", "") or "",
-                album=track.get("album", "") or "",
-                album_art_url=track.get("album_art", "") or "",
-                uri=track.get("uri", "") or "",
-                duration_seconds=_parse_hms(track.get("duration", "")),
-                position_seconds=_parse_hms(track.get("position", "")),
-            )
+                await group.pause()
+            except FailedCommand:
+                logger.debug(
+                    "Pause failed for group %s",
+                    group.id,
+                    exc_info=True,
+                )
 
-        return await asyncio.to_thread(_fetch)
+    # ── Volume ───────────────────────────────────────────────────────
 
     async def get_volume(self, speaker_id: str) -> int:
-        device = _find_device(self._devices, speaker_id)
-        return await asyncio.to_thread(lambda: device.volume)
+        client = self._clients.get(speaker_id)
+        if client is None:
+            raise KeyError(f"Unknown speaker: {speaker_id}")
+        return int(client.player.volume_level or 0)
 
     async def set_volume(self, speaker_id: str, volume: int) -> None:
-        device = _find_device(self._devices, speaker_id)
-        clamped = max(0, min(100, volume))
-        await asyncio.to_thread(setattr, device, "volume", clamped)
+        client = self._clients.get(speaker_id)
+        if client is None:
+            raise KeyError(f"Unknown speaker: {speaker_id}")
+        await client.player.set_volume(max(0, min(100, int(volume))))
 
-    # --- Grouping ---
+    # ── Transport state ──────────────────────────────────────────────
+
+    async def get_playback_state(self, speaker_id: str) -> PlaybackState:
+        client = self._clients.get(speaker_id)
+        if client is None:
+            return PlaybackState.STOPPED
+        group = client.player.group
+        if group is None:
+            return PlaybackState.STOPPED
+        return _PLAYBACK_STATE_MAP.get(
+            str(group.playback_state or ""),
+            PlaybackState.STOPPED,
+        )
+
+    async def get_now_playing(self, speaker_id: str) -> NowPlaying:
+        """Pull the latest metadata for whatever's playing on the speaker's group."""
+        client = self._clients.get(speaker_id)
+        state = await self.get_playback_state(speaker_id)
+        if client is None:
+            return NowPlaying(state=state)
+
+        group = client.player.group
+        if group is None:
+            return NowPlaying(state=state)
+
+        meta = group.playback_metadata
+        if meta is None:
+            return NowPlaying(state=state)
+
+        # aiosonos's MetadataStatus exposes ``currentItem`` with a
+        # ``track`` object, plus the current ``positionMillis`` and
+        # queue position. Fields are optional — fall back to empty.
+        current_item = getattr(meta, "currentItem", None)
+        track = getattr(current_item, "track", None) if current_item else None
+        title = str(getattr(track, "name", "") or "") if track else ""
+        artist = ""
+        if track is not None:
+            artist_obj = getattr(track, "artist", None)
+            artist = str(getattr(artist_obj, "name", "") or "") if artist_obj else ""
+        album = ""
+        if track is not None:
+            album_obj = getattr(track, "album", None)
+            album = str(getattr(album_obj, "name", "") or "") if album_obj else ""
+        album_art = ""
+        if track is not None:
+            images = getattr(track, "images", None) or []
+            if images:
+                album_art = str(getattr(images[0], "url", "") or "")
+        duration_ms = (
+            int(getattr(track, "durationMillis", 0) or 0) if track else 0
+        )
+        position_ms = int(getattr(meta, "positionMillis", 0) or 0)
+
+        return NowPlaying(
+            state=state,
+            title=title,
+            artist=artist,
+            album=album,
+            album_art_url=album_art,
+            duration_seconds=duration_ms / 1000.0,
+            position_seconds=position_ms / 1000.0,
+        )
+
+    # ── Grouping ─────────────────────────────────────────────────────
 
     @property
     def supports_grouping(self) -> bool:
         return True
 
     async def list_groups(self) -> list[SpeakerGroup]:
-        await self._discover()
-        return await asyncio.to_thread(self._list_groups_sync)
-
-    def _list_groups_sync(self) -> list[SpeakerGroup]:
-        seen_group_ids: set[str] = set()
-        groups: list[SpeakerGroup] = []
-        for device in self._devices.values():
-            group = device.group
-            if group is None or group.uid in seen_group_ids:
-                continue
-            seen_group_ids.add(group.uid)
-            groups.append(
-                SpeakerGroup(
-                    group_id=group.uid,
-                    name=group.label,
-                    coordinator_id=_speaker_id(group.coordinator),
-                    member_ids=[_speaker_id(m) for m in group.members],
+        """Return every unique group across every household's clients."""
+        seen: dict[str, SpeakerGroup] = {}
+        for client in self._clients.values():
+            for group in client.groups:
+                if group.id in seen:
+                    continue
+                seen[group.id] = SpeakerGroup(
+                    group_id=group.id,
+                    name=group.name or "",
+                    coordinator_id=group.coordinator_id or "",
+                    member_ids=list(group.player_ids),
                 )
-            )
-        return groups
+        return sorted(seen.values(), key=lambda g: g.name.lower())
 
     async def group_speakers(self, speaker_ids: list[str]) -> SpeakerGroup:
-        if len(speaker_ids) < 2:
-            raise ValueError("Need at least 2 speakers to form a group")
-
-        target_set = set(speaker_ids)
-
-        # Check if already correctly grouped
-        result = await self._check_group_state(speaker_ids)
-        if result:
-            logger.info(
-                "Speakers already grouped as '%s' — no changes needed",
-                result.name,
+        """Form a group from ``speaker_ids``; returns the resulting group."""
+        if not speaker_ids:
+            raise ValueError("speaker_ids is empty")
+        coord_id = await self._ensure_group(speaker_ids)
+        group = self._clients[coord_id].player.group
+        if group is None:
+            raise RuntimeError(
+                "Expected coordinator to be in a group after _ensure_group"
             )
-            return result
-
-        # Retry loop: attempt to form the group, poll until formed,
-        # re-attempt if it doesn't converge within the poll timeout
-        for attempt in range(1, _GROUP_MAX_ATTEMPTS + 1):
-            await self._apply_group_changes(speaker_ids, target_set)
-
-            # Poll until the group is formed or timeout
-            result = await self._poll_until_grouped(
-                speaker_ids,
-                _GROUP_POLL_TIMEOUT,
-            )
-            if result:
-                logger.info(
-                    "Speaker group formed: '%s' with %d members",
-                    result.name,
-                    len(result.member_ids),
-                )
-                return result
-
-            logger.warning(
-                "Group not formed after attempt %d/%d — retrying",
-                attempt,
-                _GROUP_MAX_ATTEMPTS,
-            )
-
-        raise RuntimeError(
-            f"Failed to form speaker group after {_GROUP_MAX_ATTEMPTS} "
-            f"attempts with {len(speaker_ids)} speakers"
+        return SpeakerGroup(
+            group_id=group.id,
+            name=group.name or "",
+            coordinator_id=group.coordinator_id or coord_id,
+            member_ids=list(group.player_ids),
         )
 
     async def ungroup_speakers(self, speaker_ids: list[str]) -> None:
-        changed = False
-        for sid in speaker_ids:
-            device = self._devices.get(sid)
-            if not device:
+        """Split each requested speaker into its own solo group."""
+        for pid in speaker_ids:
+            client = self._clients.get(pid)
+            if client is None:
                 continue
-            group = await asyncio.to_thread(lambda d=device: d.group)
-            if group and len(group.members) > 1:
-                await asyncio.to_thread(device.unjoin)
-                changed = True
-        if changed:
-            await asyncio.sleep(_GROUP_SETTLE_SECONDS)
-            logger.info("Ungrouped %d speakers", len(speaker_ids))
-
-    # --- Private grouping helpers ---
-
-    async def _check_group_state(
-        self,
-        speaker_ids: list[str],
-    ) -> SpeakerGroup | None:
-        """Check if the target speakers are already in the correct group.
-
-        Returns the SpeakerGroup if all target speakers are in the same
-        group with no extra members. Returns None otherwise.
-        """
-        target_set = set(speaker_ids)
-
-        def check() -> SpeakerGroup | None:
-            first = self._devices.get(speaker_ids[0])
-            if first is None:
-                return None
-            group = first.group
-            if group is None:
-                return None
-            group_uids = {_speaker_id(m) for m in group.members}
-            if group_uids == target_set:
-                return SpeakerGroup(
-                    group_id=group.uid,
-                    name=group.label,
-                    coordinator_id=_speaker_id(group.coordinator),
-                    member_ids=[_speaker_id(m) for m in group.members],
+            try:
+                await client.player.leave_group()
+            except FailedCommand:
+                logger.debug(
+                    "leave_group failed for %s", self._name_for(pid), exc_info=True
                 )
-            return None
 
-        return await asyncio.to_thread(check)
+    # ── Snapshot/restore — no-op under aiosonos ──────────────────────
 
-    async def _apply_group_changes(
-        self,
-        speaker_ids: list[str],
-        target_set: set[str],
-    ) -> None:
-        """Apply the minimal changes to form the desired group.
+    async def snapshot(self, speaker_ids: list[str]) -> None:
+        """No-op: the aiosonos ``audio_clip`` API self-restores.
 
-        Figures out which speakers need to be unjoined from other groups
-        and which need to join the coordinator. Avoids touching speakers
-        that are already correct.
+        Callers that still invoke ``snapshot``/``restore`` around an
+        announcement flow (notably ``SpeakerService.announce``) don't
+        need to change — they just become cheap no-ops. The proper
+        integration is to set ``PlayRequest.announce=True``, which
+        routes to ``player.play_audio_clip`` and handles duck+restore
+        natively.
         """
-        coordinator = _find_device(self._devices, speaker_ids[0])
 
-        def compute_changes() -> tuple[list[SoCo], list[SoCo]]:
-            """Returns (to_unjoin, to_join) lists."""
-            to_unjoin: list[SoCo] = []
-            to_join: list[SoCo] = []
-            coord_group = coordinator.group
-            coord_group_uids = (
-                {_speaker_id(m) for m in coord_group.members}
-                if coord_group
-                else {_speaker_id(coordinator)}
-            )
+    async def restore(self, speaker_ids: list[str]) -> None:
+        """See ``snapshot``."""
 
-            for sid in speaker_ids:
-                device = self._devices.get(sid)
-                if device is None:
-                    continue
-                if device is coordinator:
-                    # Coordinator: unjoin if it's in a group with
-                    # non-target members
-                    if coord_group and len(coord_group.members) > 1:
-                        extras = coord_group_uids - target_set
-                        if extras:
-                            # Unjoin the extras, not the coordinator
-                            for m in coord_group.members:
-                                mid = _speaker_id(m)
-                                if mid in extras:
-                                    to_unjoin.append(m)
-                    continue
-                # Non-coordinator: check if already in coordinator's group
-                if _speaker_id(device) in coord_group_uids:
-                    continue
-                # Needs to leave its current group and join ours
-                dev_group = device.group
-                if dev_group and len(dev_group.members) > 1:
-                    to_unjoin.append(device)
-                to_join.append(device)
+    # ── Helpers ──────────────────────────────────────────────────────
 
-            return to_unjoin, to_join
+    def _name_for(self, player_id: str) -> str:
+        meta = self._player_metadata.get(player_id)
+        return meta.name if meta else player_id
 
-        to_unjoin, to_join = await asyncio.to_thread(compute_changes)
 
-        # Unjoin speakers that are in wrong groups. One speaker refusing
-        # to leave its current group (rare, but happens when the speaker
-        # is mid-stream from a line-in source or in a weird transport
-        # state) shouldn't abort the entire operation — log which ones
-        # failed and press on with the rest.
-        if to_unjoin:
-            unjoin_results = await asyncio.gather(
-                *(asyncio.to_thread(d.unjoin) for d in to_unjoin),
-                return_exceptions=True,
-            )
-            unjoin_failed = [
-                (d, r) for d, r in zip(to_unjoin, unjoin_results, strict=True)
-                if isinstance(r, Exception)
-            ]
-            for device, exc in unjoin_failed:
-                logger.warning(
-                    "Sonos speaker '%s' refused to unjoin its current group "
-                    "(%s) — continuing without it",
-                    getattr(device, "player_name", "?"),
-                    exc,
-                )
-            await asyncio.sleep(_GROUP_SETTLE_SECONDS)
-            logger.debug(
-                "Unjoined %d/%d speakers from other groups",
-                len(to_unjoin) - len(unjoin_failed),
-                len(to_unjoin),
-            )
+# ── Spotify URI parsing ──────────────────────────────────────────────
 
-        # Join speakers to the coordinator. A speaker throwing UPnP 800
-        # ("Transition not available" — usually a non-idle transport
-        # state) shouldn't kill playback: the coordinator is already
-        # viable and any speakers that did join will still play. Even
-        # when *every* intended join fails we keep going — the
-        # coordinator itself can play the audio on its own, and if that
-        # too is broken ``play_uri`` below will surface a clearer error
-        # than re-raising here (which previously stopped playback even
-        # when the only "failed join" was a non-coordinator speaker
-        # that the coordinator didn't need).
-        if to_join:
-            join_results = await asyncio.gather(
-                *(asyncio.to_thread(d.join, coordinator) for d in to_join),
-                return_exceptions=True,
-            )
-            paired = list(zip(to_join, join_results, strict=True))
-            join_failed = [(d, r) for d, r in paired if isinstance(r, Exception)]
-            join_ok = [d for d, r in paired if not isinstance(r, Exception)]
-            for device, exc in join_failed:
-                logger.warning(
-                    "Sonos speaker '%s' refused to join %s's group (%s) — "
-                    "continuing without it",
-                    getattr(device, "player_name", "?"),
-                    coordinator.player_name,
-                    exc,
-                )
-            await asyncio.sleep(_GROUP_SETTLE_SECONDS)
-            logger.debug(
-                "Joined %d/%d speakers to coordinator",
-                len(join_ok),
-                len(to_join),
-            )
 
-    async def _poll_until_grouped(
-        self,
-        speaker_ids: list[str],
-        timeout: float,
-    ) -> SpeakerGroup | None:
-        """Poll until the target speakers are in the correct group.
+@dataclass
+class _SpotifyRef:
+    kind: str  # track | album | playlist | artist | episode | show
+    id: str
+    uri: str  # canonical ``spotify:<kind>:<id>``
 
-        Returns the SpeakerGroup if formed within timeout, None otherwise.
-        """
-        elapsed = 0.0
-        while elapsed < timeout:
-            await self._discover()
-            result = await self._check_group_state(speaker_ids)
-            if result:
-                return result
-            await asyncio.sleep(_GROUP_POLL_INTERVAL)
-            elapsed += _GROUP_POLL_INTERVAL
+
+# Spotify content-kind strings accepted by Sonos's ``playback.loadContent``.
+# Per docs.sonos.com/docs/playback-objects the ``type`` field uses
+# lowercase values (``track``, ``playlist``, ``album``, ``artist``,
+# ``episode``, ``show``). The aiosonos docstring shows uppercase — that's
+# stale; the local API returns a malformed-request error for uppercase.
+_SPOTIFY_KIND_TO_LOAD_TYPE: dict[str, str] = {
+    "track": "track",
+    "album": "album",
+    "playlist": "playlist",
+    "artist": "artist",
+    "episode": "episode",
+    "show": "show",
+}
+
+
+def _extract_spotify_ref(uri: str) -> _SpotifyRef | None:
+    """Detect a Spotify reference in ``uri``.
+
+    Accepts both the canonical ``spotify:track:…`` scheme and
+    ``https://open.spotify.com/track/…`` web URLs. Returns ``None``
+    when the URI is neither — caller should treat as a plain HTTP
+    stream.
+    """
+    if not uri:
         return None
+    stripped = uri.strip()
+    match = _SPOTIFY_URI_RE.match(stripped)
+    if match:
+        kind, obj_id = match.group(1), match.group(2)
+        return _SpotifyRef(kind=kind, id=obj_id, uri=stripped)
+    match = _SPOTIFY_OPEN_URL_RE.search(stripped)
+    if match:
+        kind, obj_id = match.group(1), match.group(2)
+        return _SpotifyRef(
+            kind=kind, id=obj_id, uri=f"spotify:{kind}:{obj_id}"
+        )
+    return None

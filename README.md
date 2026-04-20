@@ -41,7 +41,7 @@ The table below is an index — jump to each plugin's detail section for configu
 | [openrouter](#openrouter) | `AIBackend "openrouter"` | — (uses `httpx`) | Intelligence |
 | [qwen](#qwen) | `AIBackend "qwen"` | — (uses `httpx`) | Intelligence |
 | [slack](#slack) | `slack` service (Socket Mode bot) | `slack-bolt` | Communication |
-| [sonos](#sonos) | `SpeakerBackend "sonos"`, `MusicBackend "sonos"` | `soco` | Media |
+| [sonos](#sonos) | `SpeakerBackend "sonos"`, `MusicBackend "sonos"` | `aiosonos`, `zeroconf` | Media |
 | [tavily](#tavily) | `WebSearchBackend "tavily"` | — (uses `httpx`) | Intelligence |
 | [tesseract](#tesseract) | `OCRBackend "tesseract"` | `pytesseract` | Intelligence |
 | [unifi](#unifi) | `PresenceBackend "unifi"`, `DoorbellBackend "unifi"` | — (uses `httpx`/`aiohttp`) | Monitoring |
@@ -403,21 +403,30 @@ Slack signing secrets aren't needed — Socket Mode doesn't use HTTP webhooks, s
 
 ### sonos
 
-Sonos speaker control and Sonos-embedded music service discovery. Registers both a speaker backend (playback, volume, grouping, TTS announcements) and a music backend (Spotify via the SMAPI-linked service on the Sonos network).
+Sonos speaker control (S2 only) + Spotify-backed music search. Two backends registered by one plugin: speaker control uses the Sonos S2 local WebSocket API via `aiosonos`; music browse/search talks directly to Spotify's Web API via OAuth (playback still routes through the speaker's own linked Spotify account).
 
 **Backends registered**
-- `SpeakerBackend.backend_name = "sonos"` — handles `play_uri`, volume, grouping, snapshots/restore, now-playing.
-- `MusicBackend.backend_name = "sonos"` — browse and search the music services the user has linked via the Sonos app (Spotify, Apple Music, etc.).
+- `SpeakerBackend.backend_name = "sonos"` — playback, volume, grouping, TTS announcements (via native `audio_clip`), now-playing, Spotify URI handoff. Requires S2 firmware on every target speaker; run `scripts/check_sonos_s2.py` to verify before enabling.
+- `MusicBackend.backend_name = "sonos"` — Spotify search, user library, playlists via Spotify's Web API. Apple Music / Amazon Music / other services are NOT supported — they went away with the SMAPI drop.
 
 **Configure** (Settings → Media → Speakers / Music)
-- `preferred_service` — Preferred music service name when multiple are linked (e.g. `"Spotify"`).
-- `auth_token` / `auth_key` *(sensitive)* — Credentials for the Sonos-linked music service, captured by the link flow below.
+
+*Speaker backend* — no configuration needed beyond enabling it. Discovery happens via zeroconf (`_sonos._tcp.local.`) at startup.
+
+*Music backend* — requires a registered Spotify developer app (one-time; free at https://developer.spotify.com/dashboard):
+- `client_id` — Spotify app client ID.
+- `client_secret` *(sensitive)* — Spotify app client secret.
+- `redirect_uri` — Must match one of the redirect URIs registered on your Spotify app. Default `http://localhost:8888/callback` is fine — the endpoint doesn't need to actually respond; we parse the code from whatever the user pastes.
+- `refresh_token` *(sensitive)* — Auto-populated by the Link Spotify flow. Don't edit.
+- `spotify_auth_code` — Transient field used by the link flow; auto-cleared once tokens are issued.
+- Legacy fields (`preferred_service`, `auth_token`, `auth_key`) retained so existing configs don't fail validation but ignored by the new pipeline.
 
 **Config actions**
-- `test_connection` — Verifies the linked music service is reachable.
-- `link_spotify` / `link_spotify_complete` — Two-phase flow that walks the user through linking Spotify via the Sonos app so Gilbert can play tracks.
+- `test_connection` (speaker) — Reports how many S2 speakers responded to zeroconf.
+- `test_connection` (music) — Hits Spotify `/me` to verify the linked Spotify app + refresh token.
+- `link_spotify` → `link_spotify_complete` — Manual-paste OAuth flow. User clicks Link Spotify, gets an authorize URL, approves on Spotify, pastes the redirect URL into `spotify_auth_code`, saves, clicks Finish Linking. Gilbert exchanges the code for tokens and persists the refresh token.
 
-**Third-party deps**: `soco` (Sonos controller library).
+**Third-party deps**: `aiosonos` (S2 local WebSocket client), `zeroconf` (LAN discovery).
 
 ---
 
