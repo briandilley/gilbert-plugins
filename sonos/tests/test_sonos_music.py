@@ -310,3 +310,44 @@ async def test_link_complete_without_code_errors() -> None:
     result = await backend._action_link_complete({})
     assert result.status == "error"
     assert "authorization code" in result.message.lower()
+
+
+async def test_link_complete_reads_auth_code_from_saved_settings() -> None:
+    """The UI's ConfigAction invocation payload is empty — config
+    values live in the settings dict passed to ``initialize``, which
+    MusicService re-runs after each save. The backend has to cache the
+    ``spotify_auth_code`` at init time and pick it up from there on
+    the next link_complete click; pulling from the empty payload alone
+    would always error."""
+    from unittest.mock import AsyncMock
+
+    backend = SonosMusic()
+    await backend.initialize(
+        {
+            "client_id": "cid",
+            "client_secret": "csec",
+            # The redirect URL the user pasted after approving; the
+            # manual-paste flow runs it through _extract_auth_code.
+            "spotify_auth_code": (
+                "http://127.0.0.1:8000/callback?code=AQXYZ&state=abc"
+            ),
+        }
+    )
+
+    # Stub out the token exchange so we don't actually hit Spotify;
+    # we just want to confirm the extracted code gets handed in.
+    backend._spotify.exchange_code = AsyncMock()  # type: ignore[method-assign]
+    backend._spotify._refresh_token = "refreshed"  # type: ignore[attr-defined]
+
+    # Empty action payload — the normal case from the UI.
+    result = await backend._action_link_complete({})
+
+    assert result.status == "ok"
+    backend._spotify.exchange_code.assert_awaited_once()
+    # Code was extracted from the URL stored in settings.
+    called_code = backend._spotify.exchange_code.call_args.args[0]
+    assert called_code == "AQXYZ"
+    # Result should persist the refresh token + clear the paste field.
+    persist = result.data["persist"]
+    assert persist["settings.refresh_token"] == "refreshed"
+    assert persist["settings.spotify_auth_code"] == ""

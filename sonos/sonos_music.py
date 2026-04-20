@@ -536,6 +536,16 @@ class SonosMusic(MusicBackend, LinkedMusicServiceLister):
         # link_spotify_complete. Persists a nonce for CSRF validation of
         # the ``state`` round-trip.
         self._pending_state: str = ""
+        # Cached copy of the ``spotify_auth_code`` settings field. Gets
+        # refreshed every time ``initialize`` runs, which (per
+        # MusicService.on_config_changed) happens after each settings
+        # save — so when the user pastes the code + saves, the next
+        # click on Finish Linking sees the latest value. Stored
+        # separately because ConfigAction invocations don't carry
+        # config values in their payload; without this the
+        # link_spotify_complete handler would have nowhere to pull the
+        # code from.
+        self._auth_code_cache: str = ""
 
     # ── Lifecycle ────────────────────────────────────────────────────
 
@@ -546,6 +556,7 @@ class SonosMusic(MusicBackend, LinkedMusicServiceLister):
             config.get("redirect_uri") or "https://127.0.0.1:8000/callback"
         )
         self._refresh_token = str(config.get("refresh_token") or "")
+        self._auth_code_cache = str(config.get("spotify_auth_code") or "")
 
         if self._client_id and self._client_secret:
             self._spotify = _SpotifyClient(
@@ -728,10 +739,14 @@ class SonosMusic(MusicBackend, LinkedMusicServiceLister):
                     "No link flow in progress. Click Link Spotify to start."
                 ),
             )
-        # The auth code comes from the saved settings via the ``payload``
-        # ConfigurationService passes in. Both full-URL pastes and bare
-        # codes are handled by _extract_auth_code.
-        raw = str(
+        # The auth code comes from the ``spotify_auth_code`` settings
+        # field after the user saved it. ``MusicService.on_config_changed``
+        # re-runs ``initialize`` on save, which refreshes our cached
+        # copy. ConfigAction payloads from the UI are empty (they only
+        # carry the action ``key`` / ``backend``), so we can't get the
+        # code from there. Also fall back to ``payload`` for any future
+        # caller that *does* include the value inline.
+        raw = self._auth_code_cache or str(
             payload.get("settings.spotify_auth_code")
             or payload.get("spotify_auth_code")
             or ""
