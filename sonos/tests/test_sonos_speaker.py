@@ -216,6 +216,61 @@ async def test_http_uri_uses_play_stream_url() -> None:
     assert isinstance(metadata["name"], str) and metadata["name"]
 
 
+async def test_play_retries_once_on_group_coordinator_changed() -> None:
+    """Sonos returns ``FailedCommand: groupCoordinatorChanged`` when
+    our local ``SonosGroup`` reference is stale right after a
+    ``set_group_members`` reshuffle. The WebSocket topology event
+    catches up within a few hundred ms; one retry with a fresh group
+    from the client settles it. This test locks in that retry — a
+    regression would surface as a one-off ``FailedCommand`` that the
+    user couldn't recover from without clicking play again."""
+    from aiosonos.exceptions import FailedCommand
+
+    backend, client, _player, group = _make_backend_with_mock_speaker()
+    # First call: Sonos reports coordinator changed. Second call:
+    # succeeds. Same mock — we swap the side_effect between calls.
+    call_count = {"n": 0}
+
+    async def flaky_play_stream_url(url: str, metadata: dict) -> None:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise FailedCommand("Command failed: groupCoordinatorChanged")
+
+    group.play_stream_url = flaky_play_stream_url  # type: ignore[assignment]
+
+    await backend.play_uri(
+        PlayRequest(
+            uri="http://gilbert/song.mp3",
+            speaker_ids=["RINCON_COORD"],
+        )
+    )
+
+    # Exactly two invocations — first failed, retry succeeded.
+    assert call_count["n"] == 2
+
+
+async def test_play_reraises_unrelated_failed_command() -> None:
+    """Only ``groupCoordinatorChanged`` is retried — any other
+    ``FailedCommand`` reason is a real error and should surface
+    immediately."""
+    from aiosonos.exceptions import FailedCommand
+
+    backend, _client, _player, group = _make_backend_with_mock_speaker()
+    group.play_stream_url = AsyncMock(
+        side_effect=FailedCommand("Command failed: something else entirely")
+    )
+
+    with pytest.raises(FailedCommand, match="something else"):
+        await backend.play_uri(
+            PlayRequest(
+                uri="http://gilbert/song.mp3",
+                speaker_ids=["RINCON_COORD"],
+            )
+        )
+    # Should not have retried.
+    group.play_stream_url.assert_awaited_once()
+
+
 async def test_http_uri_applies_volume_before_play() -> None:
     backend, _client, player, group = _make_backend_with_mock_speaker()
 

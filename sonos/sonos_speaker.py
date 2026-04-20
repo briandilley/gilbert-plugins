@@ -593,11 +593,6 @@ class SonosSpeaker(SpeakerBackend):
         # rodeo, no UPnP 800 retry logic.
         coord_player_id = await self._ensure_group(live)
         coord_client = self._clients[coord_player_id]
-        group = coord_client.player.group
-        if group is None:
-            raise RuntimeError(
-                f"Coordinator speaker {coord_player_id} has no active group"
-            )
 
         # Set volume across the group before loading content so the
         # playback opens at the intended level (Sonos will apply the
@@ -608,8 +603,11 @@ class SonosSpeaker(SpeakerBackend):
 
         spotify = _extract_spotify_ref(request.uri)
         if spotify is not None:
-            await self._load_spotify_content(
-                coord_client, group.id, spotify, request.title
+            await self._play_with_topology_retry(
+                coord_client,
+                lambda group: self._load_spotify_content(
+                    coord_client, group.id, spotify, request.title
+                ),
             )
             return
 
@@ -625,7 +623,48 @@ class SonosSpeaker(SpeakerBackend):
             "name": request.title or "Gilbert audio",
             "type": "station",
         }
-        await group.play_stream_url(request.uri, metadata)
+        await self._play_with_topology_retry(
+            coord_client,
+            lambda group: group.play_stream_url(request.uri, metadata),
+        )
+
+    async def _play_with_topology_retry(
+        self,
+        coord_client: SonosLocalApiClient,
+        play: Any,
+    ) -> None:
+        """Invoke a play operation, retrying once on a group-topology race.
+
+        Sonos returns ``FailedCommand: groupCoordinatorChanged`` when
+        the local ``SonosGroup`` reference has gone stale — typically
+        right after ``set_group_members`` reshuffles and before the
+        WebSocket topology event has updated our side. Brief wait +
+        re-fetch of the current group + one retry handles the race
+        without adding a blanket sleep to every play call.
+
+        The ``play`` callable receives the current ``SonosGroup``
+        instance and is responsible for executing the actual playback
+        command (``play_stream_url``, ``load_content``, etc.).
+        """
+        group = coord_client.player.group
+        if group is None:
+            raise RuntimeError(
+                f"Coordinator speaker {coord_client.player_id} has no active group"
+            )
+        try:
+            await play(group)
+        except FailedCommand as exc:
+            if "groupCoordinatorChanged" not in str(exc):
+                raise
+            logger.debug(
+                "Sonos reported groupCoordinatorChanged on play — "
+                "waiting for topology to settle, then retrying once"
+            )
+            await asyncio.sleep(0.5)
+            group = coord_client.player.group
+            if group is None:
+                raise
+            await play(group)
 
     async def _load_spotify_content(
         self,
