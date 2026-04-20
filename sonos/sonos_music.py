@@ -722,7 +722,10 @@ class SonosMusic(MusicBackend, LinkedMusicServiceLister):
                 "— which probably shows an error page. That's fine. "
                 "3) Copy the *entire* URL from the browser's address bar "
                 "(or just the ``?code=…`` part) into Spotify Auth Code "
-                "below, save, then click Finish Linking."
+                "below. "
+                "4) Click SAVE (important — without saving, the paste "
+                "field doesn't reach the backend). "
+                "5) Click Finish Linking."
             ),
             open_url=url,
             followup_action="link_spotify_complete",
@@ -732,6 +735,13 @@ class SonosMusic(MusicBackend, LinkedMusicServiceLister):
         self,
         payload: dict[str, Any],
     ) -> ConfigActionResult:
+        logger.info(
+            "Spotify link_complete invoked: payload_keys=%s "
+            "auth_code_cache_len=%d refresh_token_present=%s",
+            list(payload.keys()),
+            len(self._auth_code_cache or ""),
+            bool(self._refresh_token),
+        )
         if self._spotify is None:
             return ConfigActionResult(
                 status="error",
@@ -756,9 +766,13 @@ class SonosMusic(MusicBackend, LinkedMusicServiceLister):
             return ConfigActionResult(
                 status="error",
                 message=(
-                    "No authorization code found. Paste the full redirect "
-                    "URL (or just the ``?code=…`` part) into Spotify Auth "
-                    "Code, save, then click Finish Linking."
+                    "No authorization code found in Spotify Auth Code. "
+                    "Did you click SAVE first? The paste field has to be "
+                    "saved before clicking Finish Linking — otherwise "
+                    "the code never reaches the backend. Paste the "
+                    "redirect URL (or just the ``?code=…`` part) into "
+                    "Spotify Auth Code, click Save, *then* click Finish "
+                    "Linking."
                 ),
             )
         try:
