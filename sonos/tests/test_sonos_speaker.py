@@ -127,12 +127,51 @@ def _make_backend_with_mock_speaker(
     client.groups = [group]
     client.create_group = AsyncMock()
     client.disconnect = AsyncMock()
-    # Mid-retry force-refresh of the groups cache goes through
-    # ``client.api.groups.get_groups`` — give it an AsyncMock so it
-    # completes cleanly without perturbing mock state.
+    # The dispatch path hits the low-level api namespaces directly:
+    # - ``api.groups.modify_group_members`` / ``api.groups.create_group``
+    #   return a ``GroupInfo`` dict whose ``group.id`` is the
+    #   authoritative new group id (bypasses the cache race that
+    #   motivated the rewrite).
+    # - ``api.playback_session.create_session`` + ``load_stream_url``
+    #   replace the ``SonosGroup.play_stream_url`` wrapper so we don't
+    #   read ``self.id`` from a cached (potentially stale) group.
     client.api = MagicMock()
     client.api.groups = MagicMock()
     client.api.groups.get_groups = AsyncMock()
+    client.api.groups.modify_group_members = AsyncMock(
+        return_value={
+            "_objectType": "groupInfo",
+            "group": {
+                "_objectType": "group",
+                "id": group.id,
+                "name": group.name,
+                "coordinatorId": player_id,
+                "playerIds": list(group.player_ids),
+            },
+        }
+    )
+    client.api.groups.create_group = AsyncMock(
+        return_value={
+            "_objectType": "groupInfo",
+            "group": {
+                "_objectType": "group",
+                "id": group.id,
+                "name": group.name,
+                "coordinatorId": player_id,
+                "playerIds": list(group.player_ids),
+            },
+        }
+    )
+    client.api.playback_session = MagicMock()
+    client.api.playback_session.create_session = AsyncMock(
+        return_value={"sessionId": "session-1"}
+    )
+    client.api.playback_session.load_stream_url = AsyncMock()
+    client.api.playback = MagicMock()
+    client.api.playback.load_content = AsyncMock()
+    # subscribe() needs to return an unsubscribe callable for
+    # _wait_for_group's subscription teardown path.
+    client.subscribe = MagicMock(return_value=lambda: None)
 
     backend._clients[player_id] = client
     backend._player_metadata[player_id] = _PlayerMetadata(
@@ -208,8 +247,12 @@ async def test_announce_with_multiple_speakers_parallelizes() -> None:
 # ── Plain HTTP URIs route to play_stream_url ─────────────────────────
 
 
-async def test_http_uri_uses_play_stream_url() -> None:
-    backend, _client, _player, group = _make_backend_with_mock_speaker()
+async def test_http_uri_uses_playback_session_api() -> None:
+    """HTTP(S) stream URLs go through the low-level playback_session API
+    with the authoritative group id Sonos returned from the preceding
+    ``modifyGroupMembers`` call — NOT through ``SonosGroup.play_stream_url``,
+    which reads the group id from a cached object that can go stale."""
+    backend, client, _player, _group = _make_backend_with_mock_speaker()
 
     await backend.play_uri(
         PlayRequest(
@@ -218,39 +261,47 @@ async def test_http_uri_uses_play_stream_url() -> None:
         )
     )
 
-    group.play_stream_url.assert_awaited_once()
-    args = group.play_stream_url.call_args.args
-    # aiosonos's ``play_stream_url`` takes (url, metadata: Container).
-    # Metadata is a minimal station-type Container so Sonos has a
-    # "now playing" title while the HTTP stream plays.
-    assert args[0] == "http://gilbert/api/share/song.mp3"
-    metadata = args[1]
+    client.api.playback_session.create_session.assert_awaited_once()
+    create_kwargs = client.api.playback_session.create_session.call_args.kwargs
+    create_args = client.api.playback_session.create_session.call_args.args
+    # create_session(group_id, app_id=..., app_context=...) — first
+    # positional arg is the authoritative group id.
+    assert create_args[0] == "group-1"
+    assert create_kwargs.get("app_id")
+    assert create_kwargs.get("app_context") == "1"
+
+    client.api.playback_session.load_stream_url.assert_awaited_once()
+    load_kwargs = client.api.playback_session.load_stream_url.call_args.kwargs
+    assert load_kwargs["session_id"] == "session-1"
+    assert load_kwargs["stream_url"] == "http://gilbert/api/share/song.mp3"
+    assert load_kwargs["play_on_completion"] is True
+    metadata = load_kwargs["station_metadata"]
     assert metadata["_objectType"] == "container"
     assert metadata["type"] == "station"
     assert isinstance(metadata["name"], str) and metadata["name"]
 
 
-async def test_play_retries_once_on_group_coordinator_changed() -> None:
-    """Sonos returns ``FailedCommand: groupCoordinatorChanged`` when
-    our local ``SonosGroup`` reference is stale right after a
-    ``set_group_members`` reshuffle. The WebSocket topology event
-    catches up within a few hundred ms; one retry with a fresh group
-    from the client settles it. This test locks in that retry — a
-    regression would surface as a one-off ``FailedCommand`` that the
-    user couldn't recover from without clicking play again."""
+async def test_play_retries_on_group_coordinator_changed() -> None:
+    """Even though we use the authoritative group id from Sonos's
+    ``modifyGroupMembers`` response, another controller (Sonos mobile
+    app, a family member) can still reshuffle between our modify and
+    our ``create_session`` call. On that race we re-run the full
+    dispatch — including a fresh ``_ensure_group`` — so the next
+    attempt gets a freshly-captured authoritative id."""
     from aiosonos.exceptions import FailedCommand
 
-    backend, client, _player, group = _make_backend_with_mock_speaker()
-    # First call: Sonos reports coordinator changed. Second call:
-    # succeeds. Same mock — we swap the side_effect between calls.
+    backend, client, _player, _group = _make_backend_with_mock_speaker()
     call_count = {"n": 0}
 
-    async def flaky_play_stream_url(url: str, metadata: dict) -> None:
+    async def flaky_create_session(group_id: str, **_kwargs: object) -> dict:
         call_count["n"] += 1
         if call_count["n"] == 1:
             raise FailedCommand("Command failed: groupCoordinatorChanged")
+        return {"sessionId": "session-2"}
 
-    group.play_stream_url = flaky_play_stream_url  # type: ignore[assignment]
+    client.api.playback_session.create_session = (
+        flaky_create_session  # type: ignore[assignment]
+    )
 
     await backend.play_uri(
         PlayRequest(
@@ -259,7 +310,6 @@ async def test_play_retries_once_on_group_coordinator_changed() -> None:
         )
     )
 
-    # Exactly two invocations — first failed, retry succeeded.
     assert call_count["n"] == 2
 
 
@@ -269,8 +319,8 @@ async def test_play_reraises_unrelated_failed_command() -> None:
     immediately."""
     from aiosonos.exceptions import FailedCommand
 
-    backend, _client, _player, group = _make_backend_with_mock_speaker()
-    group.play_stream_url = AsyncMock(
+    backend, client, _player, _group = _make_backend_with_mock_speaker()
+    client.api.playback_session.create_session = AsyncMock(
         side_effect=FailedCommand("Command failed: something else entirely")
     )
 
@@ -281,36 +331,34 @@ async def test_play_reraises_unrelated_failed_command() -> None:
                 speaker_ids=["RINCON_COORD"],
             )
         )
-    # Should not have retried.
-    group.play_stream_url.assert_awaited_once()
+    client.api.playback_session.create_session.assert_awaited_once()
 
 
 async def test_play_eventually_raises_when_topology_never_settles(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """If Sonos keeps returning ``groupCoordinatorChanged`` across all
-    retries (topology never settles in our window), surface the last
-    error rather than hanging forever or swallowing silently."""
+    retries (topology never settles), surface the last error rather
+    than hanging forever."""
     import asyncio as _asyncio
 
     from aiosonos.exceptions import FailedCommand
 
-    # Patch sleep to no-op so the test doesn't wait 3.5s.
     async def _no_sleep(_seconds: float) -> None:
         return None
 
     monkeypatch.setattr(_asyncio, "sleep", _no_sleep)
 
-    backend, _client, _player, group = _make_backend_with_mock_speaker()
+    backend, client, _player, _group = _make_backend_with_mock_speaker()
     call_count = {"n": 0}
 
-    async def always_fail(url: str, metadata: dict) -> None:
+    async def always_fail(_group_id: str, **_kwargs: object) -> dict:
         call_count["n"] += 1
-        raise FailedCommand(
-            "Command failed: groupCoordinatorChanged"
-        )
+        raise FailedCommand("Command failed: groupCoordinatorChanged")
 
-    group.play_stream_url = always_fail  # type: ignore[assignment]
+    client.api.playback_session.create_session = (
+        always_fail  # type: ignore[assignment]
+    )
 
     with pytest.raises(FailedCommand, match="groupCoordinatorChanged"):
         await backend.play_uri(
@@ -319,15 +367,16 @@ async def test_play_eventually_raises_when_topology_never_settles(
                 speaker_ids=["RINCON_COORD"],
             )
         )
-    # 1 initial + 4 retries = 5 attempts before giving up. We run the
-    # loop this long because aiosonos push-event latency on a busy
-    # household runs up to 2–3s; anything shorter and we'd fail before
-    # the topology event catches up on the worst-case reshuffle.
-    assert call_count["n"] == 5
+    # 1 initial + 2 retries = 3 dispatch attempts. We keep the retry
+    # short because with the authoritative-id design each retry is
+    # wall-clock expensive (it re-runs modify_group_members) and the
+    # race it defends against is a cross-controller reshuffle, which
+    # shouldn't benefit from many retries in quick succession.
+    assert call_count["n"] == 3
 
 
 async def test_http_uri_applies_volume_before_play() -> None:
-    backend, _client, player, group = _make_backend_with_mock_speaker()
+    backend, client, player, _group = _make_backend_with_mock_speaker()
 
     await backend.play_uri(
         PlayRequest(
@@ -338,7 +387,7 @@ async def test_http_uri_applies_volume_before_play() -> None:
     )
 
     player.set_volume.assert_awaited_once_with(55)
-    group.play_stream_url.assert_awaited_once()
+    client.api.playback_session.create_session.assert_awaited_once()
 
 
 async def test_http_uri_clamps_volume_to_valid_range() -> None:
@@ -360,14 +409,12 @@ async def test_http_uri_clamps_volume_to_valid_range() -> None:
 
 async def test_spotify_uri_uses_load_content() -> None:
     """Spotify URIs go through ``playback.load_content`` with a
-    MetadataId pointing at the speaker's linked Spotify account.
+    MetadataId pointing at the speaker's linked Spotify account,
+    using the authoritative group id from ``_ensure_group``.
     ``accountId`` is intentionally omitted — Sonos resolves the
     default linked Spotify account on the household, which is the
     correct behaviour for single-account setups."""
     backend, client, _player, group = _make_backend_with_mock_speaker()
-    client.api = MagicMock()
-    client.api.playback = MagicMock()
-    client.api.playback.load_content = AsyncMock()
 
     await backend.play_uri(
         PlayRequest(
@@ -387,8 +434,8 @@ async def test_spotify_uri_uses_load_content() -> None:
     assert content["id"]["serviceId"] == "9"
     assert content["id"]["objectId"] == "spotify:track:3w0pyHgJJW9JN0cJxmi33Z"
     assert content["playbackAction"] == "PLAY"
-    # No stream_url call for Spotify content.
-    group.play_stream_url.assert_not_awaited()
+    # Spotify path does not go through the stream-URL session API.
+    client.api.playback_session.load_stream_url.assert_not_awaited()
 
 
 async def test_spotify_playlist_uses_playlist_type() -> None:
@@ -396,9 +443,6 @@ async def test_spotify_playlist_uses_playlist_type() -> None:
     URI must produce ``"playlist"`` not ``"track"``. Wrong type =
     Sonos plays nothing."""
     backend, client, _player, _group = _make_backend_with_mock_speaker()
-    client.api = MagicMock()
-    client.api.playback = MagicMock()
-    client.api.playback.load_content = AsyncMock()
 
     await backend.play_uri(
         PlayRequest(
@@ -417,7 +461,7 @@ async def test_spotify_playlist_uses_playlist_type() -> None:
 
 async def test_ensure_group_noop_when_membership_matches() -> None:
     """If the coordinator's group already contains exactly the target
-    members, ``set_group_members`` shouldn't be called — avoiding an
+    members, ``modify_group_members`` shouldn't be called — avoiding an
     unnecessary WebSocket round-trip that would briefly drop playback."""
     group = MagicMock()
     group.id = "group-1"
@@ -425,10 +469,8 @@ async def test_ensure_group_noop_when_membership_matches() -> None:
     group.player_ids = ["RINCON_A", "RINCON_B"]
     group.coordinator_id = "RINCON_A"
     group.playback_state = "PLAYBACK_STATE_IDLE"
-    group.set_group_members = AsyncMock()
-    group.play_stream_url = AsyncMock()
 
-    backend, _client, _player, _g = _make_backend_with_mock_speaker(
+    backend, client, _player, _g = _make_backend_with_mock_speaker(
         player_id="RINCON_A",
         group_in=group,
     )
@@ -443,6 +485,7 @@ async def test_ensure_group_noop_when_membership_matches() -> None:
     b_player.group = group
     b_client = MagicMock()
     b_client.player = b_player
+    b_client.groups = [group]
     backend._clients["RINCON_B"] = b_client
 
     await backend.play_uri(
@@ -452,22 +495,23 @@ async def test_ensure_group_noop_when_membership_matches() -> None:
         )
     )
 
-    group.set_group_members.assert_not_awaited()
-    group.play_stream_url.assert_awaited_once()
+    client.api.groups.modify_group_members.assert_not_awaited()
+    client.api.playback_session.create_session.assert_awaited_once()
 
 
 async def test_ensure_group_reforms_when_membership_differs() -> None:
     """If the target set doesn't match the coordinator's current group,
-    ``set_group_members`` gets called once with the desired list."""
+    ``modify_group_members`` gets called once with the diff of players
+    to add and remove. We prefer ``modifyGroupMembers`` over
+    ``setGroupMembers`` because the latter empirically triggers more
+    aggressive coordinator election (the MA lesson learned)."""
     group = MagicMock()
     group.id = "group-1"
     group.player_ids = ["RINCON_A"]
     group.coordinator_id = "RINCON_A"
     group.playback_state = "PLAYBACK_STATE_IDLE"
-    group.set_group_members = AsyncMock()
-    group.play_stream_url = AsyncMock()
 
-    backend, _c, _p, _g = _make_backend_with_mock_speaker(
+    backend, client, _p, _g = _make_backend_with_mock_speaker(
         player_id="RINCON_A",
         group_in=group,
     )
@@ -480,6 +524,7 @@ async def test_ensure_group_reforms_when_membership_differs() -> None:
     )
     b_client = MagicMock()
     b_client.player = MagicMock(group=group)
+    b_client.groups = [group]
     backend._clients["RINCON_B"] = b_client
 
     await backend.play_uri(
@@ -489,7 +534,13 @@ async def test_ensure_group_reforms_when_membership_differs() -> None:
         )
     )
 
-    group.set_group_members.assert_awaited_once_with(["RINCON_A", "RINCON_B"])
+    client.api.groups.modify_group_members.assert_awaited_once()
+    call_kwargs = client.api.groups.modify_group_members.call_args.kwargs
+    call_args = client.api.groups.modify_group_members.call_args.args
+    # First positional is the current group id; add/remove come as kwargs.
+    assert call_args[0] == "group-1"
+    assert call_kwargs["player_ids_to_add"] == ["RINCON_B"]
+    assert call_kwargs["player_ids_to_remove"] == []
 
 
 # ── Snapshot/restore are no-ops ──────────────────────────────────────
@@ -574,7 +625,7 @@ def test_backend_name() -> None:
 async def test_duplicate_target_ids_deduped_before_sonos() -> None:
     """Callers sometimes produce lists with the same player_id twice
     (e.g. a speaker addressed by both its real name and an alias).
-    Sonos rejects ``set_group_members`` with "Effective set of new
+    Sonos rejects the topology command with "Effective set of new
     group members has repeated player id" — the backend must dedupe
     before forwarding."""
     group = MagicMock()
@@ -582,10 +633,8 @@ async def test_duplicate_target_ids_deduped_before_sonos() -> None:
     group.player_ids = ["RINCON_A"]
     group.coordinator_id = "RINCON_A"
     group.playback_state = "PLAYBACK_STATE_IDLE"
-    group.set_group_members = AsyncMock()
-    group.play_stream_url = AsyncMock()
 
-    backend, _c, _p, _g = _make_backend_with_mock_speaker(
+    backend, client, _p, _g = _make_backend_with_mock_speaker(
         player_id="RINCON_A",
         group_in=group,
     )
@@ -598,6 +647,7 @@ async def test_duplicate_target_ids_deduped_before_sonos() -> None:
     )
     b_client = MagicMock()
     b_client.player = MagicMock(group=group)
+    b_client.groups = [group]
     backend._clients["RINCON_B"] = b_client
 
     await backend.play_uri(
@@ -608,9 +658,10 @@ async def test_duplicate_target_ids_deduped_before_sonos() -> None:
         )
     )
 
-    # The list forwarded to Sonos contains each player_id exactly once.
-    forwarded = group.set_group_members.call_args.args[0]
-    assert forwarded == ["RINCON_A", "RINCON_B"]
+    # Each player_id appears at most once in the modify diff.
+    kwargs = client.api.groups.modify_group_members.call_args.kwargs
+    assert kwargs["player_ids_to_add"] == ["RINCON_B"]
+    assert kwargs["player_ids_to_remove"] == []
 
 
 async def test_duplicate_announce_target_ids_deduped() -> None:

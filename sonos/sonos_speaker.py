@@ -29,11 +29,13 @@ import aiohttp
 import httpx
 from aiosonos import SonosLocalApiClient
 from aiosonos.api.models import (
+    Container,
     LoadContentRequest,
     MetadataId,
     MusicService as AioMusicService,
     PlayBackState,
 )
+from aiosonos.const import EventType
 from aiosonos.exceptions import (
     CannotConnect,
     ConnectionClosed,
@@ -64,6 +66,13 @@ _SONOS_SERVICE_TYPE = "_sonos._tcp.local."
 _DISCOVERY_SETTLE_SECONDS = 3.0
 _CONNECT_TIMEOUT = 10.0
 _INFO_PROBE_TIMEOUT = 5.0
+
+# Upper bound on how long we'll wait for the Sonos household to
+# converge on a new topology after we issue ``modifyGroupMembers``.
+# Push events on a healthy LAN arrive in 300ms–2s; a 10s ceiling is
+# generous enough to cover a slow/busy household without hanging a
+# user-facing play call forever.
+_TOPOLOGY_SETTLE_TIMEOUT = 10.0
 
 # Spotify URIs as they appear in MusicItem.uri: ``spotify:track:abc123``
 # etc. We route these to ``playback.load_content`` with a Spotify
@@ -550,16 +559,12 @@ class SonosSpeaker(SpeakerBackend):
 
         - ``request.announce=True`` → ``player.play_audio_clip``. Native
           duck-and-restore on the speaker; ideal for TTS.
-        - HTTP(S) URL → ``group.play_stream_url``. Sonos probes the
-          URL's Content-Type and picks the right decoder.
-        - ``spotify:…`` URI or ``open.spotify.com`` link → raises
-          ``NotImplementedError``. Spotify playback via the local API
-          requires a ``MetadataId`` with an ``accountId`` discovered
-          from the speaker's linked-services list — that lookup lives
-          in the music backend (Phase 2 of the aiosonos migration), not
-          here. Callers should route Spotify content through
-          ``MusicService.play`` / ``MusicBackend.resolve_playable``
-          rather than ``SpeakerService.play_on_speakers``.
+        - HTTP(S) URL → ``playback_session.create_session`` +
+          ``load_stream_url`` against the authoritative group id returned
+          by the preceding topology change. Sonos probes the URL's
+          Content-Type and picks the right decoder.
+        - ``spotify:…`` URI or ``open.spotify.com`` link →
+          ``playback.load_content`` with a Spotify ``MetadataId``.
         """
         target_ids = request.speaker_ids or list(self._player_metadata.keys())
         if not target_ids:
@@ -569,7 +574,7 @@ class SonosSpeaker(SpeakerBackend):
         # to play — otherwise we get misleading KeyErrors. Dedupe while
         # preserving order: callers sometimes pass the same player_id
         # twice (e.g. a speaker resolved via both its real name and an
-        # alias), and Sonos rejects ``set_group_members`` with
+        # alias), and Sonos rejects ``modifyGroupMembers`` with
         # "Effective set of new group members has repeated player id"
         # if duplicates survive that far.
         seen: set[str] = set()
@@ -588,128 +593,90 @@ class SonosSpeaker(SpeakerBackend):
             await self._play_audio_clip(live, request)
             return
 
-        # Form a group if needed. aiosonos's declarative model: just
-        # ask for exactly these players in a group. No join/unjoin
-        # rodeo, no UPnP 800 retry logic.
-        coord_player_id = await self._ensure_group(live)
-        coord_client = self._clients[coord_player_id]
-
-        # Set volume across the group before loading content so the
-        # playback opens at the intended level (Sonos will apply the
-        # volume to the next buffer, which is usually fast enough that
-        # nobody hears the wrong level).
-        if request.volume is not None:
-            await self._set_group_volume(live, request.volume)
-
-        spotify = _extract_spotify_ref(request.uri)
-        if spotify is not None:
-            await self._play_with_topology_retry(
-                coord_client,
-                lambda group: self._load_spotify_content(
-                    coord_client, group.id, spotify, request.title
-                ),
-            )
-            return
-
-        # Generic HTTP(S) stream — let Sonos probe the URL and pick.
-        # ``group.play_stream_url`` requires a Container metadata object
-        # (it calls ``load_stream_url(station_metadata=...)`` under the
-        # hood with ``play_on_completion=True``). Build a minimal
-        # station-type Container; Sonos uses ``name`` for its "now
-        # playing" string and derives everything else from the HTTP
-        # response headers.
-        metadata: dict[str, Any] = {
-            "_objectType": "container",
-            "name": request.title or "Gilbert audio",
-            "type": "station",
-        }
-        await self._play_with_topology_retry(
-            coord_client,
-            lambda group: group.play_stream_url(request.uri, metadata),
-        )
-
-    async def _play_with_topology_retry(
-        self,
-        coord_client: SonosLocalApiClient,
-        play: Any,
-    ) -> None:
-        """Invoke a play operation, retrying on a group-topology race.
-
-        Sonos returns ``FailedCommand: groupCoordinatorChanged`` when
-        the ``SonosGroup`` reference has gone stale — typically right
-        after ``set_group_members`` / ``leave_group`` reshuffles the
-        topology, during the window before the WebSocket topology
-        event has updated our side. aiosonos push-event latency
-        empirically runs 300ms–2s on a busy household, so a single
-        retry isn't enough: we retry up to 4 times with backoff
-        (0.5s, 1.0s, 2.0s, 3.0s).
-
-        Crucially, we do NOT read ``coord_client.player.group`` each
-        retry — that reference is updated by
-        ``SonosPlayer.check_active_group``, which only fires on *that
-        player's* own data updates, not on every household-level
-        topology event. Meanwhile ``client._groups`` is refreshed on
-        every push event. So we look the fresh group up from
-        ``client.groups`` (via ``_current_group_for_player``) and, on
-        each retry, also force-pull the household topology via
-        ``api.groups.get_groups(household_id)`` to make sure the
-        cache is as fresh as Sonos's own state.
-
-        The ``play`` callable receives the current ``SonosGroup``
-        instance and is responsible for executing the actual playback
-        command (``play_stream_url``, ``load_content``, etc.). Any
-        ``FailedCommand`` with a reason *other than*
-        ``groupCoordinatorChanged`` re-raises immediately — blanket-
-        retrying all FailedCommands would swallow legitimate errors
-        (invalid track id, missing permissions, …).
-        """
-        backoffs = [0.5, 1.0, 2.0, 3.0]
+        # The play path reshapes topology (if needed) and immediately
+        # issues the playback command against the *authoritative* group
+        # id returned by Sonos in the topology-change response —
+        # ``modifyGroupMembers`` / ``createGroup`` return a ``GroupInfo``
+        # whose ``group.id`` reflects whatever the server actually
+        # settled on, coordinator election and all. This sidesteps the
+        # cache race that made ``groupCoordinatorChanged`` persistent
+        # with the old ``SonosGroup.play_stream_url`` wrapper (which
+        # reads ``self.id`` from a potentially-stale cached object).
+        #
+        # A bounded retry still guards the edge case where another
+        # controller (Sonos mobile app, a human walking into the
+        # kitchen) reshuffles the household between our modify call and
+        # our create_session call — rare, but real.
+        backoffs = [0.5, 1.5]
         last_exc: FailedCommand | None = None
-        coord_player_id = coord_client.player_id
-        household_id = coord_client.household_id
         for attempt, backoff in enumerate([0.0, *backoffs]):
             if backoff > 0:
                 await asyncio.sleep(backoff)
-                # Force-pull the groups cache directly from the
-                # speaker so we don't have to wait on the push-event
-                # path to close the race. get_groups returns the raw
-                # dict; the subscription we registered in
-                # start_listening processes it into our cache.
-                try:
-                    await coord_client.api.groups.get_groups(household_id)
-                except Exception:  # noqa: BLE001 - diagnostic-only
-                    logger.debug(
-                        "Sonos get_groups force-refresh failed on retry",
-                        exc_info=True,
-                    )
-            group = _current_group_for_player(coord_client, coord_player_id)
-            if group is None:
-                if last_exc is not None:
-                    raise last_exc
-                raise RuntimeError(
-                    f"Coordinator speaker {coord_player_id} "
-                    f"has no active group"
-                )
             try:
-                await play(group)
+                await self._dispatch_play(live, request)
                 return
             except FailedCommand as exc:
                 if "groupCoordinatorChanged" not in str(exc):
                     raise
                 last_exc = exc
                 logger.debug(
-                    "Sonos groupCoordinatorChanged on play attempt %d "
-                    "(group=%s, coord=%s, members=%s) — backing off "
-                    "%.1fs and retrying",
+                    "Sonos groupCoordinatorChanged on dispatch attempt %d "
+                    "— reshaping topology and retrying",
                     attempt + 1,
-                    group.id,
-                    group.coordinator_id,
-                    group.player_ids,
-                    backoffs[attempt] if attempt < len(backoffs) else 0,
+                    exc_info=True,
                 )
-        # Ran out of attempts.
         assert last_exc is not None
         raise last_exc
+
+    async def _dispatch_play(
+        self, live: list[str], request: PlayRequest
+    ) -> None:
+        """Reshape topology (if needed) and issue the play command.
+
+        Separated from ``play_uri`` so the outer retry can re-run the
+        whole dispatch — including a fresh ``_ensure_group`` call —
+        rather than just the final Sonos command. That's important
+        because on a ``groupCoordinatorChanged`` the authoritative
+        group id we captured from the first modify has already been
+        invalidated; we need to re-modify and re-capture.
+        """
+        coord_player_id, group_id = await self._ensure_group(live)
+        coord_client = self._clients[coord_player_id]
+
+        # Set volume across the group before loading content so the
+        # playback opens at the intended level.
+        if request.volume is not None:
+            await self._set_group_volume(live, request.volume)
+
+        spotify = _extract_spotify_ref(request.uri)
+        if spotify is not None:
+            await self._load_spotify_content(
+                coord_client, group_id, spotify, request.title
+            )
+            return
+
+        # Generic HTTP(S) stream. We bypass ``SonosGroup.play_stream_url``
+        # because that wrapper pulls the group id from the cached
+        # ``SonosGroup`` object (``self.id``) — and that cache is exactly
+        # what goes stale after a topology change. Instead call the
+        # low-level playback_session namespace with the authoritative
+        # group id we captured from ``_ensure_group``.
+        station_metadata: Container = {
+            "_objectType": "container",
+            "name": request.title or "Gilbert audio",
+            "type": "station",
+        }
+        session = await coord_client.api.playback_session.create_session(
+            group_id,
+            app_id="com.gilbert.playback",
+            app_context="1",
+        )
+        await coord_client.api.playback_session.load_stream_url(
+            session_id=session["sessionId"],
+            stream_url=request.uri,
+            play_on_completion=True,
+            station_metadata=station_metadata,
+        )
 
     async def _load_spotify_content(
         self,
@@ -785,61 +752,96 @@ class SonosSpeaker(SpeakerBackend):
             # so the caller knows playback didn't happen.
             raise failures[0]
 
-    async def _ensure_group(self, target_ids: list[str]) -> str:
-        """Make sure ``target_ids`` form a single group and return the coordinator.
+    async def _ensure_group(
+        self, target_ids: list[str]
+    ) -> tuple[str, str]:
+        """Shape topology so ``target_ids`` form one group.
 
-        Uses the declarative ``set_group_members`` API: if the target
-        set matches an existing group, Sonos no-ops; otherwise it
-        re-forms the group atomically on the household. Returns the
-        player_id of whoever ended up as coordinator.
+        Returns ``(coordinator_player_id, authoritative_group_id)``.
+        The group id comes straight from Sonos's response to whichever
+        topology-change command we just issued (``modifyGroupMembers``
+        / ``createGroup``), so callers using it for ``createSession``
+        don't race against the local cache's push-event refresh.
 
-        Dedupes ``target_ids`` defensively before calling Sonos —
-        ``set_group_members`` rejects any list with a repeated
-        player_id ("Effective set of new group members has repeated
-        player id"), and the callers that feed us from resolved
-        speaker-name lists occasionally produce duplicates (e.g.
-        when a speaker is addressed by both its device name and an
-        alias).
+        Dedupes ``target_ids`` defensively before hitting Sonos —
+        repeated player ids trigger "Effective set of new group members
+        has repeated player id", and callers that feed us from resolved
+        speaker-name lists occasionally produce duplicates (e.g. when a
+        speaker is addressed by both its device name and an alias).
+
+        Prefers ``modify_group_members`` over ``set_group_members`` in
+        the multi-speaker case — Music Assistant's experience is that
+        ``setGroupMembers`` triggers more aggressive coordinator
+        election, which is exactly the condition we're trying to avoid.
         """
         target_ids = list(dict.fromkeys(target_ids))
 
         if len(target_ids) == 1:
-            # Singleton: make sure the speaker is alone in its group.
             pid = target_ids[0]
             client = self._clients[pid]
-            player = client.player
-            group = player.group
-            if group is None or len(group.player_ids) != 1:
+            current = _current_group_for_player(client, pid)
+
+            # Already solo — no change, cached id is authoritative.
+            if current is not None and list(current.player_ids) == [pid]:
+                return pid, current.id
+
+            # Solo the speaker: remove it from its current group. The
+            # response's ``GroupInfo`` describes the *remnant* group
+            # (the one pid left), not the new solo group, so we have
+            # to wait for the push event that creates the solo group.
+            if current is not None:
                 try:
-                    await player.leave_group()
+                    await client.api.groups.modify_group_members(
+                        current.id,
+                        player_ids_to_add=[],
+                        player_ids_to_remove=[pid],
+                    )
                 except FailedCommand:
                     logger.debug(
-                        "Sonos leave_group failed for %s — speaker may "
-                        "already be solo",
+                        "Sonos modify_group_members (solo) failed for %s",
                         pid,
                         exc_info=True,
                     )
-            return pid
+            solo_id = await _wait_for_group(
+                client,
+                lambda g: g.coordinator_id == pid
+                and list(g.player_ids) == [pid],
+                timeout=_TOPOLOGY_SETTLE_TIMEOUT,
+            )
+            return pid, solo_id
 
-        # Multi-speaker: pick a coordinator (first target), call
-        # set_group_members on its current group with the full target
-        # list. Sonos merges + expels as needed.
+        # Multi-speaker. Use first target as the anchor for the group;
+        # Sonos may elect a different player as coordinator after the
+        # modify, but we only need our anchor to remain a member so
+        # its client can issue commands for the group.
         coord_id = target_ids[0]
         client = self._clients[coord_id]
-        player = client.player
-        group = player.group
-        if group is None:
-            # Edge case: coordinator has no group membership yet.
-            # Create one from scratch.
-            await client.create_group(target_ids)
-            return coord_id
+        current = _current_group_for_player(client, coord_id)
 
-        current = set(group.player_ids)
-        wanted = set(target_ids)
-        if current == wanted:
-            return coord_id
-        await group.set_group_members(target_ids)
-        return coord_id
+        if current is None:
+            # Edge case: coordinator has no group membership at all.
+            # createGroup returns a ``GroupInfo`` we can read directly.
+            info = await client.api.groups.create_group(
+                client.household_id,
+                player_ids=target_ids,
+            )
+            return coord_id, info["group"]["id"]
+
+        current_set = set(current.player_ids)
+        wanted_set = set(target_ids)
+        if current_set == wanted_set:
+            return coord_id, current.id
+
+        to_add = [pid for pid in target_ids if pid not in current_set]
+        to_remove = [
+            pid for pid in current.player_ids if pid not in wanted_set
+        ]
+        info = await client.api.groups.modify_group_members(
+            current.id,
+            player_ids_to_add=to_add,
+            player_ids_to_remove=to_remove,
+        )
+        return coord_id, info["group"]["id"]
 
     async def _set_group_volume(
         self, speaker_ids: list[str], volume: int
@@ -983,11 +985,22 @@ class SonosSpeaker(SpeakerBackend):
         """Form a group from ``speaker_ids``; returns the resulting group."""
         if not speaker_ids:
             raise ValueError("speaker_ids is empty")
-        coord_id = await self._ensure_group(speaker_ids)
-        group = self._clients[coord_id].player.group
+        coord_id, group_id = await self._ensure_group(speaker_ids)
+        client = self._clients[coord_id]
+        # Prefer the freshly-captured authoritative id to look up the
+        # SonosGroup object, falling back to whatever matches the
+        # coordinator — the cache may not yet have the new group by
+        # id if the push event hasn't landed.
+        group = next(
+            (g for g in client.groups if g.id == group_id),
+            None,
+        ) or _current_group_for_player(client, coord_id)
         if group is None:
-            raise RuntimeError(
-                "Expected coordinator to be in a group after _ensure_group"
+            return SpeakerGroup(
+                group_id=group_id,
+                name="",
+                coordinator_id=coord_id,
+                member_ids=list(speaker_ids),
             )
         return SpeakerGroup(
             group_id=group.id,
@@ -1044,18 +1057,80 @@ def _current_group_for_player(
     attribute is only refreshed when ``SonosPlayer.check_active_group``
     fires, which happens on the player's own data events, not on
     every household-level topology event. ``client.groups`` (i.e.
-    ``client._groups``) IS refreshed on every topology push event
-    plus whenever anyone calls ``api.groups.get_groups``.
+    ``client._groups``) IS refreshed on every topology push event.
 
     Matches either a coordinator (``group.coordinator_id == player_id``)
     or a member (``player_id in group.player_ids``). Returns ``None``
     if the player isn't in any group — which happens only briefly
-    during topology reshuffles; the retry loop above handles it.
+    during topology reshuffles; ``_wait_for_group`` handles the wait.
     """
     for group in client.groups:
         if group.coordinator_id == player_id or player_id in group.player_ids:
             return group
     return None
+
+
+async def _wait_for_group(
+    client: SonosLocalApiClient,
+    predicate: Any,
+    timeout: float,
+) -> str:
+    """Wait (bounded) for a group matching ``predicate`` to appear.
+
+    Adapted from Home Assistant's ``SonosSpeaker.wait_for_groups``
+    pattern: subscribe to groups/player events, call the topology-
+    changing command, then block on an ``asyncio.Event`` until a
+    predicate over ``client.groups`` returns true. Required for
+    operations where Sonos's response doesn't identify the new group
+    directly — notably soloing a speaker via ``modifyGroupMembers``,
+    whose ``GroupInfo`` response describes the *remnant* group rather
+    than the new solo group.
+
+    Returns the id of the first matching group. Raises ``RuntimeError``
+    on timeout (rather than hanging the caller's play command).
+    """
+    settled = asyncio.Event()
+    found: list[str] = []
+
+    def _check() -> bool:
+        for group in client.groups:
+            if predicate(group):
+                if not found:
+                    found.append(group.id)
+                return True
+        return False
+
+    if _check():
+        return found[0]
+
+    def _on_event(_event: Any) -> None:
+        if _check():
+            settled.set()
+
+    unsub = client.subscribe(
+        _on_event,
+        event_filter=(
+            EventType.GROUP_ADDED,
+            EventType.GROUP_UPDATED,
+            EventType.GROUP_REMOVED,
+            EventType.PLAYER_UPDATED,
+        ),
+    )
+    try:
+        await asyncio.wait_for(settled.wait(), timeout=timeout)
+    except asyncio.TimeoutError as exc:
+        # One final check — the event might have landed in the gap
+        # between our last subscription callback and the timeout
+        # firing.
+        if _check():
+            return found[0]
+        raise RuntimeError(
+            f"Timed out after {timeout:.1f}s waiting for Sonos "
+            f"topology to settle"
+        ) from exc
+    finally:
+        unsub()
+    return found[0]
 
 
 # ── Spotify URI parsing ──────────────────────────────────────────────
