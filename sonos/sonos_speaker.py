@@ -614,10 +614,18 @@ class SonosSpeaker(SpeakerBackend):
             return
 
         # Generic HTTP(S) stream — let Sonos probe the URL and pick.
-        await group.play_stream_url(
-            request.uri,
-            play_on_completion=False,
-        )
+        # ``group.play_stream_url`` requires a Container metadata object
+        # (it calls ``load_stream_url(station_metadata=...)`` under the
+        # hood with ``play_on_completion=True``). Build a minimal
+        # station-type Container; Sonos uses ``name`` for its "now
+        # playing" string and derives everything else from the HTTP
+        # response headers.
+        metadata: dict[str, Any] = {
+            "_objectType": "container",
+            "name": request.title or "Gilbert audio",
+            "type": "station",
+        }
+        await group.play_stream_url(request.uri, metadata)
 
     async def _load_spotify_content(
         self,

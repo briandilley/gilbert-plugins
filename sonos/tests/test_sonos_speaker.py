@@ -205,9 +205,15 @@ async def test_http_uri_uses_play_stream_url() -> None:
     )
 
     group.play_stream_url.assert_awaited_once()
-    args, kwargs = group.play_stream_url.call_args
+    args = group.play_stream_url.call_args.args
+    # aiosonos's ``play_stream_url`` takes (url, metadata: Container).
+    # Metadata is a minimal station-type Container so Sonos has a
+    # "now playing" title while the HTTP stream plays.
     assert args[0] == "http://gilbert/api/share/song.mp3"
-    assert kwargs.get("play_on_completion") is False
+    metadata = args[1]
+    assert metadata["_objectType"] == "container"
+    assert metadata["type"] == "station"
+    assert isinstance(metadata["name"], str) and metadata["name"]
 
 
 async def test_http_uri_applies_volume_before_play() -> None:
