@@ -1,11 +1,10 @@
 [project]
 name = "gilbert-plugin-voice-agent"
-version = "0.1.0"
-description = "Wake-word activated voice conversations driven by the voice_brain engine."
+version = "0.2.0"
+description = "Browser voice-conversation UI (UI-only — backend lives in core VoicePipelineService)."
 requires-python = ">=3.12"
-# No third-party deps beyond what core already has — the plugin
-# resolves WakeWordListener (from TranscriptionService) and
-# ConversationEngine (from VoiceBrainService) for everything it does.
+# No third-party deps — this plugin is UI-only; all backend
+# orchestration lives in core VoicePipelineService.
 dependencies = []
 
 [tool.uv]

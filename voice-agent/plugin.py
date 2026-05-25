@@ -1,8 +1,8 @@
-"""Voice-agent plugin — wake-word activated voice conversations.
+"""Voice-agent plugin — UI shell for the /voice route.
 
-Registers ``VoiceAgentService`` with the service manager. The service
-itself is a wrapper around the core ``voice_brain`` engine — see
-``voice_agent_service.py`` for the conversation lifecycle.
+Backend orchestration lives in core ``VoicePipelineService``. This
+plugin contributes only the SPA route + nav entry; it does not own a
+service.
 """
 
 from __future__ import annotations
@@ -19,22 +19,20 @@ class VoiceAgentPlugin(Plugin):
     def metadata(self) -> PluginMeta:
         return PluginMeta(
             name="voice-agent",
-            version="0.1.0",
-            description=(
-                "Wake-word activated voice conversations driven by the "
-                "voice_brain engine."
-            ),
-            provides=["voice_agent"],
+            version="0.2.0",
+            description="Browser voice-conversation UI (rendered at /voice).",
+            provides=["voice_agent_ui"],
             requires=[],
         )
 
     async def setup(self, context: PluginContext) -> None:
-        from .voice_agent_service import VoiceAgentService
-
-        context.services.register(VoiceAgentService())
+        # No service to register — the /voice route alone is the
+        # plugin contribution. Backend orchestration lives in
+        # ``core/services/voice_pipeline.py``.
+        return None
 
     async def teardown(self) -> None:
-        pass
+        return None
 
     def ui_routes(self) -> list[UIRoute]:
         return [
@@ -43,23 +41,12 @@ class VoiceAgentPlugin(Plugin):
                 panel_id="voice_agent.page",
                 label="Voice",
                 description=(
-                    "Start a real-time voice conversation with Gilbert. "
-                    "Press the button, talk; Gilbert speaks back through "
-                    "your browser."
+                    "Start a real-time voice conversation with Gilbert."
                 ),
                 icon="mic",
                 required_role="user",
-                # Gate the route on the service capability so disabling
-                # the service under Settings → Services hides both the
-                # nav entry and the SPA route.
                 requires_capability="voice_pipeline",
                 add_to_nav=True,
-                # Top-level nav entry (no parent group). Leaving
-                # ``nav_parent_group`` blank tells the nav-merge logic
-                # in core/services/web_api.py to synthesize a new
-                # group keyed off the route's label. Renders as a
-                # standalone "Voice" leaf with the mic icon, same
-                # shape as Calendar / Feeds / Tasks etc.
             ),
         ]
 
