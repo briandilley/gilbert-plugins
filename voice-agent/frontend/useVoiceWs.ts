@@ -16,6 +16,12 @@
 
 import { useCallback, useEffect, useRef } from "react";
 
+// Import via Vite's `?url` so the worklet is emitted as a separate
+// asset (not inlined into the main bundle). Browsers' AudioWorklet
+// needs a standalone JS module URL — the main bundle is not loadable
+// as a worklet.
+import workletUrl from "./voice-audio-worklet.js?url";
+
 export interface UseVoiceWs {
   /** Open the session. Must be called from a user gesture. */
   open(sessionId: string): Promise<void>;
@@ -61,8 +67,7 @@ export function useVoiceWs(): UseVoiceWs {
 
       const ctx = new AudioContext({ sampleRate: TARGET_SAMPLE_RATE });
       ctxRef.current = ctx;
-      const workletUrl = new URL("./voice-audio-worklet.ts", import.meta.url);
-      await ctx.audioWorklet.addModule(workletUrl.href);
+      await ctx.audioWorklet.addModule(workletUrl);
 
       const sourceNode = ctx.createMediaStreamSource(stream);
       sourceRef.current = sourceNode;
