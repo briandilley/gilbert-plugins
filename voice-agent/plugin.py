@@ -52,7 +52,7 @@ class VoiceAgentPlugin(Plugin):
                 # Gate the route on the service capability so disabling
                 # the service under Settings → Services hides both the
                 # nav entry and the SPA route.
-                requires_capability="voice_agent",
+                requires_capability="voice_pipeline",
                 add_to_nav=True,
                 # Top-level nav entry (no parent group). Leaving
                 # ``nav_parent_group`` blank tells the nav-merge logic

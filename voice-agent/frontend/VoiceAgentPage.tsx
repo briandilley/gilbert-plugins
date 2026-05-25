@@ -1,23 +1,20 @@
 /**
  * Voice-agent page — a single "Start Conversation" toggle.
  *
- * Captures the browser microphone via `getUserMedia` + an
- * `AudioContext` ScriptProcessor (the simple, broadly-supported
- * path — AudioWorklet would be slightly nicer but requires a
- * separate worklet module file). Downsamples to 16 kHz mono
- * PCM_S16LE and pumps base64'd chunks to the backend via the
- * `voice_agent.send_audio_chunk` WS RPC at 50fps.
+ * Audio capture and the binary WebSocket to the voice pipeline are
+ * handled entirely by ``useVoiceWs``. This component is responsible
+ * for:
  *
- * Outbound audio (Gilbert's TTS) goes through the existing
- * `useBrowserSpeaker` plumbing — the voice-agent service publishes
- * a `speaker.browser.play` event with the synthesized MP3 inlined
- * as a `data:` URL, and the browser-speaker hook already running in
- * the app shell plays it via its HTMLAudioElement.
+ *   1. Calling ``voice.start_session`` over the RPC WebSocket to
+ *      reserve a session_id on the server.
+ *   2. Handing the session_id to ``useVoiceWs().open()`` so the
+ *      dedicated binary WS opens to ``/ws/voice/{session_id}``.
+ *   3. Subscribing to ``voice.*`` events for transcript updates,
+ *      session-ended notifications, and state transitions.
  *
- * This is the v1 turn-taking experience: press button → talk →
- * Gilbert speaks → talk again → end. Real-time barge-in needs
- * raw-bytes-over-WS playback (different audio sink shape) and is a
- * future iteration.
+ * Outbound audio (Gilbert's TTS) is handled by the voice pipeline
+ * itself — Pipecat pushes synthesized PCM over the same binary WS
+ * and ``useVoiceWs`` schedules it onto the AudioContext destination.
  */
 
 import { useCallback, useEffect, useRef, useState, type ReactElement } from "react";
@@ -26,6 +23,7 @@ import { Mic, MicOff, Loader2, Ear } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { useWebSocket } from "@/hooks/useWebSocket";
+import { useVoiceWs } from "./useVoiceWs";
 
 /** A single transcript turn rendered in the live feed. */
 interface TranscriptTurn {
@@ -60,15 +58,10 @@ type SessionState =
 
 type SessionMode = "turn_based" | "conversational";
 
-const TARGET_SAMPLE_RATE = 16000;
-// We downsample with a ScriptProcessor of bufferSize 4096; at the
-// browser's native 48 kHz that's ~85 ms per buffer (4096/48000). After
-// downsample to 16 kHz it's 4096 * (16000/48000) ≈ 1365 PCM samples
-// per buffer. We send each buffer as its own ws frame.
-const SCRIPT_PROCESSOR_BUFFER_SIZE = 4096;
-
 export function VoiceAgentPage(): ReactElement {
   const { connected, rpc, subscribe } = useWebSocket();
+  const voiceWs = useVoiceWs();
+
   const [state, setState] = useState<SessionState>("idle");
   const [mode, setMode] = useState<SessionMode>("turn_based");
   const [error, setError] = useState<string | null>(null);
@@ -76,44 +69,13 @@ export function VoiceAgentPage(): ReactElement {
   const [transcript, setTranscript] = useState<TranscriptTurn[]>([]);
   const transcriptEndRef = useRef<HTMLDivElement | null>(null);
 
-  // Audio-graph refs + the teardown helper live ABOVE the useEffect
-  // subscriptions because the ``session_ended`` subscription calls
-  // teardownAudio in its handler — TypeScript's strict block-scope
-  // check (``tsc -b`` is stricter than ``tsc --noEmit``) rejects
-  // referencing it before declaration.
-  const audioCtxRef = useRef<AudioContext | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const processorRef = useRef<ScriptProcessorNode | null>(null);
-  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
-
-  const teardownAudio = useCallback(() => {
-    if (processorRef.current) {
-      processorRef.current.disconnect();
-      processorRef.current = null;
-    }
-    if (sourceRef.current) {
-      sourceRef.current.disconnect();
-      sourceRef.current = null;
-    }
-    if (streamRef.current) {
-      for (const t of streamRef.current.getTracks()) t.stop();
-      streamRef.current = null;
-    }
-    if (audioCtxRef.current) {
-      audioCtxRef.current.close().catch(() => {
-        /* already closed */
-      });
-      audioCtxRef.current = null;
-    }
-  }, []);
-
   // Subscribe to live transcript-turn events from the backend. The
-  // server emits ``voice_agent.transcript_turn`` for every "them"
+  // server emits ``voice.transcript_turn`` for every "them"
   // (user-side STT commit) and "us" (LLM reply) turn so the SPA can
   // render the conversation as it happens — useful even when the
   // audio-out path is misbehaving and the user can't hear Gilbert.
   useEffect(() => {
-    const unsub = subscribe("voice_agent.transcript_turn", (event) => {
+    const unsub = subscribe("voice.transcript_turn", (event) => {
       const data = event.data ?? {};
       const who = String(data.who ?? "");
       const text = String(data.text ?? "");
@@ -136,26 +98,25 @@ export function VoiceAgentPage(): ReactElement {
   // Subscribe to "session ended" so the SPA can flip back to idle
   // when the brain decides the conversation is over (e.g. the user
   // said "talk to you later" and the LLM called end_conversation).
-  // Without this the SPA stays in active mode, holding the mic open
-  // and pumping audio that nothing's listening to. Defined below the
-  // teardown helper so it can call it cleanly.
+  // Without this the SPA stays in active mode with the WS open and
+  // audio streaming that nothing's listening to.
   useEffect(() => {
-    const unsub = subscribe("voice_agent.session_ended", () => {
-      teardownAudio();
+    const unsub = subscribe("voice.session_ended", () => {
+      voiceWs.close();
       setSessionId(null);
       setState("idle");
     });
     return unsub;
-  }, [subscribe, teardownAudio]);
+  }, [subscribe, voiceWs]);
 
-  // Conversational mode emits ``voice_agent.state_changed`` when the
+  // Conversational mode emits ``voice.state_changed`` when the
   // server transitions between ``active`` (engine listening) and
   // ``dormant`` (only the wake-word detector listening, waiting for
   // "Hey Gilbert" to resume). Reflect the state in the UI so the
-  // user knows what's going on. Mic stays open in both states — only
-  // the routing on the server side changes.
+  // user knows what's going on. The WS stays open in both states —
+  // only the routing on the server side changes.
   useEffect(() => {
-    const unsub = subscribe("voice_agent.state_changed", (event) => {
+    const unsub = subscribe("voice.state_changed", (event) => {
       const data = event.data ?? {};
       const newState = String(data.state ?? "");
       if (newState === "dormant") {
@@ -178,11 +139,12 @@ export function VoiceAgentPage(): ReactElement {
     // the user might want to hard-end without doing the dance.
     if (state !== "active" && state !== "dormant") return;
     setState("stopping");
-    teardownAudio();
+    // Close the binary WS first for fast local mic teardown.
+    voiceWs.close();
     if (sessionId) {
       try {
         await rpc<{ ok: boolean }>({
-          type: "voice_agent.end_session",
+          type: "voice.end_session",
           session_id: sessionId,
         });
       } catch {
@@ -191,7 +153,7 @@ export function VoiceAgentPage(): ReactElement {
     }
     setSessionId(null);
     setState("idle");
-  }, [state, sessionId, rpc, teardownAudio]);
+  }, [state, sessionId, rpc, voiceWs]);
 
   const start = useCallback(async () => {
     if (state !== "idle") return;
@@ -199,126 +161,54 @@ export function VoiceAgentPage(): ReactElement {
     setTranscript([]);
     setState("starting");
 
-    let stream: MediaStream;
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,
-          echoCancellation: true,
-          noiseSuppression: true,
-        },
-      });
-    } catch (err) {
-      setError(
-        err instanceof Error
-          ? `Microphone permission denied: ${err.message}`
-          : "Microphone permission denied"
-      );
-      setState("idle");
-      return;
-    }
-    streamRef.current = stream;
-
-    // Tell the backend to open a session. It returns a session_id we
-    // tag every audio chunk with. ``mode`` selects the lifecycle:
-    // - ``turn_based``: classic press-button-to-talk
-    // - ``conversational``: wake-word fallback after 10s of silence
+    // Step 1: reserve the session server-side. The server allocates a
+    // session_id and holds a slot in the voice pipeline. The binary WS
+    // must open AFTER this succeeds so the session exists before the
+    // transport tries to attach to it.
     let resp: { ok: boolean; session_id?: string; error?: string };
     try {
-      resp = await rpc({ type: "voice_agent.start_session", mode });
+      resp = await rpc({ type: "voice.start_session", mode });
     } catch (err) {
       setError(
         err instanceof Error
           ? `Failed to start session: ${err.message}`
           : "Failed to start session"
       );
-      teardownAudio();
       setState("idle");
       return;
     }
     if (!resp.ok || !resp.session_id) {
       setError(resp.error ?? "Server refused the session");
-      teardownAudio();
       setState("idle");
       return;
     }
     const newSessionId = resp.session_id;
     setSessionId(newSessionId);
 
-    // Wire up the audio graph: MediaStreamSource → ScriptProcessor →
-    // (discard the output, we don't want a feedback loop with the
-    // speakers; the ScriptProcessor's `onaudioprocess` gives us the
-    // input buffer regardless of whether the output is connected).
-    const audioCtx = new AudioContext();
-    audioCtxRef.current = audioCtx;
-    const sourceNode = audioCtx.createMediaStreamSource(stream);
-    sourceRef.current = sourceNode;
-    const processor = audioCtx.createScriptProcessor(
-      SCRIPT_PROCESSOR_BUFFER_SIZE,
-      1,
-      1
-    );
-    processorRef.current = processor;
-
-    const sourceSampleRate = audioCtx.sampleRate;
-    const downsampleRatio = sourceSampleRate / TARGET_SAMPLE_RATE;
-
-    processor.onaudioprocess = (event) => {
-      // Input buffer is Float32 in [-1, 1] at the AudioContext's
-      // native sample rate (typically 48000 Hz). Downsample by
-      // averaging blocks of `downsampleRatio` samples, then convert
-      // each averaged sample to int16.
-      const input = event.inputBuffer.getChannelData(0);
-      const outLen = Math.floor(input.length / downsampleRatio);
-      const out = new Int16Array(outLen);
-      for (let i = 0; i < outLen; i++) {
-        const start = Math.floor(i * downsampleRatio);
-        const end = Math.floor((i + 1) * downsampleRatio);
-        let sum = 0;
-        let n = 0;
-        for (let j = start; j < end && j < input.length; j++) {
-          sum += input[j];
-          n++;
-        }
-        const v = n > 0 ? sum / n : 0;
-        const clamped = Math.max(-1, Math.min(1, v));
-        out[i] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
+    // Step 2: open the dedicated binary WS. This acquires the mic,
+    // spins up the AudioWorklet, and connects to /ws/voice/{session_id}.
+    try {
+      await voiceWs.open(newSessionId);
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? `Microphone / audio setup failed: ${err.message}`
+          : "Microphone / audio setup failed"
+      );
+      // Best-effort cleanup — end the server-side session we already reserved.
+      try {
+        await rpc({ type: "voice.end_session", session_id: newSessionId });
+      } catch {
+        /* ignore */
       }
-      // Base64-encode the bytes and ship via WS RPC. Fire-and-forget
-      // — we don't await the promise so the audio thread isn't held.
-      const bytes = new Uint8Array(out.buffer);
-      let bin = "";
-      for (let i = 0; i < bytes.byteLength; i++) {
-        bin += String.fromCharCode(bytes[i]);
-      }
-      const b64 = btoa(bin);
-      void rpc({
-        type: "voice_agent.send_audio_chunk",
-        session_id: newSessionId,
-        audio_b64: b64,
-      }).catch(() => {
-        /* server will have already torn the session down */
-      });
-    };
+      setSessionId(null);
+      setState("idle");
+      return;
+    }
 
-    sourceNode.connect(processor);
-    // ScriptProcessor needs its output connected for `onaudioprocess`
-    // to fire reliably across browsers. Route to a dummy gain that
-    // muted to zero so we don't echo the mic back to the speakers.
-    const muted = audioCtx.createGain();
-    muted.gain.value = 0;
-    processor.connect(muted);
-    muted.connect(audioCtx.destination);
-
-    setState("active");
-  }, [state, mode, rpc, teardownAudio]);
-
-  // Tear down on unmount.
-  useEffect(() => {
-    return () => {
-      teardownAudio();
-    };
-  }, [teardownAudio]);
+    // Step 3: flip UI to the right post-start state.
+    setState(mode === "conversational" ? "dormant" : "active");
+  }, [state, mode, rpc, voiceWs]);
 
   return (
     <div className="container mx-auto max-w-2xl py-8">
