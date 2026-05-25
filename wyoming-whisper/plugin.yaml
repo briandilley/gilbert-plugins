@@ -1,0 +1,27 @@
+name: wyoming-whisper
+version: "0.1.0"
+description: "Local streaming STT via Wyoming-protocol Whisper (e.g., the wyoming-whisper docker container)."
+
+provides:
+  - wyoming-whisper
+
+requires: []
+depends_on: []
+
+config:
+  host:
+    type: string
+    default: "127.0.0.1"
+    description: "TCP host of the Wyoming Whisper server."
+  port:
+    type: integer
+    default: 10300
+    description: "TCP port of the Wyoming Whisper server."
+  silence_ms:
+    type: integer
+    default: 600
+    description: "Milliseconds of silence to treat as end-of-utterance."
+  silence_rms_threshold:
+    type: integer
+    default: 200
+    description: "PCM s16 RMS below which a chunk counts as silence."

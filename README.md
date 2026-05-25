@@ -68,6 +68,7 @@ The table below is an index — jump to each plugin's detail section for configu
 | [unifi](#unifi) | `PresenceBackend "unifi"`, `DoorbellBackend "unifi"` | — (uses `httpx`/`aiohttp`) | Monitoring |
 | [voice-agent](#voice-agent) | `/voice` SPA page (UI shell; backend is `VoicePipelineService` in core) | — (pure stdlib) | Speech |
 | [withings](#withings) | `HealthBackend "withings"` | `httpx` | Health |
+| [wyoming-whisper](#wyoming-whisper) | `StreamingTranscriptionBackend "wyoming-whisper"` | `wyoming` | Speech |
 | [xai](#xai) | `AIBackend "xai"` | — (uses `httpx`) | Intelligence |
 
 ---
@@ -1377,6 +1378,30 @@ Per-user `oauth_*` tokens live on `health_links` rows (NOT in `backend_config_pa
 - The "Tokens stored unencrypted on this Gilbert instance until v2." disclosure.
 
 **Third-party deps** — `httpx>=0.27` (already in core; declared explicitly for plugin-isolation correctness).
+
+---
+
+### wyoming-whisper
+
+Local streaming speech-to-text via the [Wyoming protocol](https://github.com/OHF-voice/wyoming), targeting a `wyoming-whisper` Docker container (e.g. `rhasspy/wyoming-whisper`) exposing TCP port 10300. No API key required — entirely on-device.
+
+Because Wyoming Whisper emits one `transcript` event per `audio-start` … `audio-stop` cycle (no partial results), the plugin performs utterance segmentation internally via RMS silence detection. Audio accumulates in a ring-buffer; when the RMS falls below `silence_rms_threshold` for `silence_ms` milliseconds, the plugin opens a fresh TCP connection, sends the buffered audio as a single Wyoming round-trip, reads the `Transcript` response, and emits a `FinalTranscript` event. A new connection is opened per utterance — no long-lived TCP session.
+
+**Backend registered** — `StreamingTranscriptionBackend.backend_name = "wyoming-whisper"`.
+
+**Configure** (Settings → Transcription → Streaming, with the `wyoming-whisper` backend selected)
+- `host` — TCP host of the Wyoming Whisper server (default `127.0.0.1`). Set to the Docker host IP or container hostname if not running locally.
+- `port` — TCP port (default `10300`).
+- `silence_ms` — Milliseconds of audio below the RMS threshold that triggers end-of-utterance flush (default `600`). Lower values produce snappier turn-taking but may truncate speech on slow talkers.
+- `silence_rms_threshold` — PCM s16 RMS value below which a chunk counts as silence (default `200`). Raise this in noisy environments; lower it for very quiet microphones.
+
+**Quick-start Docker example**
+```bash
+docker run -it -p 10300:10300 rhasspy/wyoming-whisper --model tiny-int8
+```
+Replace `tiny-int8` with `base-int8`, `small-int8`, or `large-v2` to trade speed for accuracy.
+
+**No third-party deps beyond** `wyoming>=1.9.0` — the `wyoming` library handles all TCP framing and event serialisation.
 
 ---
 
