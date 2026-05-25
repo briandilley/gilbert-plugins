@@ -66,7 +66,7 @@ The table below is an index — jump to each plugin's detail section for configu
 | [telnyx](#telnyx) | `TelephonyBackend "telnyx"` (drives `PhoneCallService`) | — (uses `httpx`, `websockets`) | Telephony |
 | [tesseract](#tesseract) | `OCRBackend "tesseract"` | `pytesseract` | Intelligence |
 | [unifi](#unifi) | `PresenceBackend "unifi"`, `DoorbellBackend "unifi"` | — (uses `httpx`/`aiohttp`) | Monitoring |
-| [voice-agent](#voice-agent) | `voice_agent` service (wake-word-activated voice conversation, `/voice` SPA page) | — (pure stdlib) | Speech |
+| [voice-agent](#voice-agent) | `/voice` SPA page (UI shell; backend is `VoicePipelineService` in core) | — (pure stdlib) | Speech |
 | [withings](#withings) | `HealthBackend "withings"` | `httpx` | Health |
 | [xai](#xai) | `AIBackend "xai"` | — (uses `httpx`) | Intelligence |
 
@@ -1003,11 +1003,11 @@ OpenRouter chat backend — a meta-provider that fronts ~200 models from Anthrop
 
 ### phone
 
-Outbound phone calls — Gilbert places PSTN calls on the user's behalf and drives the live conversation through the core `voice_brain` engine (STT → LLM → TTS, barge-in, opening disclosure, transcript). This plugin owns `PhoneCallService` and the `/calls` SPA page; the actual carrier is a separate backend chosen at runtime (`telnyx` ships in std-plugins).
+Outbound phone calls — Gilbert places PSTN calls on the user's behalf and drives the live conversation (STT → LLM → TTS, barge-in, opening disclosure, transcript). This plugin owns `PhoneCallService` and the `/calls` SPA page; the actual carrier is a separate backend chosen at runtime (`telnyx` ships in std-plugins). **Note:** phone is being migrated to use `VoicePipelineService` as the conversation engine in a follow-up branch; the migration is not yet complete.
 
 Concurrency cap: at most one active call per user. A second `make_phone_call` while one is live returns a 409-style error — the user must hang up first.
 
-**Service registered** — `PhoneCallService`, capabilities `phone_calls`, `ai_tools`, `ws_handlers`. Requires `entity_storage`, `event_bus`, `ai_chat`, `text_to_speech`, `speech_to_text`, `voice_brain`. Toggleable.
+**Service registered** — `PhoneCallService`, capabilities `phone_calls`, `ai_tools`, `ws_handlers`. Requires `entity_storage`, `event_bus`, `ai_chat`, `text_to_speech`, `speech_to_text`. Toggleable.
 
 **SPA page** — `/calls` (and deep-links at `/calls/:callId`), gated on the `phone_calls` capability. Two-pane view: recent calls on the left, live transcript + "intervene with a directive" textbox on the right. Subscribes to `phone.call.transcript_delta` / `phone.call.status_changed` for live updates.
 
@@ -1335,19 +1335,19 @@ The doorbell backend uses a flat config pointing at Protect:
 
 ### voice-agent
 
-Wake-word-activated voice conversations in the browser. Press "Start Conversation" on the `/voice` page (or trigger the configured wake-word), Gilbert listens through the browser microphone, runs the audio through STT, drives the response through the core `voice_brain` engine, and plays the synthesized speech back through the page's audio output. v1 is turn-taking; barge-in is on the roadmap.
+**UI-only plugin.** This plugin contributes the `/voice` SPA page and nav entry; it registers no service of its own. All orchestration lives in the core `VoicePipelineService` (`core/services/voice_pipeline.py`, Pipecat-based).
 
-The full Gilbert tool ecosystem is available during a session — knowledge search, MCP tools, agent dispatch, scheduler, … — because the engine runs in `use_full_ai_service` mode and hands the LLM whatever the AI service currently exposes.
+Two modes: **turn-based** (press "Start Conversation"; pipeline is live immediately) and **conversational** (wake-word gated; session stays dormant until the configured wake phrase fires). The full Gilbert tool ecosystem is available during a turn because the engine calls `AIService.chat` with all registered tools active.
 
-**Service registered** — `VoiceAgentService`, capabilities `voice_agent`, `ws_handlers`, `ai_tools`. Requires `voice_brain`, `speech_to_text` (specifically `WakeWordListener`), `ai_chat` (specifically `ConversationMessagePoster`), `entity_storage`, `event_bus`. Toggleable; disabled by default — needs a mic source to actually run a session.
+**No service registered** — the plugin only provides a UI route.
 
-**SPA page** — `/voice`, gated on the `voice_agent` capability so disabling the service hides both the nav entry and the route.
+**SPA page** — `/voice`, gated on the `voice_pipeline` capability so the nav entry disappears when the voice service is disabled.
 
-**AI tool exposed only inside a voice session** — `end_conversation` (brain-mediated; not a slash command). The provider's `slash_namespace = "voice"`, kept defensive in case future tools expose user-facing commands.
+**AI tool exposed only inside a voice session** — `end_conversation(summary?)`, advertised by `VoicePipelineService` only while the user has an ACTIVE session. Not a slash command.
 
-**No user-facing configuration** beyond the standard service on/off toggle and per-session opening policy (which lives on the engine config, not the service).
+**No user-facing configuration** in this plugin — voice settings (idle timeout, max duration, STT/TTS backends, error utterance) live on `VoicePipelineService` under Settings → Media → Voice.
 
-**No third-party Python dependencies** — relies entirely on capabilities already resolved through the core service manager.
+**No third-party Python dependencies.**
 
 ---
 
