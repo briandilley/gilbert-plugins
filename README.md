@@ -569,12 +569,14 @@ Bundled Google integration suite. One plugin, six backends — they share creden
 
 | Setting | Keys |
 |---|---|
-| Auth (Google OAuth) | `client_id`, `client_secret` *(sensitive)*, `domain` (optional Workspace domain lock) |
+| Auth (Google OAuth) | `client_id`, `client_secret` *(sensitive)*, `domain` (optional Workspace domain lock), `callback_url_source` (`tunnel` \| `internal_url` \| `request`) |
 | User provider (Workspace directory) | `sa_json` *(sensitive, service-account JSON)*, `delegated_user`, `domain` |
 | Inbox (Gmail) | `credential_mode`, `email_address`, OAuth fields (`oauth_client_id`, `oauth_client_secret`, `oauth_redirect_uri`, `oauth_refresh_token`, `oauth_auth_code`), legacy `service_account_json` + `delegated_user` |
 | Knowledge (Drive) | `credential_mode`, `folder_id`, OAuth fields, or `service_account_json` for shared / delegated service-account modes |
 | Calendar (Google Calendar) | `credential_mode`, `email_address`, OAuth fields, or `service_account_json` for shared / delegated service-account modes |
 | Tasks (Google Tasks) | `credential_mode`, `tasklist_id`, OAuth fields, or legacy `service_account_json` + `delegated_user` |
+
+`callback_url_source` controls where Google's OAuth redirect is sent during login. `tunnel` (default) uses the public tunnel URL (ngrok plugin) — reachable from anywhere. `internal_url` uses a LAN hostname from the core internal-URL service (sslip.io), so login works without a public tunnel; the browser must trust Gilbert's TLS cert and the host must be on the same network. `request` uses the origin the login request arrived on, for setups already served under a Google-accepted hostname. Whichever you pick, add the matching `…/auth/login/google/callback` URL to your Google Cloud OAuth client's authorized redirect URIs. If the chosen source isn't available at login time, Gilbert falls back to the request origin and logs a warning.
 
 For new personal Google-account setup, use `credential_mode = oauth_bot` and the backend's `connect_google` / `connect_google_complete` actions. Existing Workspace domain-wide-delegation configs continue to work. `shared_service_account` is supported only for Calendar and Drive, where Google sharing can grant the service-account email access to a calendar or folder; Gmail and Tasks do not support that mode.
 
