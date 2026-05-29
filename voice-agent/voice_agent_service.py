@@ -1358,6 +1358,32 @@ class VoiceAgentService(Service):
                 default="Gilbert",
             ),
             ConfigParam(
+                key="echo_guard_window_seconds",
+                type=ToolParameterType.NUMBER,
+                description=(
+                    "When set > 0, transcripts arriving within this "
+                    "many seconds of the assistant's last TTS playback "
+                    "are checked for echo and dropped if they look "
+                    "like Gilbert's own voice bleeding back through "
+                    "the speakers. Covers the browser audio buffer "
+                    "drain after a barge-in. Set to 0 to disable. "
+                    "Default 1.5s."
+                ),
+                default=1.5,
+            ),
+            ConfigParam(
+                key="echo_guard_token_overlap_threshold",
+                type=ToolParameterType.NUMBER,
+                description=(
+                    "Fraction of the user transcript's tokens that "
+                    "must appear in a recent assistant utterance for "
+                    "the echo guard to drop. Lower = more aggressive "
+                    "(catches more echoes but more false positives). "
+                    "Default 0.5."
+                ),
+                default=0.5,
+            ),
+            ConfigParam(
                 key="address_gate_prompt",
                 type=ToolParameterType.STRING,
                 description=(
@@ -1790,6 +1816,26 @@ class VoiceAgentService(Service):
             # you there?".
             assistant_name=str(
                 self._config.get("assistant_name") or "Gilbert"
+            ),
+            # Echo guard. The browser-tab voice agent plays TTS
+            # through laptop/desktop speakers without hardware
+            # echo cancellation, so the mic catches the tail of
+            # Gilbert's own audio (especially after barge-in
+            # interrupts mid-utterance). This drops Scribe
+            # transcripts that match the recent assistant text
+            # within a short window. Default 1.5s window is
+            # tuned to cover the browser's audio buffer drain
+            # after audio_out.clear() without false-flagging
+            # quick follow-on user turns.
+            echo_guard_window_seconds=float(
+                self._config.get("echo_guard_window_seconds", 1.5)
+                or 1.5
+            ),
+            echo_guard_token_overlap_threshold=float(
+                self._config.get(
+                    "echo_guard_token_overlap_threshold", 0.5
+                )
+                or 0.5
             ),
             audio_input_format=_STTAudioFormat(
                 encoding=_STTAudioEncoding.PCM_S16LE,
