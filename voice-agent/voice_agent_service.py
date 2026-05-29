@@ -152,18 +152,28 @@ def _parse_noise_words(raw: Any) -> frozenset[str]:
 
 
 _DEFAULT_ADDRESS_GATE_PROMPT = (
-    "You are a gate that decides whether the latest user utterance "
-    "is directed at the AI assistant (Gilbert), versus background "
-    "chatter, a remark to someone else nearby, a cough/throat-clear "
-    "the speech recognizer interpreted as words, or an aside the "
-    "user didn't intend the assistant to hear. The assistant is "
-    "always listening in a long-running open-mic voice session, so "
-    "the default should NOT be 'yes' — only answer yes when the "
-    "utterance reads like a question, command, or statement clearly "
-    "meant for the assistant. Single-word fillers, partial sentences "
-    "that don't form a coherent address, casual asides, and "
-    "obviously incomplete fragments → no. Reply with EXACTLY one "
-    "word: 'yes' or 'no'. No punctuation, no explanation."
+    "You decide whether an AI assistant should respond to an "
+    "utterance heard on an always-on microphone. Default to YES — "
+    "the assistant SHOULD respond unless you're confident the "
+    "utterance isn't directed at it. The vast majority of "
+    "utterances in a voice session are people talking to the "
+    "assistant; only drop the obvious negatives.\n\n"
+    "Answer NO only when one of these clearly applies:\n"
+    "- The utterance is an obvious side-conversation with another "
+    "person (e.g. 'thanks honey', 'tell mom I'll be late').\n"
+    "- The utterance is a self-correction or muttered aside the "
+    "user clearly isn't addressing to anyone (e.g. 'wait, that "
+    "isn't right').\n"
+    "- The utterance is an incomplete fragment with no question, "
+    "command, or named address (e.g. 'and then', 'you know').\n\n"
+    "Answer YES in all other cases, including:\n"
+    "- Any question or command, even short ones ('what's the "
+    "weather', 'stop', 'remind me later').\n"
+    "- Any utterance that names the assistant ('Gilbert, …').\n"
+    "- Any statement that could plausibly be a request, opinion, "
+    "or observation the user wants the assistant to hear.\n"
+    "- Anything you're genuinely uncertain about — fail open.\n\n"
+    "Reply with ONE word: 'yes' or 'no'. No punctuation."
 )
 
 
@@ -1317,9 +1327,25 @@ class VoiceAgentService(Service):
                     "muttering). Adds ~100-300 ms to genuine turns but "
                     "skips the FULL agentic LLM call when the answer "
                     "is no, which is the much bigger win on open-mic "
-                    "browser sessions."
+                    "browser sessions. Fails OPEN: ambiguous LLM "
+                    "responses dispatch; only an explicit 'no' drops."
                 ),
                 default=True,
+            ),
+            ConfigParam(
+                key="assistant_name",
+                type=ToolParameterType.STRING,
+                description=(
+                    "Assistant's name for the deterministic "
+                    "name-mention fast-path. When the user's "
+                    "utterance contains this name as a whole word, "
+                    "the LLM addressing gate is SKIPPED and the "
+                    "utterance dispatches. Use this to make 'Hey "
+                    "Gilbert, …' always go through even if you've "
+                    "tightened the gate prompt. Empty string "
+                    "disables the fast-path."
+                ),
+                default="Gilbert",
             ),
             ConfigParam(
                 key="address_gate_prompt",
@@ -1745,6 +1771,15 @@ class VoiceAgentService(Service):
             address_gate_prompt=str(
                 self._config.get("address_gate_prompt")
                 or _DEFAULT_ADDRESS_GATE_PROMPT
+            ),
+            # Deterministic name-mention fast-path. When the user
+            # literally says the assistant's name, the LLM gate is
+            # skipped and the utterance dispatches. Avoids the
+            # situation where the gate prompt is too strict and
+            # drops obviously-addressed turns like "Gilbert, are
+            # you there?".
+            assistant_name=str(
+                self._config.get("assistant_name") or "Gilbert"
             ),
             audio_input_format=_STTAudioFormat(
                 encoding=_STTAudioEncoding.PCM_S16LE,
