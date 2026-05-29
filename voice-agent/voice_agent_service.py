@@ -1365,11 +1365,12 @@ class VoiceAgentService(Service):
                     "many seconds of the assistant's last TTS playback "
                     "are checked for echo and dropped if they look "
                     "like Gilbert's own voice bleeding back through "
-                    "the speakers. Covers the browser audio buffer "
-                    "drain after a barge-in. Set to 0 to disable. "
-                    "Default 1.5s."
+                    "the speakers. Needs to cover both the browser "
+                    "audio buffer drain after a barge-in (~500ms) AND "
+                    "Scribe's commit pipeline (~1-3s) — default 5s "
+                    "is tuned for both. Set to 0 to disable."
                 ),
-                default=1.5,
+                default=5.0,
             ),
             ConfigParam(
                 key="echo_guard_token_overlap_threshold",
@@ -1823,13 +1824,19 @@ class VoiceAgentService(Service):
             # Gilbert's own audio (especially after barge-in
             # interrupts mid-utterance). This drops Scribe
             # transcripts that match the recent assistant text
-            # within a short window. Default 1.5s window is
-            # tuned to cover the browser's audio buffer drain
-            # after audio_out.clear() without false-flagging
-            # quick follow-on user turns.
+            # within a window.
+            #
+            # The default 5s window is tuned for Scribe Realtime's
+            # commit pipeline: when barge-in cancels TTS, the mic
+            # captures the residual playback (browser audio buffer
+            # takes ~500ms to drain after audio_out.clear()), then
+            # Scribe takes another 1-3s to commit the captured
+            # echo as a transcript. The first deploy used 1.5s
+            # and missed everything because the echo arrived 3-4s
+            # after the cancel moment.
             echo_guard_window_seconds=float(
-                self._config.get("echo_guard_window_seconds", 1.5)
-                or 1.5
+                self._config.get("echo_guard_window_seconds", 5.0)
+                or 5.0
             ),
             echo_guard_token_overlap_threshold=float(
                 self._config.get(
