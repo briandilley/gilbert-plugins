@@ -489,3 +489,138 @@ async def test_connection_error_unblocks_pending_connect() -> None:
     # to detect the failed state.
     await asyncio.wait_for(connect_task, timeout=1.0)
     assert session.is_connected is False
+
+
+# ── DEVICE_STATE_UPDATE handling ────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_device_state_full_snapshot_replaces_state() -> None:
+    """``fullSnapshot=True`` replaces the cached GlassesInfo entirely
+    — used on initial connection and reconnect. Per the SDK contract
+    the partial-diff path should not have any state from before this
+    frame."""
+    transport = _FakeTransport()
+    session = _make_session(transport)
+
+    # Seed prior partial state to prove it gets blown away.
+    await transport.inject(
+        {
+            "type": "device_state_update",
+            "state": {"batteryLevel": 42},
+            "fullSnapshot": False,
+        }
+    )
+    assert session.glasses_info.get("batteryLevel") == 42
+
+    # Full snapshot — only carries what's in this frame.
+    await transport.inject(
+        {
+            "type": "device_state_update",
+            "state": {
+                "connected": True,
+                "modelName": "Even G1",
+                "batteryLevel": 87,
+            },
+            "fullSnapshot": True,
+        }
+    )
+    info = session.glasses_info
+    assert info == {
+        "connected": True,
+        "modelName": "Even G1",
+        "batteryLevel": 87,
+    }
+    assert session.is_glasses_connected is True
+
+
+@pytest.mark.asyncio
+async def test_device_state_partial_diff_merges() -> None:
+    """Partial diffs (``fullSnapshot`` absent or False) merge into
+    the existing cache. This is the common case after the initial
+    snapshot — a battery tick or a connection-state flip arrives
+    with just the changed fields."""
+    transport = _FakeTransport()
+    session = _make_session(transport)
+
+    await transport.inject(
+        {
+            "type": "device_state_update",
+            "state": {
+                "connected": True,
+                "modelName": "G1",
+                "batteryLevel": 80,
+            },
+            "fullSnapshot": True,
+        }
+    )
+    # Battery tick — only the one field.
+    await transport.inject(
+        {
+            "type": "device_state_update",
+            "state": {"batteryLevel": 79},
+        }
+    )
+    info = session.glasses_info
+    assert info["batteryLevel"] == 79
+    assert info["modelName"] == "G1"
+    assert info["connected"] is True
+    # Connection flip — only the connected field.
+    await transport.inject(
+        {
+            "type": "device_state_update",
+            "state": {"connected": False},
+        }
+    )
+    assert session.is_glasses_connected is False
+    assert session.glasses_info["modelName"] == "G1"
+
+
+@pytest.mark.asyncio
+async def test_on_device_state_fires_with_merged_snapshot() -> None:
+    """The on_device_state callback receives the cumulative state +
+    a flag telling it whether this frame was a full snapshot. This
+    is what the service layer hooks to gate the voice engine on
+    glasses-connected."""
+    transport = _FakeTransport()
+    session = _make_session(transport)
+
+    events: list[tuple[bool, bool]] = []  # (connected, full)
+
+    async def _on_state(info: dict[str, Any], full: bool) -> None:
+        events.append((bool(info.get("connected")), full))
+
+    session.on_device_state(_on_state)
+
+    await transport.inject(
+        {
+            "type": "device_state_update",
+            "state": {"connected": False, "modelName": "G1"},
+            "fullSnapshot": True,
+        }
+    )
+    await transport.inject(
+        {
+            "type": "device_state_update",
+            "state": {"connected": True},
+        }
+    )
+    await transport.inject(
+        {
+            "type": "device_state_update",
+            "state": {"connected": False},
+        }
+    )
+
+    assert events == [(False, True), (True, False), (False, False)]
+
+
+@pytest.mark.asyncio
+async def test_is_glasses_connected_defaults_false_pre_update() -> None:
+    """Sessions that haven't received any device_state_update yet
+    must report glasses-not-connected so callers don't false-positive
+    on uninitialized state."""
+    transport = _FakeTransport()
+    session = _make_session(transport)
+    assert session.is_glasses_connected is False
+    assert session.glasses_info == {}

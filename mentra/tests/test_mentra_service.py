@@ -341,6 +341,18 @@ async def _drive_session_admit(
     )
     result = await task
     assert result.status == "success", result.message
+    # Tell the engine the glasses ARE connected so it stops waiting
+    # at the glasses-connected gate. Real Mentra Cloud sends this
+    # ``device_state_update`` shortly after CONNECTION_ACK with
+    # ``fullSnapshot: true`` — without it the engine times out
+    # after 20s without ever calling voice_brain.run_conversation.
+    await fake.inject(
+        {
+            "type": "device_state_update",
+            "state": {"connected": True, "modelName": "test-glasses"},
+            "fullSnapshot": True,
+        }
+    )
     return fake
 
 
@@ -1101,3 +1113,107 @@ def test_noop_brain_tool_provider_satisfies_engine_contract() -> None:
 
     p = _NoopBrainToolProvider()
     assert p.get_brain_tools() == []
+
+
+# ── Glasses-connected gate ──────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_engine_starts_only_after_glasses_connect(
+    monkeypatch: Any,
+) -> None:
+    """The service must NOT call voice_brain.run_conversation until
+    the cloud confirms the glasses are physically reachable. The
+    iPhone app frequently starts the cloud session before the user
+    has connected the glasses; without this gate Gilbert tries to
+    greet a non-existent endpoint."""
+    brain = _FakeVoiceBrain()
+    svc, _, _, _, _ = await _start_service(brain=brain)
+
+    fake = _FakeTransport()
+    from gilbert_plugin_mentra import mentra_service as ms
+
+    monkeypatch.setattr(ms, "WebSocketTransport", lambda **_kwargs: fake)
+
+    task = asyncio.create_task(
+        svc.deliver_webhook_event(
+            {
+                "type": "session_request",
+                "sessionId": "sess_001",
+                "userId": "alice@example.com",
+                "timestamp": "2099-01-01T00:00:00Z",
+                "websocketUrl": "wss://cloud.mentra.glass/app-ws",
+            }
+        )
+    )
+    for _ in range(3):
+        await asyncio.sleep(0)
+    await fake.inject({"type": "tpa_connection_ack", "sessionId": "sess_001"})
+    await task
+
+    # Yield a few times so the engine task can start its wait.
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    # Engine hasn't been invoked yet — we're still in the
+    # glasses-ready wait.
+    assert len(brain.calls) == 0
+
+    # Now signal the glasses came up.
+    await fake.inject(
+        {
+            "type": "device_state_update",
+            "state": {"connected": True, "modelName": "test-glasses"},
+            "fullSnapshot": True,
+        }
+    )
+
+    # Engine should kick off promptly.
+    for _ in range(10):
+        await asyncio.sleep(0)
+        if brain.calls:
+            break
+    assert len(brain.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_engine_does_not_start_if_glasses_never_connect(
+    monkeypatch: Any,
+) -> None:
+    """If the user never connects the glasses, the engine task ends
+    cleanly without ever invoking voice_brain. The session sits idle
+    until the Mentra Cloud teardown / stop_request fires."""
+    from gilbert_plugin_mentra import mentra_service as ms
+
+    # Bring the timeout WAY down for the test (default is 20s).
+    monkeypatch.setattr(
+        ms, "_GLASSES_CONNECT_TIMEOUT_SECONDS", 0.1, raising=False
+    )
+
+    brain = _FakeVoiceBrain()
+    svc, _, _, _, _ = await _start_service(brain=brain)
+
+    fake = _FakeTransport()
+    monkeypatch.setattr(ms, "WebSocketTransport", lambda **_kwargs: fake)
+
+    task = asyncio.create_task(
+        svc.deliver_webhook_event(
+            {
+                "type": "session_request",
+                "sessionId": "sess_001",
+                "userId": "alice@example.com",
+                "timestamp": "2099-01-01T00:00:00Z",
+                "websocketUrl": "wss://cloud.mentra.glass/app-ws",
+            }
+        )
+    )
+    for _ in range(3):
+        await asyncio.sleep(0)
+    await fake.inject({"type": "tpa_connection_ack", "sessionId": "sess_001"})
+    await task
+
+    # Wait past the timeout; do NOT inject device_state_update.
+    await asyncio.sleep(0.3)
+
+    # Engine task should have exited without ever calling voice_brain.
+    assert len(brain.calls) == 0

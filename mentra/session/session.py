@@ -257,6 +257,22 @@ class MentraSession:
         # / BOOT_TIMEOUT). Cloud re-fires the webhook on the next
         # user-initiated open, so we don't need full auto-reconnect.
         self._permanent: bool = False
+        # Latest known state of the user's smart glasses, populated from
+        # ``DEVICE_STATE_UPDATE`` frames. The cloud sends a full
+        # snapshot once the cloud session is up (with
+        # ``fullSnapshot=True``) and partial diffs whenever any field
+        # changes — most importantly the ``connected: bool`` field,
+        # which flips false when the user takes the glasses off or
+        # they go out of Bluetooth range. The service layer reads
+        # ``is_glasses_connected`` and listens via ``on_device_state``
+        # to gate audio output when the glasses can't actually hear
+        # us. Without this, the Mentra iPhone app firing a session
+        # while the glasses are disconnected makes Gilbert speak into
+        # the void.
+        self._glasses_info: dict[str, Any] = {}
+        self._device_state_handlers: list[
+            Callable[[dict[str, Any], bool], Awaitable[None]]
+        ] = []
 
         # Wire transport callbacks into our dispatch.
         self._transport.on_text(self._on_text)
@@ -322,6 +338,41 @@ class MentraSession:
             and self._connected.is_set()
         )
 
+    @property
+    def glasses_info(self) -> dict[str, Any]:
+        """Latest ``GlassesInfo`` snapshot from the cloud.
+
+        Empty ``{}`` until the first ``DEVICE_STATE_UPDATE`` lands —
+        which the cloud sends shortly after ``CONNECTION_ACK`` with
+        ``fullSnapshot=True``. After that it carries the merged state
+        of every per-field diff (battery, wifi, hotspot, case, etc.).
+        Returns a defensive copy so callers can't mutate our cache.
+        """
+        return dict(self._glasses_info)
+
+    @property
+    def is_glasses_connected(self) -> bool:
+        """Whether the physical smart glasses are reachable from the
+        phone right now.
+
+        The Mentra cloud distinguishes between "app session is alive"
+        (which is when the cloud's session webhook fired and our WS
+        is up) and "glasses are physically paired + in range" — the
+        latter is the ``connected: bool`` field on the cloud's
+        ``GlassesInfo`` object, delivered via ``DEVICE_STATE_UPDATE``
+        frames. The Mentra iPhone app often starts our app even
+        when the glasses aren't actually connected (because the user
+        just opened the Mentra app); without this check Gilbert
+        speaks into a non-existent speaker.
+
+        Returns ``False`` until the first device-state update arrives
+        too — be aware that there's a small window after CONNECT_ACK
+        where we don't yet know whether the glasses are reachable.
+        Pair with a short timeout in the service layer if you need
+        a definitive "no glasses" verdict.
+        """
+        return bool(self._glasses_info.get("connected", False))
+
     async def connect(self) -> None:
         """Open the transport and send the connection-init frame.
         Resolves when the cloud's ``CONNECTION_ACK`` has arrived (or
@@ -367,6 +418,25 @@ class MentraSession:
         self._stopped_handlers.append(handler)
         return lambda: _safe_remove(self._stopped_handlers, handler)
 
+    def on_device_state(
+        self,
+        handler: Callable[[dict[str, Any], bool], Awaitable[None]],
+    ) -> Callable[[], None]:
+        """Subscribe to ``DEVICE_STATE_UPDATE`` frames.
+
+        Handler signature: ``(merged_info, is_full_snapshot)``. The
+        merged_info dict is the cumulative ``GlassesInfo`` state
+        after applying this update — equivalent to what
+        ``glasses_info`` returns immediately after the handler
+        fires. ``is_full_snapshot`` tells the handler whether this
+        was a complete state replacement (first update of a session,
+        or a reconnect) vs a partial diff.
+
+        Returns an unsubscribe callable.
+        """
+        self._device_state_handlers.append(handler)
+        return lambda: _safe_remove(self._device_state_handlers, handler)
+
     def on_message(
         self, msg_type: str, handler: Callable[[dict[str, Any]], Awaitable[None]]
     ) -> Callable[[], None]:
@@ -397,6 +467,10 @@ class MentraSession:
         self._messages.register(
             CloudToAppMessageType.CAPABILITIES_UPDATE.value,
             self._on_capabilities_update,
+        )
+        self._messages.register(
+            CloudToAppMessageType.DEVICE_STATE_UPDATE.value,
+            self._on_device_state_update,
         )
         self._messages.register(
             CloudToAppMessageType.APP_STOPPED.value, self._on_app_stopped
@@ -540,6 +614,49 @@ class MentraSession:
         caps_raw = message.get("capabilities")
         if isinstance(caps_raw, dict):
             self._capabilities = _parse_capabilities(caps_raw)
+
+    async def _on_device_state_update(self, message: dict[str, Any]) -> None:
+        """Apply a ``DEVICE_STATE_UPDATE`` frame to the cached
+        ``GlassesInfo`` snapshot + notify subscribers.
+
+        Per the Mentra SDK contract, ``fullSnapshot=True`` means
+        REPLACE everything (initial connection or reconnect);
+        otherwise the frame carries a partial diff of just the
+        changed fields. Most importantly, ``state.connected``
+        flips when the glasses' BLE link to the phone goes up
+        or down, which is the user-visible "are the glasses on
+        and in range" signal the rest of the plugin gates on.
+        """
+        full_snapshot = bool(message.get("fullSnapshot"))
+        state = message.get("state")
+        if not isinstance(state, dict):
+            state = {}
+        if full_snapshot:
+            self._glasses_info = dict(state)
+        else:
+            self._glasses_info.update(state)
+        # One-line operational log so it's easy to see in journals
+        # when the glasses connection state changes — without
+        # spamming on every battery / wifi tick by gating on
+        # 'connected' being present in this specific frame.
+        if "connected" in state:
+            logger.info(
+                "Mentra device-state: connected=%s (full=%s model=%r battery=%s)",
+                bool(state.get("connected")),
+                full_snapshot,
+                self._glasses_info.get("modelName"),
+                self._glasses_info.get("batteryLevel"),
+            )
+        # Hand the merged snapshot to subscribers. Defensive copy
+        # so callbacks can't accidentally mutate our cache.
+        snapshot = dict(self._glasses_info)
+        for handler in list(self._device_state_handlers):
+            try:
+                await handler(snapshot, full_snapshot)
+            except Exception:
+                logger.exception(
+                    "Mentra device-state handler raised"
+                )
 
     async def _on_app_stopped(self, message: dict[str, Any]) -> None:
         reason = str(message.get("reason") or "unknown")

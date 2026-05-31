@@ -157,6 +157,14 @@ _DEFAULT_GOODBYE_PHRASES = [
 # Sonnet) but covers every knowledge.search / MCP call.
 _FILLER_THRESHOLD_SECONDS = 3.0
 
+# Wait this long after CONNECTION_ACK for ``device_state_update``
+# to confirm the glasses are physically connected before the engine
+# starts speaking. Tests monkey-patch this down to 0.1s. Default
+# 20s covers the typical sub-500ms cloud-side handshake plus
+# slack for users who tap "Start" in the Mentra iPhone app while
+# the glasses are still booting / pairing.
+_GLASSES_CONNECT_TIMEOUT_SECONDS = 20.0
+
 
 class _NoopBrainToolProvider:
     """No-op ``BrainToolProvider`` for the ``use_full_ai_service=True``
@@ -1407,6 +1415,57 @@ class MentraService(Service):
         # perspective.
         inject_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=50)
 
+        # ── Glasses-connected gate ─────────────────────────────────
+        # The Mentra iPhone app sometimes starts our app even when
+        # the glasses aren't actually paired/connected — the cloud
+        # session fires on the app re-foregrounding; the BT link to
+        # the glasses is a separate concern. Without gating, Gilbert
+        # speaks into a void: TTS bytes go to a cloud session that
+        # has no audible endpoint, the user thinks Gilbert never
+        # responded, the session burns API credits, and the SPA
+        # ``/conversations`` page shows a session that the user
+        # never actually had.
+        #
+        # ``voice_brain``'s ``listening_paused`` event won't help
+        # us here — Mentra runs the engine with
+        # ``disable_internal_stt=True`` (Mentra Cloud does the STT
+        # server-side), so the listen loop early-returns and
+        # ``listening_paused`` is never checked. Instead we gate at
+        # the engine BOUNDARY: don't kick the engine into ACTIVE
+        # until ``is_glasses_connected`` is true, and end the
+        # conversation cleanly if it goes false mid-session. Mentra
+        # Cloud will re-fire the session webhook when the user
+        # reconnects the glasses, so this is a graceful "wait,
+        # nothing's actually listening" rather than a hard failure.
+        glasses_ready = asyncio.Event()
+        if session.is_glasses_connected:
+            glasses_ready.set()
+        glasses_disconnected = asyncio.Event()
+
+        async def _on_device_state(
+            info: dict[str, Any], full: bool
+        ) -> None:
+            connected = bool(info.get("connected", False))
+            was_ready = glasses_ready.is_set()
+            if connected and not was_ready:
+                logger.info(
+                    "Mentra glasses connected for session=%s "
+                    "(model=%r) — engine starting",
+                    session.session_id,
+                    info.get("modelName"),
+                )
+                glasses_ready.set()
+            elif not connected and was_ready:
+                logger.info(
+                    "Mentra glasses disconnected for session=%s — "
+                    "ending engine (cloud will re-fire webhook on "
+                    "reconnect)",
+                    session.session_id,
+                )
+                glasses_disconnected.set()
+
+        session.on_device_state(_on_device_state)
+
         async def _on_transcription(data: Any) -> None:
             # Only commit on isFinal — partials are noise, the engine
             # would re-think on every keystroke.
@@ -1654,12 +1713,82 @@ class MentraService(Service):
             inject_synthetic_user_turn_queue=inject_queue,
         )
 
-        # Kick the engine off with an ACTIVE event so its opening
-        # policy fires immediately. The status loop schedules
-        # ``_open_proactively`` on ACTIVE, which is what generates
-        # the "Welcome to Gilbert"-style greeting.
+        # Wait for glasses to actually be reachable before kicking
+        # the engine into ACTIVE. The cloud sends a
+        # ``DEVICE_STATE_UPDATE`` with the initial ``GlassesInfo``
+        # shortly after CONNECTION_ACK; the connect-time race window
+        # is typically <500 ms, but the Mentra iPhone app commonly
+        # starts our app while the glasses are powered off or out
+        # of range, in which case the user never connects them and
+        # the cloud session just sits idle. Cap the wait so we
+        # don't hold the session open forever in that case — bail
+        # cleanly and let the cloud re-fire the webhook when the
+        # user actually puts the glasses on.
+        if not glasses_ready.is_set():
+            logger.info(
+                "Mentra waiting up to %.1fs for glasses to connect "
+                "(session=%s) — cloud session is live but BT link not "
+                "confirmed yet",
+                _GLASSES_CONNECT_TIMEOUT_SECONDS,
+                session.session_id,
+            )
+            try:
+                await asyncio.wait_for(
+                    glasses_ready.wait(),
+                    timeout=_GLASSES_CONNECT_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.info(
+                    "Mentra session %s timed out waiting for glasses "
+                    "to connect — ending engine without speaking. "
+                    "Mentra Cloud re-fires the webhook on user open, "
+                    "so the next time the glasses are actually paired "
+                    "we'll get a fresh session_request.",
+                    session.session_id,
+                )
+                try:
+                    transcription_cleanup()
+                except Exception:
+                    pass
+                conv_session.closed = True
+                return
+
+        # Glasses are connected — kick the engine off with an ACTIVE
+        # event so its opening policy fires. The status loop
+        # schedules ``_open_proactively`` on ACTIVE, which is what
+        # generates the "Welcome to Gilbert"-style greeting.
         await conv_session.push_event(
             ConversationStatusEvent(status=ConversationStatus.ACTIVE)
+        )
+
+        # Watch for glasses disconnecting mid-session. If they go
+        # offline, end the engine cleanly — the conversation
+        # context is preserved in chat history, and when the user
+        # reconnects the glasses Mentra will fire a fresh session
+        # and we'll start over.
+        async def _watch_glasses_disconnect() -> None:
+            await glasses_disconnected.wait()
+            logger.info(
+                "Mentra glasses dropped mid-session %s — pushing "
+                "ENDED so the engine winds down",
+                session.session_id,
+            )
+            try:
+                await conv_session.push_event(
+                    ConversationStatusEvent(
+                        status=ConversationStatus.ENDED,
+                        reason="glasses_disconnected",
+                    )
+                )
+            except Exception:
+                logger.debug(
+                    "Push ENDED on glasses-disconnect raised",
+                    exc_info=True,
+                )
+
+        disconnect_watcher = asyncio.create_task(
+            _watch_glasses_disconnect(),
+            name=f"mentra-glasses-watch:{session.session_id}",
         )
 
         try:
@@ -1677,6 +1806,7 @@ class MentraService(Service):
                 session.session_id,
             )
         finally:
+            disconnect_watcher.cancel()
             # Unsubscribe from the transcription stream so we stop
             # paying bandwidth for a session no engine is consuming.
             try:
