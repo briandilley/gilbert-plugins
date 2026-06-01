@@ -3,6 +3,7 @@
 import json
 import logging
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -54,7 +55,13 @@ def _format_bytes(n: int) -> str:
         return f"{n / (1024 * 1024):.1f} MB"
     return f"{n / (1024 * 1024 * 1024):.1f} GB"
 
-_AVAILABLE_MODELS = [
+# Bundled fallback list — used when the on-disk cache from the
+# Anthropic ``GET /v1/models`` API isn't populated yet (fresh
+# install, missing API key, or first boot before the user hits
+# "Refresh models"). Anthropic ships new models more often than
+# we cut Gilbert releases, so this list ages quickly; the cache
+# below is the real source of truth once present.
+_FALLBACK_MODELS = [
     ModelInfo(
         id="claude-opus-4-20250514",
         name="Claude Opus 4",
@@ -73,6 +80,95 @@ _AVAILABLE_MODELS = [
 ]
 
 
+# Cache of models fetched from the live API. Populated by the
+# ``refresh_models`` action (see ``_action_refresh_models``); persisted
+# under ``.gilbert/plugin-data/anthropic/models.json`` so it survives
+# restarts. ``backend_config_params`` reads this and falls back to
+# ``_FALLBACK_MODELS`` when empty/missing.
+def _models_cache_path() -> Path:
+    """Disk location of the model-list cache. Lives next to the rest
+    of Gilbert's per-installation data (``.gilbert/plugin-data/<plugin>/``)
+    so it disappears with a clean uninstall and never gets committed."""
+    # Avoid a hard import of gilbert.config from a backend file (it
+    # could end up loading core machinery before the plugin loader
+    # has it ready). ``.gilbert`` is the established convention.
+    return Path(".gilbert") / "plugin-data" / "anthropic" / "models.json"
+
+
+def _load_cached_models() -> list[ModelInfo]:
+    """Read the cached model list off disk, or ``[]`` on any error.
+
+    The schema we persist is ``{"models": [{id, name, description}, ...]}``
+    — a thin wrapper around ``ModelInfo`` fields. We don't try to
+    handle multi-version migrations: if the JSON is malformed or
+    keys are missing we just drop the cache and fall back to the
+    hardcoded list.
+    """
+    path = _models_cache_path()
+    if not path.exists():
+        return []
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.debug("Anthropic models cache unreadable (%s); using fallback", exc)
+        return []
+    models_raw = raw.get("models")
+    if not isinstance(models_raw, list):
+        return []
+    out: list[ModelInfo] = []
+    for entry in models_raw:
+        if not isinstance(entry, dict):
+            continue
+        model_id = str(entry.get("id") or "")
+        if not model_id:
+            continue
+        out.append(
+            ModelInfo(
+                id=model_id,
+                name=str(entry.get("name") or model_id),
+                description=str(entry.get("description") or ""),
+            )
+        )
+    return out
+
+
+def _save_cached_models(models: list[ModelInfo]) -> None:
+    """Persist the fetched model list. Best-effort: errors are logged
+    and swallowed — failing to cache is not a hard failure for the
+    user-visible Refresh action."""
+    path = _models_cache_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "models": [
+                {"id": m.id, "name": m.name, "description": m.description}
+                for m in models
+            ],
+        }
+        path.write_text(json.dumps(payload, indent=2))
+    except OSError as exc:
+        logger.warning("Failed to write Anthropic models cache: %s", exc)
+
+
+def _available_models() -> list[ModelInfo]:
+    """Cache or fallback — the single source of truth for "what
+    Claude models can Gilbert offer right now." Used by both
+    ``backend_config_params`` (for ``choices=``) and ``available_models``
+    on the backend instance."""
+    cached = _load_cached_models()
+    return cached or list(_FALLBACK_MODELS)
+
+
+# Backward-compat alias for any plugins/tests still referencing the
+# old name. Resolves lazily so any updates to the on-disk cache
+# show up immediately.
+def _get_available_models() -> list[ModelInfo]:
+    return _available_models()
+
+
+_AVAILABLE_MODELS = _FALLBACK_MODELS  # deprecated — prefer _available_models()
+
+
 class AnthropicAI(AIBackend):
     """AI backend using the Anthropic Messages API via httpx."""
 
@@ -80,7 +176,12 @@ class AnthropicAI(AIBackend):
 
     @classmethod
     def backend_config_params(cls) -> list[ConfigParam]:
-        all_model_ids = [m.id for m in _AVAILABLE_MODELS]
+        # Pull from the on-disk cache (refreshed via the
+        # ``refresh_models`` action) with a hardcoded fallback. The
+        # cache lets us pick up new Claude models without a Gilbert
+        # release — operator hits "Refresh models", the choices on
+        # this very page update on the next render.
+        all_model_ids = [m.id for m in _available_models()]
         return [
             ConfigParam(
                 key="enabled",
@@ -146,6 +247,16 @@ class AnthropicAI(AIBackend):
                     "Send a tiny 'hi' message to the Anthropic API to verify the API key and model."
                 ),
             ),
+            ConfigAction(
+                key="refresh_models",
+                label="Refresh model list",
+                description=(
+                    "Fetch the current list of available Claude models from "
+                    "the Anthropic API. New models become available in the "
+                    "Model + Enabled Models pickers below — no Gilbert "
+                    "release required."
+                ),
+            ),
         ]
 
     async def invoke_backend_action(
@@ -155,6 +266,8 @@ class AnthropicAI(AIBackend):
     ) -> ConfigActionResult:
         if key == "test_connection":
             return await self._action_test_connection()
+        if key == "refresh_models":
+            return await self._action_refresh_models()
         return ConfigActionResult(
             status="error",
             message=f"Unknown action: {key}",
@@ -188,10 +301,113 @@ class AnthropicAI(AIBackend):
             message=f"Connected to Anthropic (model: {response.model}).",
         )
 
+    async def _action_refresh_models(self) -> ConfigActionResult:
+        """Fetch the current model list from Anthropic and replace the
+        on-disk cache. The user sees new models in the picker on the
+        next settings-page render.
+
+        Hits ``GET /v1/models`` per the Anthropic API docs. Paginates
+        via ``has_more`` + ``last_id`` — Anthropic's default limit is
+        20 per page; with a long tail of legacy + dated snapshots
+        we'd otherwise miss the newest ones if they came back later
+        in the list.
+        """
+        if self._client is None:
+            return ConfigActionResult(
+                status="error",
+                message=(
+                    "Anthropic backend not initialized — save your API "
+                    "key first, then click Refresh."
+                ),
+            )
+        try:
+            fetched = await self._fetch_models_from_api()
+        except AIBackendError as exc:
+            return ConfigActionResult(
+                status="error",
+                message=f"Anthropic API error: {exc}",
+            )
+        except httpx.HTTPError as exc:
+            return ConfigActionResult(
+                status="error",
+                message=f"Network error fetching models: {exc}",
+            )
+        except Exception as exc:
+            return ConfigActionResult(
+                status="error",
+                message=f"Unexpected error fetching models: {exc}",
+            )
+        if not fetched:
+            return ConfigActionResult(
+                status="error",
+                message="Anthropic /v1/models returned no models.",
+            )
+        _save_cached_models(fetched)
+        sample = ", ".join(m.id for m in fetched[:3])
+        more = "" if len(fetched) <= 3 else f", +{len(fetched) - 3} more"
+        return ConfigActionResult(
+            status="ok",
+            message=(
+                f"Refreshed {len(fetched)} Claude models from Anthropic "
+                f"(latest: {sample}{more}). Refresh the page to see "
+                f"them in the picker."
+            ),
+            data={"models": [m.id for m in fetched]},
+        )
+
+    async def _fetch_models_from_api(self) -> list[ModelInfo]:
+        """Walk ``GET /v1/models`` (paginated) and return the full list
+        as ``ModelInfo`` objects. Caller catches exceptions and surfaces
+        them in the action result."""
+        assert self._client is not None, "client must be initialized"
+        all_models: list[ModelInfo] = []
+        params: dict[str, Any] = {"limit": 100}
+        # Cap pages to avoid an unbounded loop if the API ever
+        # produces a bad ``has_more`` (defensive — Anthropic has
+        # ~tens of models, not thousands).
+        for _ in range(10):
+            resp = await self._client.get("/models", params=params)
+            if resp.status_code >= 400:
+                raise AIBackendError(
+                    f"HTTP {resp.status_code}: {resp.text[:300]}"
+                )
+            body = resp.json()
+            data = body.get("data") if isinstance(body, dict) else None
+            if not isinstance(data, list):
+                break
+            for entry in data:
+                if not isinstance(entry, dict):
+                    continue
+                model_id = str(entry.get("id") or "")
+                if not model_id:
+                    continue
+                display = str(entry.get("display_name") or model_id)
+                created = str(entry.get("created_at") or "")
+                # Anthropic doesn't ship a description; synthesize one
+                # from the display name + creation date so the picker
+                # tooltip is at least somewhat informative.
+                desc = (
+                    f"{display} (released {created[:10]})"
+                    if created
+                    else display
+                )
+                all_models.append(
+                    ModelInfo(id=model_id, name=display, description=desc)
+                )
+            if not body.get("has_more"):
+                break
+            last_id = body.get("last_id")
+            if not last_id:
+                break
+            params["after_id"] = last_id
+        return all_models
+
     def __init__(self) -> None:
         self._client: httpx.AsyncClient | None = None
         self._model: str = _DEFAULT_MODEL
-        self._enabled_models: list[str] = [m.id for m in _AVAILABLE_MODELS]
+        # Default to enabling every model the API/cache knows about
+        # right now. Persisted config overrides this in ``initialize``.
+        self._enabled_models: list[str] = [m.id for m in _available_models()]
         self._max_tokens: int = 16384
         self._temperature: float = 0.7
 
@@ -243,7 +459,11 @@ class AnthropicAI(AIBackend):
             self._client = None
 
     def available_models(self) -> list[ModelInfo]:
-        return [m for m in _AVAILABLE_MODELS if m.id in self._enabled_models]
+        # Read from the live cache (refreshed via the refresh_models
+        # action) rather than the hardcoded fallback, so newly
+        # available Claude models show up in the chat-UI model picker
+        # without a Gilbert release.
+        return [m for m in _available_models() if m.id in self._enabled_models]
 
     def capabilities(self) -> AIBackendCapabilities:
         return AIBackendCapabilities(

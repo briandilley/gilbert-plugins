@@ -1379,3 +1379,234 @@ def test_last_message_with_list_content_tags_last_block() -> None:
     content = last["content"]
     assert isinstance(content, list)
     assert content[-1].get("cache_control") == {"type": "ephemeral"}
+
+
+# --- Model cache + refresh action ---
+
+
+def test_load_cached_models_missing_file(monkeypatch, tmp_path) -> None:
+    """Missing cache file returns empty list — backend_config_params
+    then falls back to the hardcoded list."""
+    from gilbert_plugin_anthropic import anthropic_ai
+
+    monkeypatch.setattr(
+        anthropic_ai, "_models_cache_path", lambda: tmp_path / "missing.json"
+    )
+    assert anthropic_ai._load_cached_models() == []
+
+
+def test_load_cached_models_roundtrips(monkeypatch, tmp_path) -> None:
+    """Persist + load returns equivalent ModelInfo entries."""
+    from gilbert.interfaces.ai import ModelInfo
+    from gilbert_plugin_anthropic import anthropic_ai
+
+    cache = tmp_path / "models.json"
+    monkeypatch.setattr(anthropic_ai, "_models_cache_path", lambda: cache)
+
+    saved = [
+        ModelInfo(id="claude-x-2099", name="Claude X", description="future"),
+        ModelInfo(id="claude-y-2099", name="Claude Y", description="other"),
+    ]
+    anthropic_ai._save_cached_models(saved)
+    loaded = anthropic_ai._load_cached_models()
+    assert [m.id for m in loaded] == ["claude-x-2099", "claude-y-2099"]
+    assert loaded[0].name == "Claude X"
+
+
+def test_load_cached_models_malformed_falls_back(
+    monkeypatch, tmp_path
+) -> None:
+    """Corrupt JSON returns empty list — never raises into the
+    classmethod chain (would break the settings page)."""
+    from gilbert_plugin_anthropic import anthropic_ai
+
+    cache = tmp_path / "models.json"
+    cache.write_text("not valid json at all {{{")
+    monkeypatch.setattr(anthropic_ai, "_models_cache_path", lambda: cache)
+    assert anthropic_ai._load_cached_models() == []
+
+
+def test_available_models_prefers_cache_over_fallback(
+    monkeypatch, tmp_path
+) -> None:
+    """The cache wins when present. The fallback is for first-boot
+    only."""
+    from gilbert.interfaces.ai import ModelInfo
+    from gilbert_plugin_anthropic import anthropic_ai
+
+    cache = tmp_path / "models.json"
+    monkeypatch.setattr(anthropic_ai, "_models_cache_path", lambda: cache)
+    anthropic_ai._save_cached_models(
+        [ModelInfo(id="only-cached", name="Only", description="")]
+    )
+    out = anthropic_ai._available_models()
+    assert [m.id for m in out] == ["only-cached"]
+
+
+def test_available_models_falls_back_when_no_cache(
+    monkeypatch, tmp_path
+) -> None:
+    """No cache → fallback list (not empty)."""
+    from gilbert_plugin_anthropic import anthropic_ai
+
+    monkeypatch.setattr(
+        anthropic_ai,
+        "_models_cache_path",
+        lambda: tmp_path / "absent.json",
+    )
+    out = anthropic_ai._available_models()
+    assert len(out) > 0
+    assert all(m.id.startswith("claude-") for m in out)
+
+
+async def test_refresh_models_action_uninitialized_errors(
+    backend: AnthropicAI,
+) -> None:
+    """Calling refresh_models before the backend has a client should
+    return error status, not crash."""
+    result = await backend._action_refresh_models()
+    assert result.status == "error"
+    assert "not initialized" in result.message
+
+
+async def test_refresh_models_action_parses_paginated_response(
+    monkeypatch, tmp_path
+) -> None:
+    """The action paginates via has_more/last_id, parses display_name
+    + created_at, writes the cache. Two pages of two models each →
+    four models persisted."""
+    from gilbert_plugin_anthropic import anthropic_ai
+
+    cache = tmp_path / "models.json"
+    monkeypatch.setattr(
+        anthropic_ai, "_models_cache_path", lambda: cache
+    )
+
+    page_1 = {
+        "data": [
+            {
+                "type": "model",
+                "id": "claude-aaa-2099",
+                "display_name": "Claude AAA",
+                "created_at": "2099-01-15T00:00:00Z",
+            },
+            {
+                "type": "model",
+                "id": "claude-bbb-2099",
+                "display_name": "Claude BBB",
+                "created_at": "2099-02-15T00:00:00Z",
+            },
+        ],
+        "has_more": True,
+        "first_id": "claude-aaa-2099",
+        "last_id": "claude-bbb-2099",
+    }
+    page_2 = {
+        "data": [
+            {
+                "type": "model",
+                "id": "claude-ccc-2099",
+                "display_name": "Claude CCC",
+                "created_at": "2099-03-15T00:00:00Z",
+            },
+            {
+                "type": "model",
+                "id": "claude-ddd-2099",
+                "display_name": "Claude DDD",
+                "created_at": "2099-04-15T00:00:00Z",
+            },
+        ],
+        "has_more": False,
+        "first_id": "claude-ccc-2099",
+        "last_id": "claude-ddd-2099",
+    }
+
+    import httpx as _httpx
+
+    pages = [page_1, page_2]
+    seen_after_ids: list[str] = []
+
+    def handler(request: _httpx.Request) -> _httpx.Response:
+        after = request.url.params.get("after_id")
+        if after is not None:
+            seen_after_ids.append(after)
+        body = pages.pop(0) if pages else {"data": [], "has_more": False}
+        return _httpx.Response(200, json=body)
+
+    backend = AnthropicAI()
+    backend._client = _httpx.AsyncClient(
+        base_url="https://api.anthropic.com/v1",
+        transport=_httpx.MockTransport(handler),
+    )
+
+    result = await backend._action_refresh_models()
+    await backend.close()
+
+    assert result.status == "ok"
+    # Second page request carried after_id pointing at page 1's last.
+    assert seen_after_ids == ["claude-bbb-2099"]
+    # All four models were persisted to the cache.
+    cached_ids = [m.id for m in anthropic_ai._load_cached_models()]
+    assert cached_ids == [
+        "claude-aaa-2099",
+        "claude-bbb-2099",
+        "claude-ccc-2099",
+        "claude-ddd-2099",
+    ]
+    # Action result data includes the same list for any UI consumer.
+    assert result.data["models"] == cached_ids
+
+
+async def test_refresh_models_action_surfaces_http_error(
+    monkeypatch, tmp_path
+) -> None:
+    """A 401 (bad key) shouldn't crash the action — surface as a
+    user-readable error message."""
+    from gilbert_plugin_anthropic import anthropic_ai
+
+    monkeypatch.setattr(
+        anthropic_ai,
+        "_models_cache_path",
+        lambda: tmp_path / "models.json",
+    )
+
+    import httpx as _httpx
+
+    def handler(request: _httpx.Request) -> _httpx.Response:
+        return _httpx.Response(
+            401, json={"type": "error", "error": {"message": "bad key"}}
+        )
+
+    backend = AnthropicAI()
+    backend._client = _httpx.AsyncClient(
+        base_url="https://api.anthropic.com/v1",
+        transport=_httpx.MockTransport(handler),
+    )
+    result = await backend._action_refresh_models()
+    await backend.close()
+    assert result.status == "error"
+    assert "401" in result.message or "Anthropic" in result.message
+
+
+def test_backend_config_params_uses_dynamic_choices(
+    monkeypatch, tmp_path
+) -> None:
+    """When the cache has models, ``model`` + ``enabled_models`` get
+    those as their choices (not the hardcoded fallback)."""
+    from gilbert.interfaces.ai import ModelInfo
+    from gilbert_plugin_anthropic import anthropic_ai
+
+    cache = tmp_path / "models.json"
+    monkeypatch.setattr(anthropic_ai, "_models_cache_path", lambda: cache)
+    anthropic_ai._save_cached_models(
+        [
+            ModelInfo(id="dyn-aaa", name="A", description=""),
+            ModelInfo(id="dyn-bbb", name="B", description=""),
+        ]
+    )
+
+    params = AnthropicAI.backend_config_params()
+    by_key = {p.key: p for p in params}
+    assert by_key["model"].choices == ("dyn-aaa", "dyn-bbb")
+    assert by_key["enabled_models"].choices == ("dyn-aaa", "dyn-bbb")
+    assert by_key["enabled_models"].default == ["dyn-aaa", "dyn-bbb"]
