@@ -253,9 +253,15 @@ class AnthropicAI(AIBackend):
                 description=(
                     "Fetch the current list of available Claude models from "
                     "the Anthropic API. New models become available in the "
-                    "Model + Enabled Models pickers below — no Gilbert "
-                    "release required."
+                    "Model + Enabled Models pickers — no Gilbert release "
+                    "required."
                 ),
+                # Render this button inline directly beneath the
+                # "Default model ID" dropdown so the affordance lives
+                # next to the data it refreshes, instead of getting
+                # buried in the global Actions block at the bottom of
+                # the AI settings section.
+                inline_after_param="model",
             ),
         ]
 
