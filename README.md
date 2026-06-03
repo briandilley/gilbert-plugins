@@ -69,6 +69,7 @@ The table below is an index — jump to each plugin's detail section for configu
 | [tesseract](#tesseract) | `OCRBackend "tesseract"` | `pytesseract` | Intelligence |
 | [unifi](#unifi) | `PresenceBackend "unifi"`, `DoorbellBackend "unifi"` | — (uses `httpx`/`aiohttp`) | Monitoring |
 | [voice-agent](#voice-agent) | `voice_agent` service (wake-word-activated voice conversation, `/voice` SPA page) | — (pure stdlib) | Speech |
+| [web-push](#web-push) | `PushNotificationBackend "web_push"` | `pywebpush`, `cryptography` | Notifications |
 | [withings](#withings) | `HealthBackend "withings"` | `httpx` | Health |
 | [xai](#xai) | `AIBackend "xai"` | — (uses `httpx`) | Intelligence |
 
@@ -1436,6 +1437,43 @@ The full Gilbert tool ecosystem is available during a session — knowledge sear
 **No user-facing configuration** beyond the standard service on/off toggle and per-session opening policy (which lives on the engine config, not the service).
 
 **No third-party Python dependencies** — relies entirely on capabilities already resolved through the core service manager.
+
+---
+
+### web-push
+
+Browser / PWA push notifications via the [Web Push Protocol](https://datatracker.ietf.org/doc/html/rfc8030) (RFC 8030), using a VAPID keypair to authenticate the server to the push services (FCM for Chrome/Edge, autopush for Firefox, Apple Push Service for Safari 16.4+ PWAs). Each subscribed browser becomes one push-notification route — users can subscribe multiple devices and the routes page lists each separately.
+
+**Backend registered** — `PushNotificationBackend.backend_name = "web_push"`.
+
+**Generating VAPID keys (once, by an admin).** Visit Settings → Notifications → Web Push and click **Generate VAPID keys**. The action returns a fresh ECDSA P-256 keypair: the **public** key as base64url-no-pad (the form browsers expect for `applicationServerKey`) and the **private** key as a PKCS#8 PEM blob. Paste both values into the corresponding fields above the button and click Save. The action does not auto-persist — the admin reviews and saves explicitly so a fat-finger click can't rotate keys out from under existing subscriptions.
+
+**Per-user destination fields** (set on `/account` via the Browser notifications panel — users do NOT fill these in by hand)
+- `endpoint` — push service endpoint URL produced by `PushManager.subscribe`.
+- `p256dh` — subscriber's P-256 ECDH public key (base64url).
+- `auth` *(sensitive)* — subscriber's auth secret (base64url).
+- `user_agent` — optional friendly device label (e.g. "Firefox on Mac") so the user can tell their devices apart on the routes page.
+
+**Admin config** (Settings → Notifications → Backend: web_push)
+- `vapid_public_key` — Base64url-no-pad VAPID public key. Browsers use this to authenticate the subscription. Generated via the action above.
+- `vapid_private_key` *(sensitive)* — PEM-encoded ECDSA P-256 private key. Treat as a credential — leaking it lets anyone impersonate Gilbert to subscribed browsers.
+- `vapid_subject` — `mailto:` or `https:` URL identifying the server operator (default `mailto:admin@example.com`; required by FCM and Mozilla autopush — use a real mailbox you own).
+- `ttl_seconds` — Push-service retention window if the browser is offline (default `86400`; most providers cap at 4 weeks).
+- `timeout` — HTTP timeout in seconds (default `10`).
+
+**Config actions**
+- `generate_vapid_keys` — generates a fresh P-256 VAPID keypair and returns it via `ConfigActionResult.data` so the admin can paste the values into the public/private fields. Anchored inline below the `vapid_public_key` field.
+- `test_connection` — sends a one-line test push to a subscription provided in the action payload (`endpoint`, `p256dh`, `auth`). The SPA's per-route Test button on `/account/notifications` supplies these automatically.
+
+**How users subscribe.** Visit `/account`, scroll to the **Browser notifications** panel, click **Enable browser notifications**. The browser will prompt for notification permission, the panel calls `PushManager.subscribe` with the server's VAPID public key, then registers the resulting `PushSubscription` as a route via the standard `push.routes.create` RPC. No plugin-specific WS endpoints are introduced — the VAPID public key is surfaced through the existing `push.backends.list` RPC's `runtime_data` field.
+
+**iOS caveats.** Safari 16.4+ supports Web Push, but only for sites the user has **added to their Home Screen as a PWA**. A plain Safari tab can't receive pushes on iOS. The subscribe panel detects unsupported environments and shows a hint instead of the button.
+
+**Service-worker payload shape.** The backend POSTs `{title, body, icon, badge, tag, data: {url, notification_id, source}}` as the encrypted push payload. A service worker registered by the core SPA decrypts and forwards this to `registration.showNotification(...)`; clicking the notification navigates to `data.url` (the `deep_link_url` from the original notification, or `/` as a fallback).
+
+**Status mapping.** HTTP 2xx → `DELIVERED`; 404 / 410 (subscription gone) → `REJECTED` so the route gets removed; 429 → `TRANSIENT_ERROR` with the `Retry-After` header parsed (capped at 60s); 5xx and network errors → `TRANSIENT_ERROR`. All error strings are scrubbed through a regex that redacts Bearer tokens, webhook URLs, and PEM private-key blocks before they land in the result message.
+
+**Dependencies** — `pywebpush>=2.0` (which handles ECDH-ES payload encryption per RFC 8291 and VAPID JWT signing per RFC 8292), `cryptography>=42` (transitively pulled by pywebpush; pinned explicitly).
 
 ---
 

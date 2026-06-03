@@ -1,0 +1,9 @@
+name: web-push
+version: "1.0.0"
+description: "Browser/PWA push notifications via Web Push (VAPID)."
+
+provides:
+  - web_push
+
+requires: []
+depends_on: []
