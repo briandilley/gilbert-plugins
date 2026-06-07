@@ -85,6 +85,7 @@ from gilbert.interfaces.storage import (
 )
 from gilbert.interfaces.tools import ToolParameterType
 from gilbert.interfaces.tts import AudioFormat as TTSAudioFormat
+from gilbert.interfaces.users import UserManagementProvider
 
 from .session import MentraSession, MentraSessionConfig, WebSocketTransport
 from .voice_session import _MentraAudioSink, _MentraConversationSession
@@ -2134,10 +2135,29 @@ class MentraService(Service):
     ) -> UserContext | None:
         """Map a Mentra ``userId`` (email) to a Gilbert UserContext.
 
-        The mapping table is keyed by the Mentra-side email. If no
-        row exists, we refuse the session — auto-creating users
-        would be a surprise; the operator should explicitly opt
-        each Mentra account in via the Settings UI.
+        The mapping table is keyed by the Mentra-side email. The
+        stored ``gilbert_user_id`` may be a canonical user id
+        (``usr_xxx``), a username, OR an email — the Settings UI
+        accepts whichever the operator types. We canonicalize via
+        the ``users`` capability so the resulting ``UserContext``
+        carries the REAL ``user_id`` and ``roles`` from the user
+        row, not whatever string + role list the operator typed
+        into the mapping form.
+
+        Why this matters: downstream gates (MCP visibility,
+        per-conversation ACLs, the AI service's tool RBAC) compare
+        ``user_ctx.user_id`` against canonical owner ids
+        (``usr_xxx``) and check role membership exactly. A mapping
+        that stores ``gilbert_user_id="jeremy"`` would otherwise
+        produce a ``UserContext(user_id="jeremy", roles={"user"})``
+        which fails the owner-id check on every private MCP server
+        AND fails the admin bypass even when the real user *is* an
+        admin — so the glasses-bound session sees none of the
+        user's MCPs.
+
+        If no row exists, we refuse the session — auto-creating
+        users would be a surprise; the operator should explicitly
+        opt each Mentra account in via the Settings UI.
         """
         if self._storage is None:
             return None
@@ -2163,16 +2183,98 @@ class MentraService(Service):
         if not rows:
             return None
         row = rows[0]
-        gilbert_user_id = str(row.get("gilbert_user_id") or "")
-        if not gilbert_user_id:
+        stored_id = str(row.get("gilbert_user_id") or "")
+        if not stored_id:
             return None
+
+        # Canonicalize the stored id via the ``users`` capability.
+        # Try id → username → email so the operator can type any
+        # of the three in the mapping form.
+        canonical = await self._lookup_canonical_user(stored_id)
+        if canonical is None:
+            # Defensive fallback — preserve the stored values so the
+            # session admits (we don't want to break legacy mappings
+            # if the users service is misconfigured) but log loud so
+            # the operator notices their mapping is going to silently
+            # miss every owner-id check downstream.
+            logger.warning(
+                "Mentra mapping %r → %r doesn't resolve through the "
+                "users capability — falling back to the stored values. "
+                "Downstream tool RBAC + private-MCP visibility will "
+                "miss. Fix by entering the canonical user_id "
+                "(``usr_xxx``) or a real username/email in the "
+                "mapping form.",
+                mentra_user_id,
+                stored_id,
+            )
+            return UserContext(
+                user_id=stored_id,
+                email=mentra_user_id,
+                display_name=str(
+                    row.get("display_name") or mentra_user_id
+                ),
+                roles=frozenset(row.get("roles") or {"user"}),
+                provider="mentra",
+            )
+
+        canonical_id = str(canonical.get("id") or stored_id)
+        canonical_roles = frozenset(
+            str(r) for r in (canonical.get("roles") or ["user"])
+        )
+        canonical_email = str(
+            canonical.get("email") or mentra_user_id
+        )
+        canonical_dn = str(
+            canonical.get("display_name")
+            or canonical.get("username")
+            or row.get("display_name")
+            or mentra_user_id
+        )
+        logger.info(
+            "Mentra mapping %r → stored=%r canonical=%r roles=%s",
+            mentra_user_id,
+            stored_id,
+            canonical_id,
+            sorted(canonical_roles),
+        )
         return UserContext(
-            user_id=gilbert_user_id,
-            email=mentra_user_id,
-            display_name=str(row.get("display_name") or mentra_user_id),
-            roles=frozenset(row.get("roles") or {"user"}),
+            user_id=canonical_id,
+            email=canonical_email,
+            display_name=canonical_dn,
+            roles=canonical_roles,
             provider="mentra",
         )
+
+    async def _lookup_canonical_user(
+        self, stored_id: str
+    ) -> dict[str, Any] | None:
+        """Resolve ``stored_id`` to a canonical user record via the
+        ``users`` capability. Tries the value as ``user_id`` first,
+        then ``username``, then ``email`` — whichever shape the
+        operator typed into the mapping form. ``None`` when the
+        users service is unavailable or the value matches nothing.
+        """
+        if self._resolver is None:
+            return None
+        users_svc = self._resolver.get_capability("users")
+        if not isinstance(users_svc, UserManagementProvider):
+            return None
+        backend = users_svc.backend
+        for getter in (
+            backend.get_user,
+            backend.get_user_by_username,
+            backend.get_user_by_email,
+        ):
+            try:
+                user = await getter(stored_id)
+            except Exception:
+                logger.exception(
+                    "Mentra: users.%s(%r) raised", getter.__name__, stored_id
+                )
+                continue
+            if user:
+                return user
+        return None
 
     # ── Bus / WS plumbing ──────────────────────────────────────────
 

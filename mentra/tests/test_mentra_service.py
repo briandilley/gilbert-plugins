@@ -1530,3 +1530,212 @@ async def test_wake_word_disabled_keeps_speak_first_opening(
     assert config.opening_policy.behavior == OpeningBehavior.SPEAK_FIRST
 
     brain.hold_until.set()
+
+
+# ── User canonicalization through the `users` capability ─────────────
+
+
+class _FakeUserBackend:
+    """Just enough of UserBackend to satisfy ``_lookup_canonical_user``.
+
+    Keyed by canonical id, with secondary indexes by username + email.
+    Returns ``None`` for unknown identifiers — same shape the real
+    backend uses."""
+
+    def __init__(self, users: list[dict[str, Any]]) -> None:
+        self._by_id = {u["id"]: u for u in users}
+        self._by_username = {u["username"]: u for u in users}
+        self._by_email = {u["email"]: u for u in users if u.get("email")}
+
+    async def get_user(self, user_id: str) -> dict[str, Any] | None:
+        return self._by_id.get(user_id)
+
+    async def get_user_by_username(self, username: str) -> dict[str, Any] | None:
+        return self._by_username.get(username)
+
+    async def get_user_by_email(self, email: str) -> dict[str, Any] | None:
+        return self._by_email.get(email)
+
+    async def get_user_by_provider_link(self, *_a: Any, **_kw: Any) -> None:
+        return None
+
+
+class _FakeUserMgmtSvc:
+    """Stub UserManagementProvider — only ``backend`` is touched by
+    the Mentra canonicalization path."""
+
+    def __init__(self, backend: _FakeUserBackend) -> None:
+        self._backend = backend
+
+    @property
+    def allow_user_creation(self) -> bool:
+        return False
+
+    async def list_users(self) -> list[dict[str, Any]]:
+        return []
+
+    async def resolve_user_id_by_name(self, _name: str) -> None:
+        return None
+
+    @property
+    def backend(self) -> _FakeUserBackend:
+        return self._backend
+
+
+async def _start_service_with_users(
+    *,
+    mapping_email: str,
+    mapping_stored_id: str,
+    users: list[dict[str, Any]],
+) -> tuple[Any, _FakeStorage]:
+    """Spin up a MentraService with both a storage-backed mapping AND
+    a fake ``users`` capability, returning the service + the storage
+    so the caller can drive ``_resolve_user`` directly."""
+    from gilbert_plugin_mentra.mentra_service import MentraService
+
+    svc = MentraService()
+    storage = _FakeStorage()
+    await storage.backend.put(
+        "mentra_user_mappings",
+        f"map_{mapping_stored_id}",
+        {
+            "mentra_user_id": mapping_email,
+            "gilbert_user_id": mapping_stored_id,
+            # Deliberately stuff the WRONG roles into the mapping so
+            # we can verify the canonical lookup wins — the bug
+            # report had a mapping with roles=["user"] for a user
+            # whose canonical record was ["admin","user"], and the
+            # admin bypass downstream failed.
+            "display_name": "Stale display name",
+            "roles": ["user"],
+        },
+    )
+    cfg = _Cfg(
+        {
+            "enabled": True,
+            "api_key": "k",
+            "package_name": "p",
+            "public_base_url": "https://x.example",
+            "display_duration_ms": 8000,
+            "require_wake_word": False,
+        }
+    )
+    resolver = _Resolver(
+        entity_storage=storage,
+        voice_brain=_FakeVoiceBrain(),
+        audio_blob_store=_FakeBlobStore(),
+        event_bus=_BusProvider(_Bus()),
+        configuration=cfg,
+        users=_FakeUserMgmtSvc(_FakeUserBackend(users)),
+    )
+    await svc.start(resolver)
+    return svc, storage
+
+
+@pytest.mark.asyncio
+async def test_resolve_user_canonicalizes_username_to_canonical_id() -> None:
+    """The bug as reported: mapping stores ``gilbert_user_id=
+    "jeremy"`` (a username), but the canonical user id is
+    ``usr_32e068af6631``. Without canonicalization downstream
+    ``user_ctx.user_id != record.owner_id`` for every private MCP,
+    AND the admin bypass misses because the stored mapping roles
+    don't include admin. The fix routes through the ``users``
+    capability so the returned ``UserContext`` carries the REAL
+    id + roles."""
+    svc, _ = await _start_service_with_users(
+        mapping_email="jeremy@example.com",
+        mapping_stored_id="jeremy",  # ← username, not user_id
+        users=[
+            {
+                "id": "usr_jeremy_canonical",
+                "username": "jeremy",
+                "email": "jeremy@example.com",
+                "display_name": "Jeremy Real",
+                "roles": ["admin", "user"],
+            }
+        ],
+    )
+    ctx = await svc._resolve_user("jeremy@example.com")
+    assert ctx is not None
+    assert ctx.user_id == "usr_jeremy_canonical"
+    assert "admin" in ctx.roles
+    assert "user" in ctx.roles
+    assert ctx.display_name == "Jeremy Real"
+    assert ctx.email == "jeremy@example.com"
+
+
+@pytest.mark.asyncio
+async def test_resolve_user_canonicalizes_by_email_when_username_misses() -> None:
+    """Operator typed the email into the mapping form instead of a
+    username — still canonicalize via ``get_user_by_email``."""
+    svc, _ = await _start_service_with_users(
+        mapping_email="alice@example.com",
+        mapping_stored_id="alice@example.com",  # ← email
+        users=[
+            {
+                "id": "usr_alice_canonical",
+                "username": "alice",
+                "email": "alice@example.com",
+                "display_name": "Alice",
+                "roles": ["user"],
+            }
+        ],
+    )
+    ctx = await svc._resolve_user("alice@example.com")
+    assert ctx is not None
+    assert ctx.user_id == "usr_alice_canonical"
+
+
+@pytest.mark.asyncio
+async def test_resolve_user_canonical_id_passes_through() -> None:
+    """Mapping already stores the canonical id — verify the lookup
+    still works (``get_user(id)`` is the first attempt)."""
+    svc, _ = await _start_service_with_users(
+        mapping_email="bob@example.com",
+        mapping_stored_id="usr_bob_canonical",
+        users=[
+            {
+                "id": "usr_bob_canonical",
+                "username": "bob",
+                "email": "bob@example.com",
+                "display_name": "Bob",
+                "roles": ["user"],
+            }
+        ],
+    )
+    ctx = await svc._resolve_user("bob@example.com")
+    assert ctx is not None
+    assert ctx.user_id == "usr_bob_canonical"
+
+
+@pytest.mark.asyncio
+async def test_resolve_user_falls_back_to_stored_when_canonical_lookup_misses() -> None:
+    """Defensive: if the stored id matches nothing in the users
+    table, admit the session with the stored values (so the
+    glasses still work) but the logged warning tells the operator
+    their mapping is broken. We don't lock the user out — that
+    would be a worse failure mode than silently degraded
+    visibility."""
+    svc, _ = await _start_service_with_users(
+        mapping_email="ghost@example.com",
+        mapping_stored_id="ghost",
+        users=[],  # ← nothing in the users table
+    )
+    ctx = await svc._resolve_user("ghost@example.com")
+    assert ctx is not None
+    assert ctx.user_id == "ghost"  # stored fallback
+    assert "user" in ctx.roles
+
+
+@pytest.mark.asyncio
+async def test_resolve_user_returns_none_when_no_mapping() -> None:
+    """No mapping row → refuse the session. (Pre-existing
+    behaviour; locked in here so the canonicalization change
+    can't regress it.)"""
+    svc, _ = await _start_service_with_users(
+        mapping_email="other@example.com",
+        mapping_stored_id="other",
+        users=[],
+    )
+    ctx = await svc._resolve_user("nobody@example.com")
+    assert ctx is None
