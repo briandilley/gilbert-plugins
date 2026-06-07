@@ -270,6 +270,7 @@ async def _start_service(
     mapping_user_id: str = "usr_alice",
     brain: _FakeVoiceBrain | None = None,
     blob_store: _FakeBlobStore | None = None,
+    require_wake_word: bool = False,
 ) -> tuple[Any, _FakeStorage, _Bus, _FakeVoiceBrain, _FakeBlobStore]:
     from gilbert_plugin_mentra.mentra_service import MentraService
 
@@ -299,6 +300,12 @@ async def _start_service(
             "package_name": package_name,
             "public_base_url": public_base_url,
             "display_duration_ms": 8000,
+            # Existing baseline tests pre-date the wake-word gate and
+            # inject bare transcripts ("what time is it"). Opt them
+            # out of the gate so they continue to assert the
+            # transcript→engine handoff in isolation. Wake-word
+            # behaviour is covered by the dedicated tests below.
+            "require_wake_word": require_wake_word,
         }
     )
     resolver = _Resolver(
@@ -1217,3 +1224,309 @@ async def test_engine_does_not_start_if_glasses_never_connect(
 
     # Engine task should have exited without ever calling voice_brain.
     assert len(brain.calls) == 0
+
+
+# ── Wake-word gate ──────────────────────────────────────────────────
+
+
+def test_match_wake_word_strips_canonical_prefix() -> None:
+    """``"Hey Gilbert, what's the weather?"`` matches the canonical
+    phrase and leaves ``"what's the weather?"`` for the LLM. Casing
+    + punctuation are tolerated."""
+    from gilbert_plugin_mentra.mentra_service import _match_wake_word
+
+    matched, rest = _match_wake_word(
+        "Hey Gilbert, what's the weather?",
+        ["hey gilbert", "gilbert"],
+    )
+    assert matched is True
+    assert rest == "what's the weather?"
+
+
+def test_match_wake_word_handles_punctuation_variants() -> None:
+    """``"Hey, Gilbert!"`` and ``"Hey-Gilbert?"`` and ``"hey gilbert."``
+    must all match the canonical ``"hey gilbert"`` entry — the cloud
+    STT punctuates inconsistently."""
+    from gilbert_plugin_mentra.mentra_service import _match_wake_word
+
+    for text in (
+        "Hey, Gilbert! Turn the lights on.",
+        "hey gilbert. turn the lights on",
+        "HEY GILBERT — turn the lights on",
+    ):
+        matched, rest = _match_wake_word(text, ["hey gilbert"])
+        assert matched is True, text
+        assert "turn the lights on" in rest.lower(), text
+
+
+def test_match_wake_word_no_match_returns_original() -> None:
+    """No wake phrase → ``matched=False`` and the text is returned
+    unchanged so callers can choose to drop or pass through."""
+    from gilbert_plugin_mentra.mentra_service import _match_wake_word
+
+    matched, rest = _match_wake_word(
+        "what's the weather", ["hey gilbert"]
+    )
+    assert matched is False
+    assert rest == "what's the weather"
+
+
+def test_match_wake_word_requires_word_boundary() -> None:
+    """``"Gilbertson is here"`` must NOT match the bare ``"gilbert"``
+    fallback — otherwise random transcripts containing names that
+    happen to start with the wake word activate Gilbert."""
+    from gilbert_plugin_mentra.mentra_service import _match_wake_word
+
+    matched, _ = _match_wake_word("Gilbertson is here.", ["gilbert"])
+    assert matched is False
+
+
+def test_match_wake_word_longest_phrase_wins() -> None:
+    """When both ``"hey gilbert"`` and bare ``"gilbert"`` are in the
+    phrase list, ``"Hey Gilbert, what's up?"`` strips ``"hey gilbert"``
+    (2 words) not just ``"gilbert"`` (1 word leaving ``", what's up?"``).
+    Otherwise the bare-fallback eats the longer match and leaves a
+    leading-comma fragment for the LLM."""
+    from gilbert_plugin_mentra.mentra_service import _match_wake_word
+
+    matched, rest = _match_wake_word(
+        "Hey Gilbert, what's up?",
+        ["gilbert", "hey gilbert"],
+    )
+    assert matched is True
+    assert rest == "what's up?"
+
+
+def test_match_wake_word_bare_summons_returns_empty_remainder() -> None:
+    """``"Hey Gilbert."`` with nothing after gets ``matched=True`` and
+    an empty remainder — the caller substitutes a synthetic summons
+    string before handing to the LLM."""
+    from gilbert_plugin_mentra.mentra_service import _match_wake_word
+
+    matched, rest = _match_wake_word(
+        "Hey Gilbert.", ["hey gilbert"]
+    )
+    assert matched is True
+    assert rest == ""
+
+
+def test_match_wake_word_empty_phrases_passes_through() -> None:
+    """Empty phrase list → never matches (defensive: a misconfigured
+    empty list shouldn't accidentally let everything through OR
+    drop everything; the gate above handles ``matched=False``)."""
+    from gilbert_plugin_mentra.mentra_service import _match_wake_word
+
+    matched, rest = _match_wake_word("Hey Gilbert, hello", [])
+    assert matched is False
+    assert rest == "Hey Gilbert, hello"
+
+
+@pytest.mark.asyncio
+async def test_wake_word_gate_drops_unaddressed_transcripts(
+    monkeypatch: Any,
+) -> None:
+    """With ``require_wake_word=True``, transcripts that don't start
+    with a configured wake phrase never reach the engine — Gilbert
+    stays silent on unaddressed speech (background conversation,
+    radio, the user talking to a colleague).
+
+    Regression target: without the gate, Mentra Cloud transcribes
+    every utterance the glasses mic picks up and Gilbert chimes in
+    on each one."""
+    brain = _FakeVoiceBrain()
+    brain.hold_until = asyncio.Event()
+    svc, _, _, _, _ = await _start_service(
+        brain=brain, require_wake_word=True
+    )
+    fake = await _drive_session_admit(svc, monkeypatch)
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    _, config = brain.calls[0]
+    queue = config.inject_synthetic_user_turn_queue
+
+    # User is talking to a colleague — no wake word.
+    await fake.inject(
+        {
+            "type": "data_stream",
+            "streamType": "transcription",
+            "data": {
+                "text": "did you see the game last night",
+                "isFinal": True,
+            },
+        }
+    )
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    # Engine queue stayed empty — Gilbert never heard it.
+    assert queue.empty()
+
+    brain.hold_until.set()
+
+
+@pytest.mark.asyncio
+async def test_wake_word_gate_strips_prefix_before_handoff(
+    monkeypatch: Any,
+) -> None:
+    """An addressed transcript flows to the engine with the wake
+    phrase stripped: ``"Hey Gilbert, what's the weather?"`` becomes
+    ``"what's the weather?"`` so the LLM responds to the actual
+    question instead of greeting the wake word."""
+    brain = _FakeVoiceBrain()
+    brain.hold_until = asyncio.Event()
+    svc, _, _, _, _ = await _start_service(
+        brain=brain, require_wake_word=True
+    )
+    fake = await _drive_session_admit(svc, monkeypatch)
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    _, config = brain.calls[0]
+    queue = config.inject_synthetic_user_turn_queue
+
+    await fake.inject(
+        {
+            "type": "data_stream",
+            "streamType": "transcription",
+            "data": {
+                "text": "Hey Gilbert, what's the weather?",
+                "isFinal": True,
+            },
+        }
+    )
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    assert queue.get_nowait() == "what's the weather?"
+
+    brain.hold_until.set()
+
+
+@pytest.mark.asyncio
+async def test_wake_word_gate_bare_summons_injects_synthetic_text(
+    monkeypatch: Any,
+) -> None:
+    """When the user says just ``"Hey Gilbert."`` with no follow-up,
+    the stripped remainder is empty. The plugin substitutes a
+    synthetic summons string so the LLM has something non-empty to
+    respond to (Anthropic's API rejects empty user messages)."""
+    from gilbert_plugin_mentra.mentra_service import _EMPTY_WAKE_SUMMONS_TEXT
+
+    brain = _FakeVoiceBrain()
+    brain.hold_until = asyncio.Event()
+    svc, _, _, _, _ = await _start_service(
+        brain=brain, require_wake_word=True
+    )
+    fake = await _drive_session_admit(svc, monkeypatch)
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    _, config = brain.calls[0]
+    queue = config.inject_synthetic_user_turn_queue
+
+    await fake.inject(
+        {
+            "type": "data_stream",
+            "streamType": "transcription",
+            "data": {"text": "Hey Gilbert.", "isFinal": True},
+        }
+    )
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    assert queue.get_nowait() == _EMPTY_WAKE_SUMMONS_TEXT
+
+    brain.hold_until.set()
+
+
+@pytest.mark.asyncio
+async def test_wake_word_disabled_passes_every_transcript(
+    monkeypatch: Any,
+) -> None:
+    """``require_wake_word=False`` restores the always-listening
+    behaviour — bare transcripts flow straight to the engine. Same
+    path the existing baseline test exercises; this one is the
+    explicit toggle assertion."""
+    brain = _FakeVoiceBrain()
+    brain.hold_until = asyncio.Event()
+    svc, _, _, _, _ = await _start_service(
+        brain=brain, require_wake_word=False
+    )
+    fake = await _drive_session_admit(svc, monkeypatch)
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    _, config = brain.calls[0]
+    queue = config.inject_synthetic_user_turn_queue
+
+    await fake.inject(
+        {
+            "type": "data_stream",
+            "streamType": "transcription",
+            "data": {"text": "what time is it", "isFinal": True},
+        }
+    )
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    assert queue.get_nowait() == "what time is it"
+
+    brain.hold_until.set()
+
+
+@pytest.mark.asyncio
+async def test_wake_word_required_uses_wait_for_remote_opening(
+    monkeypatch: Any,
+) -> None:
+    """When the wake-word gate is on, the engine must NOT cold-open
+    on session start — Gilbert should stay silent until addressed.
+    The plugin switches OpeningPolicy from SPEAK_FIRST to
+    WAIT_FOR_REMOTE with a huge fallback so the engine's silence
+    timer never fires."""
+    from gilbert.interfaces.conversation import OpeningBehavior
+
+    brain = _FakeVoiceBrain()
+    brain.hold_until = asyncio.Event()
+    svc, _, _, _, _ = await _start_service(
+        brain=brain, require_wake_word=True
+    )
+    await _drive_session_admit(svc, monkeypatch)
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    _, config = brain.calls[0]
+    assert (
+        config.opening_policy.behavior == OpeningBehavior.WAIT_FOR_REMOTE
+    )
+    # Fallback ≥ max_conversation_seconds means "effectively never".
+    assert (
+        config.opening_policy.fallback_timeout_seconds
+        >= config.max_conversation_seconds
+    )
+
+    brain.hold_until.set()
+
+
+@pytest.mark.asyncio
+async def test_wake_word_disabled_keeps_speak_first_opening(
+    monkeypatch: Any,
+) -> None:
+    """Opting out of the wake-word gate must restore the
+    SPEAK_FIRST greeting on session start — the original
+    always-listening behaviour."""
+    from gilbert.interfaces.conversation import OpeningBehavior
+
+    brain = _FakeVoiceBrain()
+    brain.hold_until = asyncio.Event()
+    svc, _, _, _, _ = await _start_service(
+        brain=brain, require_wake_word=False
+    )
+    await _drive_session_admit(svc, monkeypatch)
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    _, config = brain.calls[0]
+    assert config.opening_policy.behavior == OpeningBehavior.SPEAK_FIRST
+
+    brain.hold_until.set()

@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 import uuid
 from collections import deque
@@ -166,6 +167,130 @@ _FILLER_THRESHOLD_SECONDS = 3.0
 _GLASSES_CONNECT_TIMEOUT_SECONDS = 20.0
 
 
+# ── Wake-word gating ─────────────────────────────────────────────────
+#
+# Mentra Cloud transcribes EVERY utterance the glasses mic picks up —
+# the user talking to a colleague, the radio in the background, the
+# barista asking "what can I get you", all flow into our
+# ``_on_transcription`` callback as final transcripts. Without a wake
+# word, Gilbert chimes in on every one. With wake-word required, the
+# transcript must start with one of these phrases or the engine
+# ignores it entirely.
+#
+# Default list covers what users actually say plus the common things
+# the cloud STT mis-hears the phrase as (drops "hey", swaps "ok"
+# for "okay", etc.). Tail entry ``"gilbert"`` is the bare-summons
+# fallback — matched last so longer phrases win when both are
+# present in the configured list.
+_DEFAULT_WAKE_WORD_PHRASES = [
+    "hey gilbert",
+    "hi gilbert",
+    "ok gilbert",
+    "okay gilbert",
+    "gilbert",
+]
+
+# Default ON — per user request. Operators in quiet environments
+# (single-user office, dedicated demo room) can flip it off via
+# Settings → Mentra → require_wake_word for the always-listening
+# experience.
+_DEFAULT_REQUIRE_WAKE_WORD = True
+
+# Synthetic user-role priming injected at the head of the LLM
+# message list. Two variants — one for the always-listening
+# (SPEAK_FIRST) mode where Gilbert opens with a greeting, one for
+# wake-word mode where Gilbert stays silent until addressed and
+# should respond directly without acknowledging the wake phrase.
+_GREETING_PRIMING_TEXT = (
+    "(SYSTEM) The user just put on their smart glasses "
+    "and activated Gilbert. Greet them briefly — one "
+    "short sentence — and let them know you're listening."
+)
+
+_WAKE_WORD_PRIMING_TEXT = (
+    "(SYSTEM) The user is wearing smart glasses with the Gilbert app "
+    "open. They will only address you by starting an utterance with "
+    'a wake phrase such as "Hey Gilbert". The wake phrase has '
+    "already been stripped from the transcripts you receive — "
+    "respond directly to whatever they ask without greeting them "
+    "on every turn or acknowledging the wake word itself."
+)
+
+
+_WAKE_NORMALIZE_RX = re.compile(r"[^a-z0-9 ]+")
+_WAKE_LEADING_PUNCT_RX = re.compile(r"^[,.;:!?\-–—\s]+")
+
+
+def _normalize_for_wake_match(text: str) -> str:
+    """Lowercase, drop punctuation, collapse whitespace.
+
+    Wake-word matching is fuzzy — ``"Hey, Gilbert!"`` must match
+    the canonical ``"hey gilbert"`` entry. Both sides of the
+    comparison go through this so the match is symmetric.
+    """
+    text = text.lower().strip()
+    text = _WAKE_NORMALIZE_RX.sub(" ", text)
+    return " ".join(text.split())
+
+
+def _match_wake_word(
+    text: str, phrases: list[str]
+) -> tuple[bool, str]:
+    """Match ``text`` against any configured wake phrase as a prefix.
+
+    Returns ``(matched, remainder)``. When matched, ``remainder`` is
+    the original ``text`` (preserving the user's casing and
+    interior punctuation) with the matched prefix and a leading
+    comma/period removed. When no phrase matches, ``remainder == text``.
+
+    Phrases are tried longest-first so the bare ``"gilbert"`` fallback
+    doesn't swallow a ``"hey gilbert"`` prefix that's also configured.
+    A trailing word-boundary is required: ``"gilbertson"`` will not
+    match ``"gilbert"``.
+    """
+    if not phrases:
+        return False, text
+    norm = _normalize_for_wake_match(text)
+    if not norm:
+        return False, text
+    candidates = sorted(
+        {_normalize_for_wake_match(p) for p in phrases if p.strip()},
+        key=len,
+        reverse=True,
+    )
+    for phrase in candidates:
+        if not phrase:
+            continue
+        if norm == phrase or norm.startswith(phrase + " "):
+            words_to_strip = len(phrase.split())
+            return True, _strip_n_leading_words(text, words_to_strip)
+    return False, text
+
+
+def _strip_n_leading_words(text: str, n: int) -> str:
+    """Drop ``n`` whitespace-separated tokens from the front of
+    ``text``, then any leading comma/period/etc. so
+    ``"Hey Gilbert, what's the weather"`` becomes ``"what's the
+    weather"``. Preserves the rest of the string verbatim, including
+    casing — only the wake phrase is touched."""
+    if n <= 0:
+        return text
+    remaining = text.lstrip()
+    for _ in range(n):
+        match = re.match(r"\S+", remaining)
+        if match is None:
+            return ""
+        remaining = remaining[match.end():].lstrip()
+    return _WAKE_LEADING_PUNCT_RX.sub("", remaining)
+
+
+# When the user says only the wake phrase with no follow-up ("Hey
+# Gilbert.") the stripped remainder is empty. Substitute a synthetic
+# user turn so the LLM has something to respond to instead of seeing
+# an empty user message (Anthropic Messages API rejects that anyway).
+_EMPTY_WAKE_SUMMONS_TEXT = "(The user addressed you with the wake word but didn't say anything else — acknowledge briefly that you're listening.)"
+
+
 class _NoopBrainToolProvider:
     """No-op ``BrainToolProvider`` for the ``use_full_ai_service=True``
     engine path.
@@ -228,6 +353,14 @@ class MentraService(Service):
         self._public_base_url: str = ""
         self._system_prompt: str = _DEFAULT_SYSTEM_PROMPT
         self._display_duration_ms: int = 8000
+        # Wake-word gate: with this ON (default), every committed
+        # transcript MUST start with one of ``_wake_word_phrases``
+        # or the engine ignores it — Gilbert only responds when
+        # explicitly addressed. The wake phrase is stripped before
+        # the remainder reaches the LLM. See ``_match_wake_word``
+        # and the gate in ``_on_transcription``.
+        self._require_wake_word: bool = _DEFAULT_REQUIRE_WAKE_WORD
+        self._wake_word_phrases: list[str] = list(_DEFAULT_WAKE_WORD_PHRASES)
 
         # ── Resolved dependencies ─────────────────────────────────
         self._resolver: ServiceResolver | None = None
@@ -829,6 +962,34 @@ class MentraService(Service):
                 multiline=True,
                 ai_prompt=True,
             ),
+            ConfigParam(
+                key="require_wake_word",
+                type=ToolParameterType.BOOLEAN,
+                description=(
+                    "Only respond when the user starts an utterance "
+                    'with a wake phrase (e.g. "Hey Gilbert, what\'s '
+                    'the weather?"). With this off, Gilbert responds '
+                    "to every transcript Mentra Cloud delivers — "
+                    "fine for a quiet single-user demo, intrusive in "
+                    "a noisy room or when you're talking to another "
+                    "human. The wake phrase is stripped before the "
+                    "remainder is sent to the LLM, so you don't have "
+                    "to address Gilbert by name in your actual prompt."
+                ),
+                default=_DEFAULT_REQUIRE_WAKE_WORD,
+            ),
+            ConfigParam(
+                key="wake_word_phrases",
+                type=ToolParameterType.ARRAY,
+                description=(
+                    "Accepted wake phrases (case-insensitive, "
+                    "punctuation-tolerant). Longer phrases are matched "
+                    'first, so "hey gilbert" wins over a bare "gilbert" '
+                    "fallback when both are present. Only consulted "
+                    "when ``require_wake_word`` is on."
+                ),
+                default=list(_DEFAULT_WAKE_WORD_PHRASES),
+            ),
         ]
 
     async def on_config_changed(self, config: dict[str, Any]) -> None:
@@ -847,6 +1008,22 @@ class MentraService(Service):
         self._system_prompt = str(
             section.get("system_prompt") or _DEFAULT_SYSTEM_PROMPT
         )
+        # require_wake_word defaults TRUE — explicit ``False`` opts
+        # out. ``None`` / missing key / non-bool truthy values all
+        # fall through to the default ON behaviour.
+        raw_require = section.get("require_wake_word")
+        if isinstance(raw_require, bool):
+            self._require_wake_word = raw_require
+        else:
+            self._require_wake_word = _DEFAULT_REQUIRE_WAKE_WORD
+        raw_phrases = section.get("wake_word_phrases")
+        if isinstance(raw_phrases, list) and raw_phrases:
+            cleaned = [str(p).strip() for p in raw_phrases if str(p).strip()]
+            self._wake_word_phrases = (
+                cleaned if cleaned else list(_DEFAULT_WAKE_WORD_PHRASES)
+            )
+        else:
+            self._wake_word_phrases = list(_DEFAULT_WAKE_WORD_PHRASES)
 
     # ── MentraWebhookEndpoint impl ─────────────────────────────────
 
@@ -1550,6 +1727,38 @@ class MentraService(Service):
                 )
                 return
 
+            # Wake-word gate. When ``require_wake_word`` is on
+            # (default), transcripts must start with one of the
+            # configured wake phrases or the engine ignores them —
+            # Gilbert only responds when explicitly addressed. The
+            # matched prefix is stripped before handoff so the LLM
+            # sees the actual question ("what's the weather") and
+            # not the wake noise ("Hey Gilbert, what's the weather").
+            #
+            # An empty stripped remainder (user just said "Hey
+            # Gilbert.") gets a synthetic summons string so the LLM
+            # has something non-empty to respond to. Anthropic's
+            # Messages API rejects empty user turns anyway.
+            inject_text = text
+            if self._require_wake_word:
+                matched, stripped = _match_wake_word(
+                    text, self._wake_word_phrases
+                )
+                if not matched:
+                    self._record_event(
+                        session.user_id,
+                        "transcription_suppressed_no_wake_word",
+                        f'(no wake word): "{text[:140]}"',
+                    )
+                    logger.info(
+                        "Mentra transcription DROPPED — no wake "
+                        "word (session=%s text=%r)",
+                        session.session_id,
+                        text[:120],
+                    )
+                    return
+                inject_text = stripped or _EMPTY_WAKE_SUMMONS_TEXT
+
             # Surface every committed user transcript in the debug
             # webview. With ``disable_internal_stt=True`` the engine
             # never emits ``on_transcript_turn("them", ...)`` itself
@@ -1565,7 +1774,7 @@ class MentraService(Service):
                 ),
             )
             try:
-                inject_queue.put_nowait(text)
+                inject_queue.put_nowait(inject_text)
             except asyncio.QueueFull:
                 logger.warning(
                     "Mentra inject queue full — dropping transcript "
@@ -1649,22 +1858,54 @@ class MentraService(Service):
                 reason,
             )
 
-        # Synthetic user-role priming so the SPEAK_FIRST opener has
-        # something to respond to. The Anthropic Messages API
-        # rejects ``messages=[]`` — without this the engine's first
-        # ai.chat() call would crash on a brand-new session. Same
-        # priming shape as voice-agent.
-        priming = [
-            Message(
-                role=MessageRole.USER,
-                content=(
-                    "(SYSTEM) The user just put on their smart glasses "
-                    "and activated Gilbert. Greet them briefly — one "
-                    "short sentence — and let them know you're "
-                    "listening."
-                ),
+        # Synthetic user-role priming so the engine's first
+        # ai.chat() call has something to respond to. The Anthropic
+        # Messages API rejects ``messages=[]``, and without priming
+        # the LLM has no idea what modality / context it's serving.
+        #
+        # Two variants:
+        #
+        # - Always-listening mode (require_wake_word=False): tell
+        #   the LLM to greet the user, paired with SPEAK_FIRST so
+        #   Gilbert speaks immediately on session start.
+        #
+        # - Wake-word mode (default): tell the LLM the user must
+        #   say a wake phrase first and the phrase has been
+        #   stripped before it sees the transcript, so it should
+        #   respond directly without greeting on every turn. Paired
+        #   with WAIT_FOR_REMOTE so the engine never cold-opens —
+        #   silence is the right default until the user addresses
+        #   Gilbert.
+        if self._require_wake_word:
+            priming = [
+                Message(
+                    role=MessageRole.USER,
+                    content=_WAKE_WORD_PRIMING_TEXT,
+                )
+            ]
+            opening = OpeningPolicy(
+                behavior=OpeningBehavior.WAIT_FOR_REMOTE,
+                # Huge fallback so the engine never cold-opens on
+                # silence. The wake-word gate in
+                # ``_on_transcription`` is the ONLY thing that
+                # should activate Gilbert; without this, the
+                # WAIT_FOR_REMOTE fallback timer would fire after
+                # 4s of silence and Gilbert would speak unprompted.
+                # ``max_conversation_seconds`` below is 900s so any
+                # value >= that means "effectively never".
+                fallback_timeout_seconds=900.0,
             )
-        ]
+        else:
+            priming = [
+                Message(
+                    role=MessageRole.USER,
+                    content=_GREETING_PRIMING_TEXT,
+                )
+            ]
+            opening = OpeningPolicy(
+                behavior=OpeningBehavior.SPEAK_FIRST,
+                fallback_timeout_seconds=1.0,
+            )
 
         config = ConversationConfig(
             system_prompt=self._system_prompt,
@@ -1674,10 +1915,7 @@ class MentraService(Service):
             # (voice-agent's ``end_conversation`` tool is visible
             # via ContextVar-gated discovery; it ends both modes).
             brain_tool_provider=_NoopBrainToolProvider(),
-            opening_policy=OpeningPolicy(
-                behavior=OpeningBehavior.SPEAK_FIRST,
-                fallback_timeout_seconds=1.0,
-            ),
+            opening_policy=opening,
             max_conversation_seconds=900,
             priming_messages=priming,
             on_status_change=_on_status_change,
