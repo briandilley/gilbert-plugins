@@ -47,3 +47,16 @@ streaming parsing were rewritten:
 `base_url` is accepted with or without a trailing `/v1` and normalised to the daemon root, so configs
 carried over from the old default keep working. The `local_model_runtime` service already used the
 native `/api/*` routes, so it is unchanged.
+
+The native API unlocks two more things the shim couldn't, both built on a cached per-model `/api/show`
+lookup (capabilities + max context length):
+
+- **Reasoning streaming** — on models advertising the `thinking` capability we send `think: true` and
+  map the streamed `message.thinking` deltas to a new core `REASONING_DELTA` / `chat.stream.reasoning`
+  channel, so Gilbert shows the model's thinking live (and persists it on the assistant row for
+  history replay). `think` is sent *only* to thinking-capable models — the shim has no equivalent, and
+  sending it to a non-thinking model 400s.
+- **`num_ctx` safety** — `num_ctx` is clamped to the model's real max from `/api/show`, and httpx
+  timeouts raise a descriptive `AIBackendError` (504) instead of an opaque failure, so an oversized
+  context window can't make the daemon hang allocating an impossible KV cache and surface as a bare
+  "Unknown error".
