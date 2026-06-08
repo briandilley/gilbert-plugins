@@ -291,6 +291,21 @@ Before committing a change that touches any `plugin.yaml`, `plugin.py`, or `conf
 
 Non-obvious plugin design rationale and gotchas (e.g. the SMAPI-over-SOAP bridge for Spotify-on-Sonos, browser plugin's Docker fallback model) live in `docs/architecture/`. Read on demand when working on that plugin; `ls docs/architecture/` to browse. When a doc drifts from the code, fix it in the same change that caused the drift.
 
+### Documentation taxonomy
+
+This submodule is the **Plugins** context in Gilbert's multi-context doc model (root
+`CONTEXT-MAP.md` in the parent repo). Reach for the right genre:
+
+- **Glossary** — [`CONTEXT.md`](CONTEXT.md): the canonical vocabulary for authoring/packaging a
+  plugin (virtual workspace member, runtime dependency, UI panel vs slot, slash namespace, …).
+  Shared platform terms (backend, service, capability) live in the Core glossary at
+  `../src/gilbert/CONTEXT.md`.
+- **Decision records** — [`docs/adr/`](docs/adr/): *why* non-obvious plugin-system choices were made
+  (virtual workspace members, Sonos S2-only + the SMAPI SOAP bridge, the browser Docker model). Core
+  / system-wide decisions live in `../docs/adr/`.
+- **Walkthroughs** — `docs/architecture/`: the long-form per-plugin explanations above — reference,
+  not canon. When a walkthrough's decision has been distilled into an ADR, the ADR wins.
+
 ## Privacy
 
 **Never put private or personal information in tracked files.** This includes plugin source code, `plugin.yaml` examples, and README text. API keys, personal email addresses, voice IDs, device names that identify people — none of that goes into commits. If you need an example in a doc, use obvious placeholders (`sk-ant-…`, `xoxb-…`, `example@example.com`).
