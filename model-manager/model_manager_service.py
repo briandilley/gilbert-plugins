@@ -50,7 +50,7 @@ from gilbert.interfaces.service import (
 from gilbert.interfaces.tools import ToolParameterType
 from gilbert.interfaces.ws import RpcHandler, WsConnectionBase, require_admin
 
-from . import fit, hf_catalog
+from . import fit, hf_catalog, sources
 
 logger = logging.getLogger(__name__)
 
@@ -260,6 +260,9 @@ class ModelManagerService(Service):
     def get_ws_handlers(self) -> dict[str, RpcHandler]:
         return {
             "model_manager.installed.list": self._ws_installed_list,
+            "model_manager.sources.list": self._ws_sources_list,
+            "model_manager.source.search": self._ws_source_search,
+            "model_manager.source.variants": self._ws_source_variants,
             "model_manager.catalog.search": self._ws_catalog_search,
             "model_manager.catalog.quants": self._ws_catalog_quants,
             "model_manager.host.resources": self._ws_host_resources,
@@ -301,6 +304,165 @@ class ModelManagerService(Service):
             "type": "model_manager.installed.list.result",
             "ref": frame.get("id"),
             "models": [{"tag": m.tag, "size_bytes": m.size_bytes} for m in models],
+        }
+
+    async def _ws_sources_list(
+        self, conn: WsConnectionBase, frame: dict[str, Any]
+    ) -> dict[str, Any]:
+        """List the model **sources** the installer can browse (S10).
+
+        Admin-gated (the manager is an admin-global tool, ADR-0009). The SPA
+        renders its source selector from this — each descriptor says how the
+        source is browsed (live ``search`` vs a ``curated`` list) and what its
+        per-source affordances are (sort? recommended-only? variant noun?), so a
+        new source is purely additive: register a :class:`~.sources.ModelSource`
+        and it appears here automatically with no SPA edit.
+        """
+        denied = require_admin(conn, frame)
+        if denied is not None:
+            return denied
+        return {
+            "type": "model_manager.sources.list.result",
+            "ref": frame.get("id"),
+            "sources": [
+                {
+                    "id": d.id,
+                    "label": d.label,
+                    "description": d.description,
+                    "kind": d.kind,
+                    "search_placeholder": d.search_placeholder,
+                    "variant_noun": d.variant_noun,
+                    "supports_sort": d.supports_sort,
+                    "supports_recommended_only": d.supports_recommended_only,
+                }
+                for d in (s.descriptor() for s in sources.all_sources())
+            ],
+        }
+
+    async def _ws_source_search(
+        self, conn: WsConnectionBase, frame: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Search/list models within a chosen source (S10, source-parameterized).
+
+        Admin-gated. ``source`` selects the catalog (``huggingface`` /
+        ``ollama``); ``query`` / ``sort`` / ``limit`` / ``recommended_only`` are
+        passed through to that source. A live source hits its remote catalog; a
+        curated source filters its fixed list client-side. Each row is the
+        provider-neutral :class:`~.sources.SourceModel` shape.
+        """
+        denied = require_admin(conn, frame)
+        if denied is not None:
+            return denied
+        source = sources.get_source(str(frame.get("source") or ""))
+        if source is None:
+            return self._unknown_source_error(frame)
+        query = str(frame.get("query") or "")
+        sort = str(frame.get("sort") or _DEFAULT_SEARCH_SORT)
+        limit = self._coerce_limit(frame.get("limit"))
+        recommended_only = bool(frame.get("recommended_only", False))
+        try:
+            models = await source.search(
+                query, sort, limit, recommended_only=recommended_only, client=self._http
+            )
+        except Exception as exc:
+            logger.exception("model_manager.source.search failed for %s", frame.get("source"))
+            return {
+                "type": "gilbert.error",
+                "ref": frame.get("id"),
+                "error": f"source search failed: {exc}",
+                "code": 502,
+            }
+        return {
+            "type": "model_manager.source.search.result",
+            "ref": frame.get("id"),
+            "source": source.descriptor().id,
+            "models": [
+                {
+                    "id": m.id,
+                    "name": m.name,
+                    "downloads": m.downloads,
+                    "likes": m.likes,
+                    "last_modified": m.last_modified,
+                    "recommended": m.recommended,
+                    "params_b": m.params_b,
+                }
+                for m in models
+            ],
+        }
+
+    async def _ws_source_variants(
+        self, conn: WsConnectionBase, frame: dict[str, Any]
+    ) -> dict[str, Any]:
+        """List a model's pullable variants (HF quants / Ollama size tags), S10.
+
+        Admin-gated. ``source`` + ``model_id`` identify the model; each variant
+        carries the exact ``pull_ref`` for ``model_manager.pull`` plus a
+        per-variant hardware-fit verdict (computed from its real-or-estimated
+        ``size_bytes``). ``size_estimated`` flags an estimated size (Ollama),
+        so the UI can mark that fit verdict approximate rather than exact.
+        """
+        denied = require_admin(conn, frame)
+        if denied is not None:
+            return denied
+        source = sources.get_source(str(frame.get("source") or ""))
+        if source is None:
+            return self._unknown_source_error(frame)
+        model_id = str(frame.get("model_id") or "")
+        if not model_id:
+            return {
+                "type": "gilbert.error",
+                "ref": frame.get("id"),
+                "error": "model_id is required",
+                "code": 400,
+            }
+        try:
+            variants = await source.list_variants(model_id, client=self._http)
+        except Exception as exc:
+            logger.exception("model_manager.source.variants failed for %s", model_id)
+            return {
+                "type": "gilbert.error",
+                "ref": frame.get("id"),
+                "error": f"source variants failed: {exc}",
+                "code": 502,
+            }
+        host = await self._host_snapshot()
+        rows: list[dict[str, Any]] = []
+        for v in variants:
+            if v.size_bytes is None:
+                verdict = fit.UNKNOWN
+            else:
+                verdict = fit.fit_verdict(v.size_bytes, host, remote=self._remote)
+            rows.append(
+                {
+                    "variant_id": v.variant_id,
+                    "label": v.label,
+                    "pull_ref": v.pull_ref,
+                    "size_bytes": v.size_bytes,
+                    "size_estimated": v.size_estimated,
+                    "fit": verdict,
+                    "pullable": v.pullable,
+                    "params_b": v.params_b,
+                }
+            )
+        return {
+            "type": "model_manager.source.variants.result",
+            "ref": frame.get("id"),
+            "source": source.descriptor().id,
+            "model_id": model_id,
+            "variants": rows,
+        }
+
+    @staticmethod
+    def _unknown_source_error(frame: dict[str, Any]) -> dict[str, Any]:
+        """Build the 400 for a missing/unknown ``source`` field."""
+        return {
+            "type": "gilbert.error",
+            "ref": frame.get("id"),
+            "error": (
+                f"unknown source '{frame.get('source')}' — call "
+                "model_manager.sources.list for the available source ids"
+            ),
+            "code": 400,
         }
 
     async def _ws_catalog_search(
@@ -489,7 +651,12 @@ class ModelManagerService(Service):
         # Pre-flight: a junk/community quant tag (e.g. ``Q8_K_P``) 400s in
         # Ollama with "not a valid quantization scheme". Reject it cleanly here
         # — never hand it to the runtime, never surface a traceback.
-        quant_tag = self._pull_quant(frame, ref)
+        #
+        # This only applies to **Hugging Face** refs (``hf.co/<repo>:<quant>``),
+        # where the tag IS a quantization scheme. A bare Ollama registry tag's
+        # suffix is a *size* (``llama3.3:70b``), not a quant — validating it
+        # against the quant set would wrongly reject every Ollama-library pull.
+        quant_tag = self._pull_quant(frame, ref) if self._is_hf_ref(frame, ref) else ""
         if quant_tag and not hf_catalog.is_pullable_quant(quant_tag):
             return {
                 "type": "gilbert.error",
@@ -501,10 +668,15 @@ class ModelManagerService(Service):
                 ),
                 "code": 400,
             }
+        emit = self._pull_progress_emitter(conn, frame, ref)
+        # Fire one keepalive immediately, BEFORE awaiting the runtime. Ollama's
+        # first real progress frame can lag behind a slow manifest fetch (the
+        # pull request's connect budget alone is up to 10s); this guarantees the
+        # frontend's pull RPC deadline is reset right away so it can never time
+        # out into a spurious "Retry" in the gap before Ollama starts streaming.
+        emit(PullProgress(status="starting"))
         try:
-            await self._runtime.pull_model(
-                ref, on_progress=self._pull_progress_emitter(conn, frame, ref)
-            )
+            await self._runtime.pull_model(ref, on_progress=emit)
         except Exception as exc:
             return self._pull_error_response(frame, ref, exc)
         # The installed tag is the ref Ollama now serves chat requests under
@@ -626,6 +798,19 @@ class ModelManagerService(Service):
         if repo_id and quant:
             return f"hf.co/{repo_id}:{quant}"
         return ""
+
+    @staticmethod
+    def _is_hf_ref(frame: dict[str, Any], ref: str) -> bool:
+        """True iff this pull targets Hugging Face (``hf.co/<repo>:<quant>``).
+
+        A Hugging Face pull either resolves to an ``hf.co/...`` ref or supplies a
+        ``repo_id`` (the handler builds the ``hf.co/`` ref from it). A bare
+        Ollama registry tag (``llama3.3:70b``) is neither — its suffix is a size,
+        not a quantization scheme, so the quant pre-flight must skip it.
+        """
+        if str(frame.get("repo_id") or "").strip():
+            return True
+        return ref.startswith("hf.co/")
 
     @staticmethod
     def _pull_quant(frame: dict[str, Any], ref: str) -> str:

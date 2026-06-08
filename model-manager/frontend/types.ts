@@ -109,6 +109,88 @@ export interface HostResourcesResponse {
   remote: boolean;
 }
 
+// --- Multi-source installer (S10) ----------------------------------------
+
+/** How a source is browsed. ``search`` ⇒ a live remote query (Hugging Face);
+ *  ``curated`` ⇒ a fixed, hand-vetted list filtered client-side (Ollama
+ *  library — no public search API exists). */
+export type SourceKind = "search" | "curated";
+
+/** One browsable model source. Mirrors the backend ``SourceDescriptor``
+ *  serialized by ``model_manager.sources.list``. The selector + per-source
+ *  affordances render from this, so adding a source is purely additive. */
+export interface SourceDescriptor {
+  /** Stable source id, sent back on every search/variants RPC. */
+  id: string;
+  /** Friendly selector label. */
+  label: string;
+  /** One-line blurb for the selector. */
+  description: string;
+  /** Live ``search`` vs ``curated`` list — drives honest UI labeling. */
+  kind: SourceKind;
+  /** Placeholder for the search/filter input. */
+  search_placeholder: string;
+  /** Singular noun for an expanded variant ("quantization" / "size"). */
+  variant_noun: string;
+  /** Whether the sort dropdown applies (HF yes, curated Ollama no). */
+  supports_sort: boolean;
+  /** Whether a "Recommended only" toggle is meaningful (HF only). */
+  supports_recommended_only: boolean;
+}
+
+export interface SourcesListResponse {
+  sources: SourceDescriptor[];
+}
+
+/** One model row from a source. Mirrors the backend ``SourceModel``
+ *  serialized by ``model_manager.source.search``. Generalizes ``CatalogModel``
+ *  across sources (``name`` is non-null for the curated Ollama list). */
+export interface SourceModel {
+  /** Model id within the source (HF repo id, or Ollama registry name). */
+  id: string;
+  /** Friendly display name, or ``null`` ⇒ fall back to ``id``. */
+  name: string | null;
+  downloads: number;
+  likes: number;
+  last_modified: string | null;
+  recommended: boolean;
+  params_b: number | null;
+}
+
+export interface SourceSearchResponse {
+  source: string;
+  models: SourceModel[];
+}
+
+/** One pullable variant of a model — an HF quant or an Ollama size tag.
+ *  Mirrors the backend ``SourceVariant`` (with the ``fit`` verdict attached)
+ *  serialized by ``model_manager.source.variants``. */
+export interface SourceVariant {
+  /** Stable per-row key (HF gguf filename, or Ollama registry tag). */
+  variant_id: string;
+  /** What the UI shows (quant label / size tag). */
+  label: string;
+  /** Exact reference handed to ``model_manager.pull``. */
+  pull_ref: string;
+  /** On-disk size — exact for HF, estimated for Ollama, or ``null``. */
+  size_bytes: number | null;
+  /** True when ``size_bytes`` is an estimate (Ollama), so the UI marks the
+   *  fit verdict approximate rather than exact. */
+  size_estimated: boolean;
+  /** Hardware-fit verdict on the host where Ollama runs. */
+  fit: FitVerdict;
+  /** Whether the runtime accepts ``pull_ref`` as a pull reference. */
+  pullable: boolean;
+  /** Parameter count this variant pins (Ollama size tag), or ``null``. */
+  params_b: number | null;
+}
+
+export interface SourceVariantsResponse {
+  source: string;
+  model_id: string;
+  variants: SourceVariant[];
+}
+
 // --- Pull / delete (S8) ---------------------------------------------------
 
 /** Result of ``model_manager.pull``. The RPC returns only once the pull has
