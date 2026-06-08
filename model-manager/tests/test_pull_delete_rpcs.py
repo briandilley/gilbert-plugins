@@ -21,7 +21,7 @@ from gilbert_plugin_model_manager import hf_catalog
 from gilbert_plugin_model_manager.model_manager_service import ModelManagerService
 
 from gilbert.interfaces.ai import ModelConfig, PerModelConfigProvider
-from gilbert.interfaces.local_models import InstalledModel
+from gilbert.interfaces.local_models import InstalledModel, PullProgress
 
 
 class _FakeRuntime:
@@ -34,7 +34,7 @@ class _FakeRuntime:
     async def list_models(self) -> list[InstalledModel]:  # pragma: no cover - unused
         return []
 
-    async def pull_model(self, ref: str) -> None:
+    async def pull_model(self, ref: str, on_progress: Any = None) -> None:
         self.pulled.append(ref)
 
     async def delete_model(self, tag: str) -> None:
@@ -45,8 +45,20 @@ class _FakeRuntime:
 
 
 class _ExplodingRuntime(_FakeRuntime):
-    async def pull_model(self, ref: str) -> None:
+    async def pull_model(self, ref: str, on_progress: Any = None) -> None:
         raise RuntimeError("pull access denied")
+
+
+class _ProgressRuntime(_FakeRuntime):
+    """Reports two distinct-status progress frames through the callback."""
+
+    async def pull_model(self, ref: str, on_progress: Any = None) -> None:
+        self.pulled.append(ref)
+        if on_progress is not None:
+            on_progress(PullProgress(status="pulling manifest"))
+            on_progress(
+                PullProgress(status="pulling sha256:abc", completed=10, total=100)
+            )
 
 
 class _FakePerModelConfig:
@@ -91,10 +103,18 @@ class _FakeResolver:
 
 
 class _Conn:
-    """Minimal WS connection stub. ``user_level == 0`` ⇒ admin."""
+    """Minimal WS connection stub. ``user_level == 0`` ⇒ admin.
+
+    Records frames the handler pushes via ``enqueue`` (the pull-progress
+    keepalive events) so tests can assert on them.
+    """
 
     def __init__(self, user_level: int = 0) -> None:
         self.user_level = user_level
+        self.enqueued: list[dict[str, Any]] = []
+
+    def enqueue(self, frame: dict[str, Any]) -> None:
+        self.enqueued.append(frame)
 
 
 async def _start(runtime: Any, per_model: Any = None) -> ModelManagerService:
@@ -207,6 +227,29 @@ async def test_pull_tolerates_missing_ai_model_config(
 
 
 @pytest.mark.asyncio
+async def test_pull_emits_progress_events_keyed_by_ref() -> None:
+    """While pulling, the handler pushes ``model_manager.pull.progress`` events
+    to the requesting connection, each carrying the originating RPC's ``ref`` so
+    the frontend resets THAT pending RPC's deadline (the timeout keepalive)."""
+    svc = await _start(_ProgressRuntime(), per_model=None)
+    conn = _Conn(0)
+
+    resp = await svc._ws_pull(conn, {"id": "p-prog", "ref": "hf.co/owner/Repo:Q4_K_M"})
+    assert resp["type"] == "model_manager.pull.result"
+
+    progress = [
+        f for f in conn.enqueued if f.get("event_type") == "model_manager.pull.progress"
+    ]
+    assert progress, "expected at least one pull.progress keepalive event"
+    # Shaped as a gilbert.event and keyed to the originating request id.
+    assert all(f["type"] == "gilbert.event" for f in progress)
+    assert all(f["data"]["ref"] == "p-prog" for f in progress)
+    statuses = [f["data"]["status"] for f in progress]
+    assert "pulling manifest" in statuses
+    await svc.stop()
+
+
+@pytest.mark.asyncio
 async def test_pull_context_window_none_when_metadata_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -301,19 +344,19 @@ async def test_pull_accepts_standard_quant(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 class _ManifestErrorRuntime(_FakeRuntime):
-    async def pull_model(self, ref: str) -> None:
+    async def pull_model(self, ref: str, on_progress: Any = None) -> None:
         raise RuntimeError(
             "Ollama pull failed (400): pull model manifest: 400 not a valid quantization scheme"
         )
 
 
 class _NotFoundRuntime(_FakeRuntime):
-    async def pull_model(self, ref: str) -> None:
+    async def pull_model(self, ref: str, on_progress: Any = None) -> None:
         raise RuntimeError("Ollama pull failed (404): repository not found")
 
 
 class _UnexpectedRuntime(_FakeRuntime):
-    async def pull_model(self, ref: str) -> None:
+    async def pull_model(self, ref: str, on_progress: Any = None) -> None:
         raise RuntimeError("kernel panic: totally unexpected explosion")
 
 

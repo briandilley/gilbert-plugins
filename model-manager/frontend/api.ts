@@ -20,6 +20,13 @@ import type {
   PullResponse,
 } from "./types";
 
+// A pull streams a (potentially multi-GB) download that can run for many
+// minutes. The server pushes throttled ``model_manager.pull.progress`` events
+// carrying this RPC's ``ref`` while it runs, and useWebSocket resets the
+// deadline on each — so this large ceiling is really a "no progress at all for
+// this long ⇒ treat as dead" backstop, not the expected duration.
+const PULL_TIMEOUT_MS = 10 * 60 * 1000;
+
 export function useModelManagerApi() {
   const { rpc } = useWebSocket();
 
@@ -55,12 +62,15 @@ export function useModelManagerApi() {
       // we also send the constructed ``ref`` for clarity; ``repo_id`` lets the
       // server seed per-model config (best-effort context window from HF).
       pull: (repoId: string, quant: string) =>
-        rpc<PullResponse>({
-          type: "model_manager.pull",
-          ref: `hf.co/${repoId}:${quant}`,
-          repo_id: repoId,
-          quant,
-        }),
+        rpc<PullResponse>(
+          {
+            type: "model_manager.pull",
+            ref: `hf.co/${repoId}:${quant}`,
+            repo_id: repoId,
+            quant,
+          },
+          PULL_TIMEOUT_MS,
+        ),
       deleteModel: (tag: string) =>
         rpc<DeleteResponse>({
           type: "model_manager.delete",

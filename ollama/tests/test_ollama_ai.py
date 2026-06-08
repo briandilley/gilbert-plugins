@@ -1,5 +1,6 @@
-"""Tests for Ollama backend — local defaults, optional api_key."""
+"""Tests for Ollama backend — native /api/chat, num_ctx, optional api_key."""
 
+import json
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -12,8 +13,9 @@ from gilbert.interfaces.ai import (
     Message,
     MessageRole,
     StopReason,
+    StreamEventType,
 )
-from gilbert.interfaces.tools import ToolParameterType
+from gilbert.interfaces.tools import ToolCall, ToolParameterType, ToolResult
 
 
 @pytest.fixture
@@ -40,11 +42,9 @@ async def test_initialize_with_api_key_sets_bearer(backend: OllamaAI) -> None:
     await backend.close()
 
 
-async def test_default_base_url_is_localhost_ollama(backend: OllamaAI) -> None:
+async def test_default_chat_url_is_native_api(backend: OllamaAI) -> None:
     await backend.initialize({})
-    assert backend._client is not None
-    resolved = str(backend._client.build_request("POST", "/chat/completions").url)
-    assert resolved == "http://localhost:11434/v1/chat/completions"
+    assert backend._chat_url() == "http://localhost:11434/api/chat"
     await backend.close()
 
 
@@ -55,10 +55,18 @@ async def test_default_model_is_llama3_3(backend: OllamaAI) -> None:
 
 
 async def test_custom_base_url_for_remote_ollama(backend: OllamaAI) -> None:
+    await backend.initialize({"base_url": "http://gpu.lan:11434"})
+    assert backend._chat_url() == "http://gpu.lan:11434/api/chat"
+    await backend.close()
+
+
+async def test_base_url_v1_suffix_is_stripped(backend: OllamaAI) -> None:
+    """A ``base_url`` carried over from the old OpenAI-shim default (ending in
+    ``/v1``) is normalised to the daemon root — native routes live there."""
     await backend.initialize({"base_url": "http://gpu.lan:11434/v1"})
-    assert backend._client is not None
-    resolved = str(backend._client.build_request("POST", "/chat/completions").url)
-    assert resolved == "http://gpu.lan:11434/v1/chat/completions"
+    assert backend._root_url() == "http://gpu.lan:11434"
+    assert backend._chat_url() == "http://gpu.lan:11434/api/chat"
+    assert backend._tags_url() == "http://gpu.lan:11434/api/tags"
     await backend.close()
 
 
@@ -104,7 +112,7 @@ def test_backend_config_params_includes_enabled_toggle() -> None:
     assert enabled.default is True
 
 
-def test_build_request_body_uses_max_tokens() -> None:
+def test_build_request_body_uses_num_predict_for_max_tokens() -> None:
     backend = OllamaAI()
     backend._model = "llama3.3"
     backend._max_tokens = 256
@@ -112,36 +120,85 @@ def test_build_request_body_uses_max_tokens() -> None:
         AIRequest(messages=[Message(role=MessageRole.USER, content="hi")])
     )
     assert body["model"] == "llama3.3"
-    assert body["max_tokens"] == 256
+    # Native API: max_tokens -> options.num_predict, no top-level max_tokens.
+    assert "max_tokens" not in body
+    assert body["options"]["num_predict"] == 256
+
+
+def test_build_request_body_sets_num_ctx_from_context_window() -> None:
+    """The whole point of the native endpoint: a resolved ``context_window``
+    becomes ``options.num_ctx`` so the model loads with the right window."""
+    backend = OllamaAI()
+    backend._model = "llama3.3"
+    body = backend._build_request_body(
+        AIRequest(
+            messages=[Message(role=MessageRole.USER, content="hi")],
+            context_window=32768,
+        )
+    )
+    assert body["options"]["num_ctx"] == 32768
+
+
+def test_build_request_body_omits_num_ctx_when_unset() -> None:
+    """No ``context_window`` -> no ``num_ctx``, so Ollama keeps its own default."""
+    backend = OllamaAI()
+    body = backend._build_request_body(
+        AIRequest(messages=[Message(role=MessageRole.USER, content="hi")])
+    )
+    assert "num_ctx" not in body["options"]
 
 
 def test_parse_text_response() -> None:
     backend = OllamaAI()
     data = {
-        "choices": [
-            {
-                "message": {"role": "assistant", "content": "Hello!"},
-                "finish_reason": "stop",
-            }
-        ],
+        "message": {"role": "assistant", "content": "Hello!"},
+        "done": True,
+        "done_reason": "stop",
         "model": "llama3.3",
+        "prompt_eval_count": 9,
+        "eval_count": 2,
     }
     response = backend._parse_response(data)
     assert response.message.content == "Hello!"
     assert response.stop_reason == StopReason.END_TURN
+    assert response.usage is not None
+    assert response.usage.input_tokens == 9
+    assert response.usage.output_tokens == 2
 
 
-async def test_generate_calls_chat_completions(backend: OllamaAI) -> None:
+def test_parse_response_with_tool_calls() -> None:
+    """Native tool calls carry an arguments *object* (not a JSON string) and no
+    id — we synthesise an id and report ``TOOL_USE``."""
+    backend = OllamaAI()
+    data = {
+        "message": {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"function": {"name": "get_weather", "arguments": {"city": "SF"}}}
+            ],
+        },
+        "done": True,
+        "done_reason": "stop",
+        "model": "llama3.3",
+    }
+    response = backend._parse_response(data)
+    assert response.stop_reason == StopReason.TOOL_USE
+    assert len(response.message.tool_calls) == 1
+    tc = response.message.tool_calls[0]
+    assert tc.tool_name == "get_weather"
+    assert tc.arguments == {"city": "SF"}
+    assert tc.tool_call_id  # synthesised, non-empty
+
+
+async def test_generate_calls_native_chat_endpoint(backend: OllamaAI) -> None:
     await backend.initialize({})
     mock_response = MagicMock()
     mock_response.is_error = False
     mock_response.json.return_value = {
-        "choices": [
-            {
-                "message": {"role": "assistant", "content": "hi"},
-                "finish_reason": "stop",
-            }
-        ],
+        "message": {"role": "assistant", "content": "hi"},
+        "done": True,
+        "done_reason": "stop",
         "model": "llama3.3",
     }
     assert backend._client is not None
@@ -149,7 +206,9 @@ async def test_generate_calls_chat_completions(backend: OllamaAI) -> None:
     await backend.generate(
         AIRequest(messages=[Message(role=MessageRole.USER, content="x")])
     )
-    assert backend._client.post.call_args[0][0] == "/chat/completions"
+    # Posts to the absolute native /api/chat URL with stream disabled.
+    assert backend._client.post.call_args[0][0] == "http://localhost:11434/api/chat"
+    assert backend._client.post.call_args.kwargs["json"]["stream"] is False
     await backend.close()
 
 
@@ -158,7 +217,8 @@ async def test_generate_raises_ai_backend_error(backend: OllamaAI) -> None:
     mock_response = MagicMock()
     mock_response.is_error = True
     mock_response.status_code = 404
-    mock_response.json.return_value = {"error": {"message": "model not found"}}
+    # Native errors are a plain {"error": "<string>"}.
+    mock_response.json.return_value = {"error": "model not found"}
     assert backend._client is not None
     backend._client.post = AsyncMock(return_value=mock_response)  # type: ignore[method-assign]
     with pytest.raises(AIBackendError) as exc_info:
@@ -278,8 +338,8 @@ def test_request_temperature_and_max_tokens_override_globals() -> None:
             max_tokens=256,
         )
     )
-    assert body["temperature"] == 0.2
-    assert body["max_tokens"] == 256
+    assert body["options"]["temperature"] == 0.2
+    assert body["options"]["num_predict"] == 256
 
 
 def test_request_falls_back_to_globals_when_none() -> None:
@@ -291,5 +351,179 @@ def test_request_falls_back_to_globals_when_none() -> None:
     body = backend._build_request_body(
         AIRequest(messages=[Message(role=MessageRole.USER, content="hi")])
     )
-    assert body["temperature"] == 0.7
-    assert body["max_tokens"] == 8192
+    assert body["options"]["temperature"] == 0.7
+    assert body["options"]["num_predict"] == 8192
+
+
+# --- Native message encoding (tools, tool results, images) ---
+
+
+def test_build_messages_assistant_tool_call_uses_object_arguments() -> None:
+    """Native assistant tool_calls carry an arguments *object* and no id."""
+    backend = OllamaAI()
+    rows = backend._build_messages(
+        [
+            Message(
+                role=MessageRole.ASSISTANT,
+                content="",
+                tool_calls=[
+                    ToolCall(tool_call_id="call_0", tool_name="ping", arguments={"n": 1})
+                ],
+            )
+        ],
+        system_prompt="",
+    )
+    tc = rows[0]["tool_calls"][0]
+    assert tc == {"function": {"name": "ping", "arguments": {"n": 1}}}
+    assert "id" not in tc
+
+
+def test_build_messages_tool_result_is_native_tool_row() -> None:
+    """A tool result becomes ``{"role": "tool", content, tool_name}`` — the
+    name resolved from the matching assistant tool_call (no id on the wire)."""
+    backend = OllamaAI()
+    rows = backend._build_messages(
+        [
+            Message(
+                role=MessageRole.ASSISTANT,
+                content="",
+                tool_calls=[
+                    ToolCall(tool_call_id="call_0", tool_name="ping", arguments={})
+                ],
+            ),
+            Message(
+                role=MessageRole.TOOL_RESULT,
+                tool_results=[ToolResult(tool_call_id="call_0", content="pong")],
+            ),
+        ],
+        system_prompt="",
+    )
+    tool_row = rows[-1]
+    assert tool_row["role"] == "tool"
+    assert tool_row["content"] == "pong"
+    assert tool_row["tool_name"] == "ping"
+    assert "tool_call_id" not in tool_row
+
+
+def test_build_user_message_inlines_images_as_base64_list() -> None:
+    """Image attachments with inline bytes go in a native ``images`` array as
+    raw base64 (no ``data:`` URL), with the text kept in ``content``."""
+    from gilbert.interfaces.ai import FileAttachment
+
+    backend = OllamaAI()
+    row = backend._build_user_message(
+        Message(
+            role=MessageRole.USER,
+            content="what is this?",
+            attachments=[
+                FileAttachment(
+                    kind="image",
+                    name="pic.png",
+                    media_type="image/png",
+                    size=3,
+                    data="QUJD",
+                )
+            ],
+        )
+    )
+    assert row["images"] == ["QUJD"]
+    assert row["content"] == "what is this?"
+
+
+# --- Native NDJSON streaming ---
+
+
+def _streaming_backend(lines: list[dict], capture: dict) -> OllamaAI:
+    """An OllamaAI whose client streams ``lines`` as native NDJSON."""
+    body = "".join(json.dumps(line) + "\n" for line in lines)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        capture["path"] = request.url.path
+        capture["body"] = json.loads(request.content)
+        return httpx.Response(200, content=body)
+
+    backend = OllamaAI()
+    backend._base_url = "http://localhost:11434"
+    backend._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return backend
+
+
+async def test_generate_stream_parses_native_ndjson() -> None:
+    capture: dict = {}
+    backend = _streaming_backend(
+        [
+            {"model": "llama3.3", "message": {"role": "assistant", "content": "Hel"}, "done": False},
+            {"model": "llama3.3", "message": {"role": "assistant", "content": "lo"}, "done": False},
+            {
+                "model": "llama3.3",
+                "message": {"role": "assistant", "content": ""},
+                "done": True,
+                "done_reason": "stop",
+                "prompt_eval_count": 12,
+                "eval_count": 3,
+            },
+        ],
+        capture,
+    )
+    events = [
+        ev
+        async for ev in backend.generate_stream(
+            AIRequest(
+                messages=[Message(role=MessageRole.USER, content="hi")],
+                context_window=16384,
+            )
+        )
+    ]
+    await backend.close()
+
+    # Hit the native endpoint, streaming, with num_ctx applied.
+    assert capture["path"] == "/api/chat"
+    assert capture["body"]["stream"] is True
+    assert capture["body"]["options"]["num_ctx"] == 16384
+
+    text = "".join(e.text or "" for e in events if e.type == StreamEventType.TEXT_DELTA)
+    assert text == "Hello"
+    complete = next(e for e in events if e.type == StreamEventType.MESSAGE_COMPLETE)
+    assert complete.response is not None
+    assert complete.response.message.content == "Hello"
+    assert complete.response.stop_reason == StopReason.END_TURN
+    assert complete.response.usage.input_tokens == 12
+    assert complete.response.usage.output_tokens == 3
+
+
+async def test_generate_stream_emits_tool_calls() -> None:
+    capture: dict = {}
+    backend = _streaming_backend(
+        [
+            {
+                "model": "m",
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {"function": {"name": "get_weather", "arguments": {"city": "SF"}}}
+                    ],
+                },
+                "done": True,
+                "done_reason": "stop",
+                "prompt_eval_count": 5,
+                "eval_count": 2,
+            }
+        ],
+        capture,
+    )
+    events = [
+        ev
+        async for ev in backend.generate_stream(
+            AIRequest(messages=[Message(role=MessageRole.USER, content="weather?")])
+        )
+    ]
+    await backend.close()
+
+    starts = [e for e in events if e.type == StreamEventType.TOOL_CALL_START]
+    assert len(starts) == 1 and starts[0].tool_name == "get_weather"
+    complete = next(e for e in events if e.type == StreamEventType.MESSAGE_COMPLETE)
+    assert complete.response.stop_reason == StopReason.TOOL_USE
+    tc = complete.response.message.tool_calls[0]
+    assert tc.tool_name == "get_weather"
+    assert tc.arguments == {"city": "SF"}

@@ -30,6 +30,8 @@ admin-gated.
 from __future__ import annotations
 
 import logging
+import time
+from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlparse
 
@@ -38,7 +40,7 @@ import httpx
 from gilbert.interfaces.ai import ModelConfig, PerModelConfigProvider
 from gilbert.interfaces.configuration import ConfigParam
 from gilbert.interfaces.host_resources import HostResources, HostResourcesProvider
-from gilbert.interfaces.local_models import LocalModelRuntimeProvider
+from gilbert.interfaces.local_models import LocalModelRuntimeProvider, PullProgress
 from gilbert.interfaces.service import (
     EnablementDep,
     Service,
@@ -56,6 +58,13 @@ logger = logging.getLogger(__name__)
 _DEFAULT_SEARCH_SORT = "downloads"
 _DEFAULT_SEARCH_LIMIT = 25
 _MAX_SEARCH_LIMIT = 100
+
+# Progress/keepalive event pushed to the requesting client during a pull.
+# Ollama emits progress frames many times a second; we coalesce to roughly one
+# event per second (a status change always passes through) so the client's RPC
+# deadline keeps getting reset without flooding its event queue.
+_PULL_PROGRESS_EVENT = "model_manager.pull.progress"
+_PULL_PROGRESS_THROTTLE_S = 1.0
 
 # The AI-backend name the local runtime (Ollama) maps to. Per-model config is
 # keyed by ``(backend, model)``; a pulled tag is an ``ollama`` model, so we
@@ -440,9 +449,16 @@ class ModelManagerService(Service):
         **Progress is coarse, by design.** The pull is awaited to completion
         and this RPC returns only when the model is installed — the frontend
         shows a "pulling…" spinner while the RPC is in flight, then refreshes
-        the installed list. Granular byte-level progress is intentionally out
-        of scope (gilbert#40): faking a progress bar would be dishonest, so a
-        spinner + completion is the deliverable.
+        the installed list.
+
+        While the (potentially very long) pull runs, the handler pushes
+        throttled ``model_manager.pull.progress`` events back to the requesting
+        client, each carrying the originating RPC's ``ref`` (the request id).
+        The frontend treats these as a **keepalive**: every one resets the
+        pull RPC's client-side deadline, so a multi-GB download on a slow link
+        never spuriously times out into a "Retry" button while Ollama is still
+        downloading (gilbert#40). The events carry real Ollama status + byte
+        counts, so they're honest — not a faked progress bar.
 
         On success it SEEDS per-model config (when the optional
         ``ai_model_config`` capability is present): ``enabled=True`` plus a
@@ -486,7 +502,9 @@ class ModelManagerService(Service):
                 "code": 400,
             }
         try:
-            await self._runtime.pull_model(ref)
+            await self._runtime.pull_model(
+                ref, on_progress=self._pull_progress_emitter(conn, frame, ref)
+            )
         except Exception as exc:
             return self._pull_error_response(frame, ref, exc)
         # The installed tag is the ref Ollama now serves chat requests under
@@ -501,6 +519,54 @@ class ModelManagerService(Service):
             "seeded": self._per_model_config is not None,
             "context_window": seeded_context,
         }
+
+    @staticmethod
+    def _pull_progress_emitter(
+        conn: WsConnectionBase,
+        frame: dict[str, Any],
+        ref: str,
+    ) -> Callable[[PullProgress], None]:
+        """Build the throttled ``on_progress`` callback for a pull.
+
+        Each emitted event is a ``gilbert.event`` of type
+        ``model_manager.pull.progress`` pushed straight to the requesting
+        connection (``conn.enqueue`` — no event bus, no other clients). Its
+        ``data.ref`` is the originating RPC's request id so the frontend resets
+        *that* pending RPC's deadline (the keepalive). Coalesced to roughly one
+        event per ``_PULL_PROGRESS_THROTTLE_S``; a status change always passes
+        through. Best-effort: ``enqueue`` silently drops if the queue is full.
+        """
+        req_id = frame.get("id")
+        last_emit = 0.0
+        last_status = ""
+
+        def _emit(progress: PullProgress) -> None:
+            nonlocal last_emit, last_status
+            now = time.monotonic()
+            if (
+                progress.status == last_status
+                and (now - last_emit) < _PULL_PROGRESS_THROTTLE_S
+            ):
+                return
+            last_emit = now
+            last_status = progress.status
+            conn.enqueue(
+                {
+                    "type": "gilbert.event",
+                    "event_type": _PULL_PROGRESS_EVENT,
+                    "data": {
+                        "ref": req_id,
+                        "model": ref,
+                        "status": progress.status,
+                        "completed": progress.completed,
+                        "total": progress.total,
+                    },
+                    "source": "model_manager",
+                    "timestamp": "",
+                }
+            )
+
+        return _emit
 
     async def _ws_delete(self, conn: WsConnectionBase, frame: dict[str, Any]) -> dict[str, Any]:
         """Delete an installed model tag from the local runtime.
