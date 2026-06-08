@@ -1,11 +1,19 @@
 """Ollama AI backend — AI via a locally-running Ollama server.
 
 `Ollama <https://ollama.com>`_ is a local LLM runtime that serves
-open-weight models (Llama, Qwen, Mistral, DeepSeek, Gemma, Phi, …) over
-an OpenAI-compatible Chat Completions endpoint at
-``http://localhost:11434/v1/chat/completions``. No API key is required
-for local usage; remote/protected Ollama instances can supply one
-anyway and it'll be passed through as a Bearer token.
+open-weight models (Llama, Qwen, Mistral, DeepSeek, Gemma, Phi, …). We
+talk to its **native** chat endpoint at ``{root}/api/chat`` rather than
+the OpenAI-compatible ``/v1/chat/completions`` one (ADR-0009). The native
+API is the only one that accepts a per-request context size
+(``options.num_ctx``); the OpenAI shim has no field for it, so a model
+loaded through it is stuck at the daemon default (often 4096 tokens) and
+400s any larger prompt. Routing through ``/api/chat`` lets Gilbert load
+the model with the context window resolved from per-model config.
+
+No API key is required for local usage; remote/protected Ollama
+instances can supply one anyway and it'll be passed through as a Bearer
+token. ``base_url`` may be given with or without a trailing ``/v1`` — we
+normalise to the daemon root either way.
 
 Models are referenced by the tag a user has pulled locally (e.g.
 ``llama3.3``, ``qwen2.5-coder:32b``). The ``model`` field is free-text
@@ -42,6 +50,7 @@ from gilbert.interfaces.tools import (
     ToolCall,
     ToolDefinition,
     ToolParameterType,
+    ToolResult,
 )
 
 from . import _installed_cache
@@ -49,7 +58,7 @@ from . import _installed_cache
 logger = logging.getLogger(__name__)
 ai_logger = logging.getLogger("gilbert.ai")
 
-_DEFAULT_BASE_URL = "http://localhost:11434/v1"
+_DEFAULT_BASE_URL = "http://localhost:11434"
 _DEFAULT_MODEL = "llama3.3"
 
 # Recommended overlay: a curated set of common tool-capable model
@@ -110,7 +119,7 @@ _RECOMMENDED_OVERLAY = [
 
 
 class OllamaAI(AIBackend):
-    """AI backend using Ollama's OpenAI-compatible Chat Completions API."""
+    """AI backend using Ollama's native ``/api/chat`` endpoint (ADR-0009)."""
 
     backend_name = "ollama"
 
@@ -142,8 +151,10 @@ class OllamaAI(AIBackend):
                 key="base_url",
                 type=ToolParameterType.STRING,
                 description=(
-                    "Ollama server URL (default ``http://localhost:11434/v1``). "
-                    "Point at another host/port if Ollama runs elsewhere."
+                    "Ollama server URL (default ``http://localhost:11434``). "
+                    "Point at another host/port if Ollama runs elsewhere. A "
+                    "trailing ``/v1`` is accepted and stripped — Gilbert uses "
+                    "the native ``/api`` endpoints."
                 ),
                 default=_DEFAULT_BASE_URL,
             ),
@@ -163,7 +174,7 @@ class OllamaAI(AIBackend):
                 type=ToolParameterType.INTEGER,
                 description=(
                     "Maximum tokens in a single AI response. Sent as "
-                    "``max_tokens`` to the Ollama endpoint."
+                    "``options.num_predict`` to the Ollama endpoint."
                 ),
                 default=8192,
             ),
@@ -267,8 +278,10 @@ class OllamaAI(AIBackend):
             headers["Authorization"] = f"Bearer {api_key}"
 
         self._base_url = base_url
+        # No ``base_url`` on the client: the native ``/api/*`` routes and the
+        # legacy ``/v1`` shim live at different depths, so we build absolute
+        # URLs from the normalised daemon root (``_root_url``) instead.
         self._client = httpx.AsyncClient(
-            base_url=base_url,
             headers=headers,
             timeout=120.0,
         )
@@ -319,17 +332,25 @@ class OllamaAI(AIBackend):
                     tags.append(name)
         self._installed_tags = tags
 
-    def _tags_url(self) -> str:
-        """Absolute URL for ``/api/tags`` at the Ollama daemon root.
+    def _root_url(self) -> str:
+        """The Ollama daemon root, with any trailing ``/v1`` shim stripped.
 
-        The httpx client's ``base_url`` points at the OpenAI-compatible
-        ``/v1`` endpoint; the native ``/api/*`` routes live one level up,
-        so strip a trailing ``/v1`` before appending.
+        ``base_url`` is accepted with or without ``/v1`` (the OpenAI shim
+        path); the native ``/api/*`` routes — which we use exclusively — live
+        at the root, so normalise here and build absolute URLs from it.
         """
         root = self._base_url
         if root.endswith("/v1"):
             root = root[: -len("/v1")]
-        return f"{root.rstrip('/')}/api/tags"
+        return root.rstrip("/")
+
+    def _chat_url(self) -> str:
+        """Absolute URL for the native ``/api/chat`` endpoint."""
+        return f"{self._root_url()}/api/chat"
+
+    def _tags_url(self) -> str:
+        """Absolute URL for ``/api/tags`` at the Ollama daemon root."""
+        return f"{self._root_url()}/api/tags"
 
     def available_models(self) -> list[ModelInfo]:
         """Advertise one ``ModelInfo`` per **installed** Ollama tag.
@@ -372,22 +393,25 @@ class OllamaAI(AIBackend):
             raise RuntimeError("OllamaAI not initialized")
 
         body = self._build_request_body(request)
+        body["stream"] = False
 
         ai_logger.debug(
-            "Ollama request: model=%s messages=%d",
+            "Ollama request: model=%s messages=%d num_ctx=%s",
             body["model"],
             len(body["messages"]),
+            body.get("options", {}).get("num_ctx"),
         )
 
-        resp = await self._client.post("/chat/completions", json=body)
+        resp = await self._client.post(self._chat_url(), json=body)
         if resp.is_error:
             raise self._error_from_response(resp.status_code, resp, body)
         data = resp.json()
 
         ai_logger.debug(
-            "Ollama response: finish_reason=%s usage=%s",
-            self._first_finish_reason(data),
-            data.get("usage"),
+            "Ollama response: done_reason=%s prompt_eval=%s eval=%s",
+            data.get("done_reason"),
+            data.get("prompt_eval_count"),
+            data.get("eval_count"),
         )
 
         return self._parse_response(data)
@@ -396,39 +420,40 @@ class OllamaAI(AIBackend):
         self,
         request: AIRequest,
     ) -> AsyncIterator[StreamEvent]:
-        """Stream Ollama SSE chunks as provider-neutral ``StreamEvent``s.
+        """Stream Ollama's native ``/api/chat`` NDJSON as ``StreamEvent``s.
 
-        Ollama's endpoint emits OpenAI-shape SSE frames, so parsing
-        mirrors the OpenAI plugin: ``delta.content`` → ``TEXT_DELTA``,
-        ``delta.tool_calls[i]`` → ``TOOL_CALL_START`` / ``TOOL_CALL_DELTA``,
-        ``finish_reason="tool_calls"`` → ``TOOL_CALL_END``, final chunk
-        → ``MESSAGE_COMPLETE`` with the assembled ``AIResponse``.
+        Native streaming emits one JSON object per line (not OpenAI SSE):
+        each carries a ``message`` with a ``content`` delta and, on the final
+        line, ``done: true`` plus ``done_reason`` and token counts
+        (``prompt_eval_count`` / ``eval_count``). Tool calls arrive *complete*
+        in a single chunk's ``message.tool_calls`` — Ollama doesn't stream
+        tool arguments token-by-token — so each is surfaced as a
+        ``TOOL_CALL_START`` + ``TOOL_CALL_END`` pair and folded into the final
+        ``AIResponse`` carried by ``MESSAGE_COMPLETE``.
         """
         if self._client is None:
             raise RuntimeError("OllamaAI not initialized")
 
         body = self._build_request_body(request)
         body["stream"] = True
-        body["stream_options"] = {"include_usage": True}
 
         ai_logger.debug(
-            "Ollama stream request: model=%s messages=%d",
-            self._model,
+            "Ollama stream request: model=%s messages=%d num_ctx=%s",
+            body["model"],
             len(body["messages"]),
+            body.get("options", {}).get("num_ctx"),
         )
 
         text_parts: list[str] = []
-        tool_builders: dict[int, dict[str, Any]] = {}
-        tool_started: set[int] = set()
-        tool_ended: set[int] = set()
-        finish_reason_raw = "stop"
+        tool_calls: list[ToolCall] = []
+        done_reason = "stop"
         usage_input = 0
         usage_output = 0
-        model_id = self._model
+        model_id = str(body["model"])
 
         async with self._client.stream(
             "POST",
-            "/chat/completions",
+            self._chat_url(),
             json=body,
         ) as resp:
             if resp.is_error:
@@ -439,88 +464,49 @@ class OllamaAI(AIBackend):
                 )
 
             async for line in resp.aiter_lines():
-                if not line or line.startswith(":"):
+                if not line.strip():
                     continue
-                if not line.startswith("data:"):
-                    continue
-                payload = line[len("data:") :].strip()
-                if not payload:
-                    continue
-                if payload == "[DONE]":
-                    break
                 try:
-                    data = json.loads(payload)
+                    data = json.loads(line)
                 except json.JSONDecodeError:
                     continue
                 if not isinstance(data, dict):
                     continue
 
                 model_id = str(data.get("model") or model_id)
-                usage = data.get("usage")
-                if isinstance(usage, dict):
-                    usage_input = int(usage.get("prompt_tokens", usage_input) or 0)
-                    usage_output = int(usage.get("completion_tokens", usage_output) or 0)
 
-                choices = data.get("choices") or []
-                if not choices:
-                    continue
-                choice = choices[0]
-                if not isinstance(choice, dict):
-                    continue
-
-                delta = choice.get("delta") or {}
-                if isinstance(delta, dict):
-                    content = delta.get("content")
+                message = data.get("message")
+                if isinstance(message, dict):
+                    content = message.get("content")
                     if isinstance(content, str) and content:
                         text_parts.append(content)
                         yield StreamEvent(
                             type=StreamEventType.TEXT_DELTA,
                             text=content,
                         )
-                    delta_tool_calls = delta.get("tool_calls")
-                    if isinstance(delta_tool_calls, list):
-                        for tc_delta in delta_tool_calls:
-                            if not isinstance(tc_delta, dict):
-                                continue
-                            async for ev in self._ingest_tool_call_delta(
-                                tc_delta,
-                                tool_builders,
-                                tool_started,
-                            ):
-                                yield ev
-
-                raw_finish = choice.get("finish_reason")
-                if raw_finish:
-                    finish_reason_raw = str(raw_finish)
-                    if finish_reason_raw == "tool_calls":
-                        for idx in sorted(tool_builders.keys()):
-                            if idx in tool_ended:
-                                continue
-                            builder = tool_builders[idx]
-                            tool_ended.add(idx)
+                    raw_tool_calls = message.get("tool_calls")
+                    if isinstance(raw_tool_calls, list):
+                        for tc in self._parse_tool_calls(
+                            raw_tool_calls, start=len(tool_calls)
+                        ):
+                            tool_calls.append(tc)
+                            yield StreamEvent(
+                                type=StreamEventType.TOOL_CALL_START,
+                                tool_call_id=tc.tool_call_id,
+                                tool_name=tc.tool_name,
+                            )
                             yield StreamEvent(
                                 type=StreamEventType.TOOL_CALL_END,
-                                tool_call_id=str(builder.get("id", "")),
-                                tool_name=str(builder.get("name", "")),
+                                tool_call_id=tc.tool_call_id,
+                                tool_name=tc.tool_name,
                             )
 
-        stop_reason = self._map_finish_reason(finish_reason_raw)
+                if data.get("done"):
+                    done_reason = str(data.get("done_reason") or done_reason)
+                    usage_input = int(data.get("prompt_eval_count", usage_input) or 0)
+                    usage_output = int(data.get("eval_count", usage_output) or 0)
 
-        tool_calls: list[ToolCall] = []
-        for idx in sorted(tool_builders.keys()):
-            builder = tool_builders[idx]
-            raw_json = builder.get("arguments", "")
-            try:
-                args = json.loads(raw_json) if raw_json else {}
-            except json.JSONDecodeError:
-                args = {}
-            tool_calls.append(
-                ToolCall(
-                    tool_call_id=str(builder.get("id", "")),
-                    tool_name=str(builder.get("name", "")),
-                    arguments=args,
-                )
-            )
+        stop_reason = self._stop_reason(done_reason, bool(tool_calls))
 
         final_message = Message(
             role=MessageRole.ASSISTANT,
@@ -538,63 +524,59 @@ class OllamaAI(AIBackend):
             usage=usage_obj,
         )
         ai_logger.debug(
-            "Ollama stream response: finish_reason=%s usage=%s",
-            finish_reason_raw,
-            {"prompt_tokens": usage_input, "completion_tokens": usage_output},
+            "Ollama stream response: done_reason=%s usage=%s",
+            done_reason,
+            {"prompt_eval_count": usage_input, "eval_count": usage_output},
         )
         yield StreamEvent(
             type=StreamEventType.MESSAGE_COMPLETE,
             response=final_response,
         )
 
-    async def _ingest_tool_call_delta(
-        self,
-        tc_delta: dict[str, Any],
-        tool_builders: dict[int, dict[str, Any]],
-        tool_started: set[int],
-    ) -> AsyncIterator[StreamEvent]:
-        """Fold a single streamed ``tool_calls[i]`` delta into the builder."""
-        idx = int(tc_delta.get("index") or 0)
-        builder = tool_builders.setdefault(
-            idx,
-            {"id": "", "name": "", "arguments": ""},
-        )
+    @staticmethod
+    def _parse_tool_calls(raw: list[Any], start: int = 0) -> list[ToolCall]:
+        """Convert native ``message.tool_calls`` entries into ``ToolCall``s.
 
-        tc_id = tc_delta.get("id")
-        if isinstance(tc_id, str) and tc_id:
-            builder["id"] = tc_id
+        Native tool calls are ``{"function": {"name", "arguments": <object>}}``
+        — arguments is already a JSON object (not the OpenAI JSON *string*) and
+        there is no ``id``, so we synthesise a per-turn id (``call_<n>``) for
+        the loop's call/result bookkeeping. The synthetic id never goes back on
+        the wire: native tool-result messages are matched by order + tool name,
+        not id.
+        """
+        out: list[ToolCall] = []
+        for offset, tc in enumerate(raw):
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function")
+            if not isinstance(fn, dict):
+                continue
+            name = str(fn.get("name") or "")
+            if not name:
+                continue
+            raw_args = fn.get("arguments")
+            if isinstance(raw_args, dict):
+                args = raw_args
+            elif isinstance(raw_args, str) and raw_args:
+                try:
+                    parsed = json.loads(raw_args)
+                except json.JSONDecodeError:
+                    parsed = {}
+                args = parsed if isinstance(parsed, dict) else {}
+            else:
+                args = {}
+            tc_id = str(tc.get("id") or f"call_{start + offset}")
+            out.append(ToolCall(tool_call_id=tc_id, tool_name=name, arguments=args))
+        return out
 
-        fn = tc_delta.get("function")
-        if isinstance(fn, dict):
-            name = fn.get("name")
-            if isinstance(name, str) and name:
-                builder["name"] = name
-            args_chunk = fn.get("arguments")
-            if isinstance(args_chunk, str) and args_chunk:
-                builder["arguments"] += args_chunk
-                if idx in tool_started:
-                    yield StreamEvent(
-                        type=StreamEventType.TOOL_CALL_DELTA,
-                        tool_call_id=str(builder.get("id", "")),
-                        tool_name=str(builder.get("name", "")),
-                        partial_json=args_chunk,
-                    )
-
-        if idx not in tool_started and builder.get("id") and builder.get("name"):
-            tool_started.add(idx)
-            yield StreamEvent(
-                type=StreamEventType.TOOL_CALL_START,
-                tool_call_id=str(builder["id"]),
-                tool_name=str(builder["name"]),
-            )
-            buffered = str(builder.get("arguments", ""))
-            if buffered:
-                yield StreamEvent(
-                    type=StreamEventType.TOOL_CALL_DELTA,
-                    tool_call_id=str(builder["id"]),
-                    tool_name=str(builder["name"]),
-                    partial_json=buffered,
-                )
+    @staticmethod
+    def _stop_reason(done_reason: str, has_tool_calls: bool) -> StopReason:
+        """Map a native ``done_reason`` (+ tool-call presence) to ``StopReason``."""
+        if has_tool_calls:
+            return StopReason.TOOL_USE
+        if done_reason == "length":
+            return StopReason.MAX_TOKENS
+        return StopReason.END_TURN
 
     # --- Request Building ---
 
@@ -605,11 +587,23 @@ class OllamaAI(AIBackend):
         # ``None`` means "use this backend's own global default".
         max_tokens = request.max_tokens if request.max_tokens is not None else self._max_tokens
         temperature = request.temperature if request.temperature is not None else self._temperature
+
+        # Native ``/api/chat`` carries generation params under ``options``:
+        # ``num_predict`` is the OpenAI ``max_tokens``, ``num_ctx`` is the
+        # context window. ``num_ctx`` is the whole reason we use this endpoint
+        # — it loads the model with the caller-resolved window instead of the
+        # daemon default. Omit it when unset so Ollama keeps its own default.
+        options: dict[str, Any] = {
+            "temperature": temperature,
+            "num_predict": max_tokens,
+        }
+        if request.context_window is not None:
+            options["num_ctx"] = request.context_window
+
         body: dict[str, Any] = {
             "model": model,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
             "messages": self._build_messages(request.messages, request.system_prompt),
+            "options": options,
         }
 
         if request.tools:
@@ -622,7 +616,20 @@ class OllamaAI(AIBackend):
         messages: list[Message],
         system_prompt: str,
     ) -> list[dict[str, Any]]:
-        """Convert internal messages to OpenAI-compatible Chat Completions format."""
+        """Convert internal messages to native ``/api/chat`` format.
+
+        Native tool results are ``{"role": "tool", "content": …}`` with an
+        optional ``tool_name`` (there is no ``tool_call_id`` on the wire —
+        calls and results are matched by order). ``ToolResult`` only stores the
+        id, so we first build an id→name map across the whole history to fill
+        ``tool_name`` even for standalone ``TOOL_RESULT`` rows.
+        """
+        name_by_id: dict[str, str] = {}
+        for msg in messages:
+            for tc in msg.tool_calls:
+                if tc.tool_call_id:
+                    name_by_id[tc.tool_call_id] = tc.tool_name
+
         result: list[dict[str, Any]] = []
 
         if system_prompt:
@@ -638,161 +645,109 @@ class OllamaAI(AIBackend):
                 result.append(self._build_user_message(msg))
 
             elif msg.role == MessageRole.ASSISTANT:
-                # Slash-command turns are persisted as a single assistant
-                # row carrying both ``tool_calls`` and ``tool_results``;
-                # Ollama (like OpenAI) requires the tool results to
-                # appear as separate ``tool``-role rows after the
-                # assistant's tool_calls, so we split them here.
+                # Slash-command turns are persisted as a single assistant row
+                # carrying both ``tool_calls`` and ``tool_results``; Ollama
+                # requires the results to follow as separate ``tool`` rows
+                # after the assistant's tool_calls, so split them here.
+                result.append(self._assistant_row(msg))
                 if msg.tool_calls and msg.tool_results:
-                    result.append(
-                        {
-                            "role": "assistant",
-                            "content": msg.content or None,
-                            "tool_calls": [self._encode_tool_call(tc) for tc in msg.tool_calls],
-                        }
-                    )
                     for tr in msg.tool_results:
-                        result.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": tr.tool_call_id,
-                                "content": tr.content,
-                            }
-                        )
-                    continue
-
-                assistant_row: dict[str, Any] = {
-                    "role": "assistant",
-                    "content": msg.content or None,
-                }
-                if msg.tool_calls:
-                    assistant_row["tool_calls"] = [
-                        self._encode_tool_call(tc) for tc in msg.tool_calls
-                    ]
-                result.append(assistant_row)
+                        result.append(self._tool_result_row(tr, name_by_id))
 
             elif msg.role == MessageRole.TOOL_RESULT:
                 for tr in msg.tool_results:
-                    result.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tr.tool_call_id,
-                            "content": tr.content,
-                        }
-                    )
+                    result.append(self._tool_result_row(tr, name_by_id))
 
         return result
 
-    def _build_user_message(self, msg: Message) -> dict[str, Any]:
-        """Build a user-role message, inlining any attachments.
+    @staticmethod
+    def _assistant_row(msg: Message) -> dict[str, Any]:
+        """Native assistant row: ``content`` plus optional ``tool_calls``."""
+        row: dict[str, Any] = {"role": "assistant", "content": msg.content or ""}
+        if msg.tool_calls:
+            row["tool_calls"] = [OllamaAI._encode_tool_call(tc) for tc in msg.tool_calls]
+        return row
 
-        Multimodal Ollama models (e.g. ``llava``, ``llama3.2-vision``,
-        ``qwen2.5-vl``) accept ``image_url`` content parts with base64
-        data URLs. Text-only models ignore vision parts, so sending the
-        data URL is safe regardless of which tag is selected.
+    @staticmethod
+    def _tool_result_row(tr: ToolResult, name_by_id: dict[str, str]) -> dict[str, Any]:
+        """Native tool-result row: ``{"role": "tool", "content", tool_name?}``."""
+        row: dict[str, Any] = {"role": "tool", "content": tr.content}
+        name = name_by_id.get(tr.tool_call_id)
+        if name:
+            row["tool_name"] = name
+        return row
+
+    def _build_user_message(self, msg: Message) -> dict[str, Any]:
+        """Build a native user message: text ``content`` + optional ``images``.
+
+        Multimodal Ollama models (``llava``, ``llama3.2-vision``,
+        ``qwen2.5-vl``, …) take raw base64 image strings in an ``images`` array
+        on the message — no ``data:`` URL prefix and no OpenAI content-parts
+        array. Non-image attachments (documents, text without inline content,
+        file references, and image refs without inline bytes) are described in
+        the text so the model knows to fetch them via a workspace tool.
         """
         if not msg.attachments:
             return {"role": "user", "content": msg.content}
 
-        image_atts = [a for a in msg.attachments if a.kind == "image"]
-        doc_atts = [a for a in msg.attachments if a.kind == "document"]
-        text_atts = [a for a in msg.attachments if a.kind == "text"]
-        ref_atts = [a for a in msg.attachments if a.kind == "file"]
+        images: list[str] = []
+        text_blocks: list[str] = []
 
-        parts: list[dict[str, Any]] = []
-
-        for img in image_atts:
-            if img.data:
-                data_url = f"data:{img.media_type};base64,{img.data}"
-                parts.append(
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": data_url},
-                    }
+        for att in msg.attachments:
+            if att.kind == "image":
+                if att.data:
+                    images.append(att.data)
+                else:
+                    text_blocks.append(
+                        f"[Attached image: {att.name or 'image'} "
+                        f"({att.media_type}, {att.size} bytes) — use "
+                        f"read_workspace_file or run_workspace_script to access]"
+                    )
+            elif att.kind == "document":
+                text_blocks.append(
+                    f"[Attached document: {att.name or 'document'} "
+                    f"({att.media_type}, {att.size} bytes) — use "
+                    f"read_workspace_file or run_workspace_script to access]"
                 )
+            elif att.kind == "text" and att.text:
+                text_blocks.append(f"## {att.name}\n\n{att.text}")
             else:
-                parts.append(
-                    {
-                        "type": "text",
-                        "text": (
-                            f"[Attached image: {img.name or 'image'} "
-                            f"({img.media_type}, {img.size} bytes) — use "
-                            f"read_workspace_file or run_workspace_script "
-                            f"to access]"
-                        ),
-                    }
+                text_blocks.append(
+                    f"[Attached file: {att.name or 'file'} "
+                    f"({att.media_type}, {att.size} bytes) — use "
+                    f"read_workspace_file or run_workspace_script to access]"
                 )
-
-        for doc in doc_atts:
-            parts.append(
-                {
-                    "type": "text",
-                    "text": (
-                        f"[Attached document: {doc.name or 'document'} "
-                        f"({doc.media_type}, {doc.size} bytes) — use "
-                        f"read_workspace_file or run_workspace_script "
-                        f"to access]"
-                    ),
-                }
-            )
-
-        for txt in text_atts:
-            if txt.text:
-                parts.append(
-                    {
-                        "type": "text",
-                        "text": f"## {txt.name}\n\n{txt.text}",
-                    }
-                )
-            else:
-                parts.append(
-                    {
-                        "type": "text",
-                        "text": (
-                            f"[Attached file: {txt.name or 'file'} "
-                            f"({txt.media_type}, {txt.size} bytes) — use "
-                            f"read_workspace_file or run_workspace_script "
-                            f"to access]"
-                        ),
-                    }
-                )
-
-        for ref in ref_atts:
-            parts.append(
-                {
-                    "type": "text",
-                    "text": (
-                        f"[Attached file: {ref.name or 'file'} "
-                        f"({ref.media_type}, {ref.size} bytes) — use "
-                        f"read_workspace_file or run_workspace_script "
-                        f"to access]"
-                    ),
-                }
-            )
 
         if msg.content:
-            parts.append({"type": "text", "text": msg.content})
+            text_blocks.append(msg.content)
 
-        if not parts:
-            return {"role": "user", "content": msg.content}
-
-        return {"role": "user", "content": parts}
+        row: dict[str, Any] = {"role": "user", "content": "\n\n".join(text_blocks)}
+        if images:
+            row["images"] = images
+        return row
 
     @staticmethod
     def _encode_tool_call(tc: ToolCall) -> dict[str, Any]:
-        """OpenAI-compat: ``tool_calls[i].function.arguments`` is a JSON string."""
+        """Native ``message.tool_calls[i]`` — ``arguments`` is a JSON object.
+
+        Unlike the OpenAI shim (which wants ``arguments`` as a JSON *string*
+        and an ``id``), the native API takes the arguments object directly and
+        has no id field.
+        """
         return {
-            "id": tc.tool_call_id,
-            "type": "function",
             "function": {
                 "name": tc.tool_name,
-                "arguments": json.dumps(tc.arguments),
+                "arguments": tc.arguments,
             },
         }
 
     @staticmethod
     def _build_tools(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
-        """Convert tool definitions to OpenAI function-calling format."""
+        """Convert tool definitions to the native function-calling format.
+
+        Native ``/api/chat`` uses the same ``{"type": "function", "function":
+        {name, description, parameters}}`` shape as OpenAI.
+        """
         return [
             {
                 "type": "function",
@@ -852,10 +807,14 @@ class OllamaAI(AIBackend):
 
     @staticmethod
     def _extract_error_reason(err_body: Any) -> str:
+        # The native API returns ``{"error": "<message string>"}``; the OpenAI
+        # shim returned ``{"error": {"message": …}}``. Handle both shapes.
         reason = ""
         if isinstance(err_body, dict):
             err_obj = err_body.get("error")
-            if isinstance(err_obj, dict):
+            if isinstance(err_obj, str):
+                reason = err_obj.strip()
+            elif isinstance(err_obj, dict):
                 reason = str(err_obj.get("message") or "").strip()
             if not reason:
                 reason = str(err_body.get("message") or "").strip()
@@ -863,55 +822,26 @@ class OllamaAI(AIBackend):
             reason = str(err_body)[:500]
         return reason
 
-    @staticmethod
-    def _first_finish_reason(data: dict[str, Any]) -> str:
-        choices = data.get("choices") or []
-        if choices and isinstance(choices[0], dict):
-            return str(choices[0].get("finish_reason") or "")
-        return ""
-
-    @staticmethod
-    def _map_finish_reason(raw: str) -> StopReason:
-        if raw == "tool_calls" or raw == "function_call":
-            return StopReason.TOOL_USE
-        if raw == "length":
-            return StopReason.MAX_TOKENS
-        return StopReason.END_TURN
-
     def _parse_response(self, data: dict[str, Any]) -> AIResponse:
-        """Parse a Chat Completions response into an ``AIResponse``."""
-        choices = data.get("choices") or []
-        choice = choices[0] if choices else {}
-        message = choice.get("message") or {}
+        """Parse a native ``/api/chat`` (non-stream) response into ``AIResponse``."""
+        message = data.get("message")
+        if not isinstance(message, dict):
+            message = {}
         raw_content = message.get("content")
         content_text = raw_content if isinstance(raw_content, str) else ""
 
-        tool_calls: list[ToolCall] = []
-        for tc in message.get("tool_calls") or []:
-            if not isinstance(tc, dict):
-                continue
-            fn = tc.get("function") or {}
-            args_raw = fn.get("arguments")
-            try:
-                args = json.loads(args_raw) if isinstance(args_raw, str) else {}
-            except json.JSONDecodeError:
-                args = {}
-            tool_calls.append(
-                ToolCall(
-                    tool_call_id=str(tc.get("id", "")),
-                    tool_name=str(fn.get("name", "")),
-                    arguments=args if isinstance(args, dict) else {},
-                )
-            )
+        raw_tool_calls = message.get("tool_calls")
+        tool_calls = (
+            self._parse_tool_calls(raw_tool_calls) if isinstance(raw_tool_calls, list) else []
+        )
 
-        stop_reason = self._map_finish_reason(str(choice.get("finish_reason") or ""))
+        stop_reason = self._stop_reason(str(data.get("done_reason") or ""), bool(tool_calls))
 
         usage = None
-        raw_usage = data.get("usage")
-        if isinstance(raw_usage, dict):
+        if "prompt_eval_count" in data or "eval_count" in data:
             usage = TokenUsage(
-                input_tokens=int(raw_usage.get("prompt_tokens", 0) or 0),
-                output_tokens=int(raw_usage.get("completion_tokens", 0) or 0),
+                input_tokens=int(data.get("prompt_eval_count", 0) or 0),
+                output_tokens=int(data.get("eval_count", 0) or 0),
             )
 
         assistant_msg = Message(

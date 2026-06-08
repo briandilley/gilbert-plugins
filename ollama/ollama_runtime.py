@@ -18,12 +18,13 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 from typing import Any
 
 import httpx
 
 from gilbert.interfaces.configuration import ConfigurationReader
-from gilbert.interfaces.local_models import InstalledModel
+from gilbert.interfaces.local_models import InstalledModel, PullProgress
 from gilbert.interfaces.service import (
     Service,
     ServiceInfo,
@@ -144,7 +145,11 @@ class OllamaRuntimeService(Service):
             return
         _installed_cache.set([m.tag for m in installed])
 
-    async def pull_model(self, ref: str) -> None:
+    async def pull_model(
+        self,
+        ref: str,
+        on_progress: Callable[[PullProgress], None] | None = None,
+    ) -> None:
         """Pull a model via ``POST /api/pull``, awaiting completion.
 
         ``ref`` is any reference Ollama accepts — a registry tag
@@ -152,6 +157,13 @@ class OllamaRuntimeService(Service):
         (``hf.co/<repo>:<quant>``). Ollama streams newline-delimited JSON
         progress frames; we drain the stream until it ends and raise if a
         frame reports an ``error``.
+
+        For each progress frame, ``on_progress`` (when supplied) is invoked
+        with a :class:`PullProgress` carrying Ollama's ``status`` and, when
+        present, ``completed`` / ``total`` byte counts. It's best-effort: a
+        callback that raises is logged and ignored so it can never fail the
+        pull. This is what lets the manager keep the (long) pull RPC alive past
+        a fixed client timeout.
         """
         url = f"{self._root_url()}/api/pull"
         body = {"name": ref, "stream": True}
@@ -170,11 +182,37 @@ class OllamaRuntimeService(Service):
                         frame = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if isinstance(frame, dict) and frame.get("error"):
+                    if not isinstance(frame, dict):
+                        continue
+                    if frame.get("error"):
                         raise RuntimeError(f"Ollama pull error: {frame['error']}")
+                    if on_progress is not None:
+                        self._emit_progress(frame, on_progress)
         # Pull succeeded — resync the host-global installed cache so the AI
         # backend's available_models() shows the new tag immediately.
         await self._refresh_installed_cache()
+
+    @staticmethod
+    def _emit_progress(
+        frame: dict[str, Any],
+        on_progress: Callable[[PullProgress], None],
+    ) -> None:
+        """Translate one Ollama pull frame into a ``PullProgress`` callback.
+
+        Best-effort and swallowing: a misbehaving callback must never abort an
+        in-flight pull the user is waiting on.
+        """
+        completed = frame.get("completed")
+        total = frame.get("total")
+        progress = PullProgress(
+            status=str(frame.get("status") or ""),
+            completed=int(completed) if isinstance(completed, (int, float)) else None,
+            total=int(total) if isinstance(total, (int, float)) else None,
+        )
+        try:
+            on_progress(progress)
+        except Exception:
+            logger.debug("pull on_progress callback raised; ignoring", exc_info=True)
 
     async def delete_model(self, tag: str) -> None:
         """Delete an installed tag via ``DELETE /api/delete``."""

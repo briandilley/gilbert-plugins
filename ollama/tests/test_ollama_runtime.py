@@ -162,6 +162,69 @@ async def test_pull_model_posts_api_pull(monkeypatch: pytest.MonkeyPatch) -> Non
     assert client.stream.call_args[1]["json"]["name"] == "hf.co/some/repo:Q4_K_M"
 
 
+def _stream_client(monkeypatch: pytest.MonkeyPatch, lines: list[str]) -> None:
+    """Patch httpx.AsyncClient so a pull streams ``lines`` as NDJSON frames."""
+    resp = MagicMock()
+    resp.is_error = False
+
+    async def _aiter_lines() -> Any:
+        for line in lines:
+            yield line
+
+    resp.aiter_lines = _aiter_lines
+    stream_cm = MagicMock()
+    stream_cm.__aenter__ = AsyncMock(return_value=resp)
+    stream_cm.__aexit__ = AsyncMock(return_value=False)
+    client = MagicMock()
+    client.stream = MagicMock(return_value=stream_cm)
+    monkeypatch.setattr(
+        "gilbert_plugin_ollama.ollama_runtime.httpx.AsyncClient",
+        lambda *a, **k: _client_cm(client),
+    )
+
+
+async def test_pull_model_invokes_on_progress(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each Ollama progress frame becomes a ``PullProgress`` callback with the
+    status and (when present) byte counts."""
+    svc = await _started({})
+    _stream_client(
+        monkeypatch,
+        [
+            json.dumps({"status": "pulling manifest"}),
+            json.dumps({"status": "pulling sha256:abc", "completed": 10, "total": 100}),
+            json.dumps({"status": "success"}),
+        ],
+    )
+
+    seen: list[Any] = []
+    await svc.pull_model("hf.co/some/repo:Q4_K_M", on_progress=seen.append)
+
+    assert [p.status for p in seen] == [
+        "pulling manifest",
+        "pulling sha256:abc",
+        "success",
+    ]
+    assert seen[1].completed == 10
+    assert seen[1].total == 100
+
+
+async def test_pull_model_progress_callback_errors_are_swallowed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A misbehaving ``on_progress`` must never abort an in-flight pull."""
+    svc = await _started({})
+    _stream_client(
+        monkeypatch,
+        [json.dumps({"status": "pulling manifest"}), json.dumps({"status": "success"})],
+    )
+
+    def boom(_p: Any) -> None:
+        raise ValueError("callback boom")
+
+    # Completes without raising despite the broken callback.
+    await svc.pull_model("hf.co/some/repo:Q4_K_M", on_progress=boom)
+
+
 async def test_pull_model_raises_on_error_frame(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
