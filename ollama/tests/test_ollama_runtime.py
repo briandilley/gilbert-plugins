@@ -12,6 +12,8 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from gilbert_plugin_ollama import _installed_cache
+from gilbert_plugin_ollama.ollama_ai import OllamaAI
 from gilbert_plugin_ollama.ollama_runtime import OllamaRuntimeService
 
 from gilbert.interfaces.local_models import (
@@ -204,6 +206,93 @@ async def test_delete_model_calls_api_delete(
     assert method == "DELETE"
     assert url == "http://localhost:11434/api/delete"
     assert client.request.call_args[1]["json"] == {"name": "llama3.3:latest"}
+
+
+# --- pull/delete keep the shared installed cache (and available_models) live ---
+
+
+def _tags_resp(*names: str) -> MagicMock:
+    """A ``/api/tags`` GET response carrying the given installed tag names."""
+    resp = MagicMock()
+    resp.raise_for_status.return_value = None
+    resp.json.return_value = {"models": [{"name": n} for n in names]}
+    return resp
+
+
+def _pull_stream_ok() -> MagicMock:
+    """A successful ``/api/pull`` stream context manager (no error frame)."""
+    resp = MagicMock()
+    resp.is_error = False
+
+    async def _aiter_lines() -> Any:
+        yield json.dumps({"status": "success"})
+
+    resp.aiter_lines = _aiter_lines
+    stream_cm = MagicMock()
+    stream_cm.__aenter__ = AsyncMock(return_value=resp)
+    stream_cm.__aexit__ = AsyncMock(return_value=False)
+    return stream_cm
+
+
+async def test_pull_model_makes_tag_immediately_chat_selectable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After ``pull_model`` succeeds, the runtime re-fetches ``/api/tags`` and
+    publishes the result into the host-global cache — so the Ollama AI
+    backend's ``available_models()`` shows the new tag *immediately*, with no
+    restart. This is the "immediately chat-selectable" guarantee."""
+    svc = await _started({})
+    assert _installed_cache.get() == []
+
+    # ``/api/pull`` streams success; the post-pull ``/api/tags`` GET now
+    # reports the newly-installed tag.
+    client = MagicMock()
+    client.stream = MagicMock(return_value=_pull_stream_ok())
+    client.get = AsyncMock(return_value=_tags_resp("hf.co/some/repo:Q4_K_M"))
+    monkeypatch.setattr(
+        "gilbert_plugin_ollama.ollama_runtime.httpx.AsyncClient",
+        lambda *a, **k: _client_cm(client),
+    )
+
+    await svc.pull_model("hf.co/some/repo:Q4_K_M")
+
+    # The shared cache reflects the pull...
+    assert _installed_cache.get() == ["hf.co/some/repo:Q4_K_M"]
+    # ...and a fresh AI backend instance (reading that same cache) advertises
+    # the tag without ever having hit the network itself.
+    backend = OllamaAI()
+    ids = [m.id for m in backend.available_models()]
+    assert "hf.co/some/repo:Q4_K_M" in ids
+
+
+async def test_delete_model_removes_tag_from_available_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After ``delete_model`` succeeds, the runtime re-fetches ``/api/tags``
+    and the deleted tag disappears from the shared cache → the AI backend's
+    ``available_models()`` no longer advertises it."""
+    # Seed the cache as if two models were installed.
+    _installed_cache.set(["llama3.3:latest", "mistral:7b"])
+    svc = await _started({})
+
+    resp = MagicMock()
+    resp.is_error = False
+    client = MagicMock()
+    client.request = AsyncMock(return_value=resp)
+    # Post-delete ``/api/tags`` now reports only the surviving tag.
+    client.get = AsyncMock(return_value=_tags_resp("mistral:7b"))
+    monkeypatch.setattr(
+        "gilbert_plugin_ollama.ollama_runtime.httpx.AsyncClient",
+        lambda *a, **k: _client_cm(client),
+    )
+
+    await svc.delete_model("llama3.3:latest")
+
+    assert _installed_cache.get() == ["mistral:7b"]
+    backend = OllamaAI()
+    ids = [m.id for m in backend.available_models()]
+    assert "llama3.3:latest" not in ids
+    assert "mistral:7b" in ids
 
 
 async def test_api_key_flows_as_bearer(monkeypatch: pytest.MonkeyPatch) -> None:

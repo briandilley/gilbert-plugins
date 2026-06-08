@@ -91,3 +91,25 @@ export interface HostResourcesResponse {
   /** True when Ollama's ``base_url`` is off-box ⇒ every fit is "unknown". */
   remote: boolean;
 }
+
+// --- Pull / delete (S8) ---------------------------------------------------
+
+/** Result of ``model_manager.pull``. The RPC returns only once the pull has
+ *  completed (coarse progress: a spinner while in flight, then this). Mirrors
+ *  the frame serialized by ``ModelManagerService._ws_pull``. */
+export interface PullResponse {
+  /** The installed model tag Ollama now serves chat under
+   *  (``hf.co/<repo>:<quant>``). */
+  model: string;
+  /** True when per-model config was seeded (the ``ai_model_config``
+   *  capability was present). */
+  seeded: boolean;
+  /** Best-effort context window read from HF metadata, or ``null``. */
+  context_window: number | null;
+}
+
+/** Result of ``model_manager.delete``. */
+export interface DeleteResponse {
+  /** The tag that was removed. */
+  tag: string;
+}

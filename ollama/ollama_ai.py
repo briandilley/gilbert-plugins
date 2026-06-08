@@ -44,6 +44,8 @@ from gilbert.interfaces.tools import (
     ToolParameterType,
 )
 
+from . import _installed_cache
+
 logger = logging.getLogger(__name__)
 ai_logger = logging.getLogger("gilbert.ai")
 
@@ -168,9 +170,7 @@ class OllamaAI(AIBackend):
             ConfigParam(
                 key="temperature",
                 type=ToolParameterType.NUMBER,
-                description=(
-                    "Sampling temperature (0.0 = deterministic, 1.0 = creative)."
-                ),
+                description=("Sampling temperature (0.0 = deterministic, 1.0 = creative)."),
                 default=0.7,
             ),
         ]
@@ -231,13 +231,23 @@ class OllamaAI(AIBackend):
         self._client: httpx.AsyncClient | None = None
         self._base_url: str = _DEFAULT_BASE_URL
         self._model: str = _DEFAULT_MODEL
-        # Tags actually installed in the Ollama daemon, refreshed from
-        # ``GET /api/tags`` in ``initialize()`` /
-        # ``refresh_installed_models()``. ``available_models()`` is sync,
-        # so it reads this cache rather than hitting the network.
-        self._installed_tags: list[str] = []
         self._max_tokens: int = 8192
         self._temperature: float = 0.7
+
+    @property
+    def _installed_tags(self) -> list[str]:
+        """Installed Ollama tags, read from the host-global shared cache.
+
+        Backed by ``_installed_cache`` rather than instance state so the
+        runtime service's pull/delete writes are visible here immediately —
+        that's what makes a freshly-pulled model chat-selectable without a
+        backend restart.
+        """
+        return _installed_cache.get()
+
+    @_installed_tags.setter
+    def _installed_tags(self, tags: list[str]) -> None:
+        _installed_cache.set(tags)
 
     async def initialize(self, config: dict[str, Any]) -> None:
         # ``api_key`` is intentionally optional: local Ollama doesn't
@@ -282,10 +292,10 @@ class OllamaAI(AIBackend):
 
         Queries ``GET /api/tags`` (the daemon's native API, which sits at
         the server root — *not* under the OpenAI-compatible ``/v1`` path)
-        and stores the tag names in ``self._installed_tags`` so the sync
-        ``available_models()`` can reflect them without doing network I/O.
-        Best-effort: a daemon that's unreachable or returns an unexpected
-        shape leaves the previous cache untouched.
+        and stores the tag names in the host-global ``_installed_cache`` so
+        the sync ``available_models()`` can reflect them without doing
+        network I/O. Best-effort: a daemon that's unreachable or returns an
+        unexpected shape leaves the previous cache untouched.
         """
         if self._client is None:
             return
@@ -324,12 +334,13 @@ class OllamaAI(AIBackend):
     def available_models(self) -> list[ModelInfo]:
         """Advertise one ``ModelInfo`` per **installed** Ollama tag.
 
-        Sourced from ``self._installed_tags`` (refreshed from the daemon's
-        ``/api/tags``). Each tag is enriched from the recommended overlay
-        when it matches a curated family; otherwise it's advertised as a
-        bare ``ModelInfo(id=tag, name=tag)``. Per-model ``enabled``
-        filtering is applied downstream by the core ``AIService``
-        (ADR-0019), so it's intentionally not done here.
+        Sourced from the host-global ``_installed_cache`` (refreshed from
+        the daemon's ``/api/tags`` here and after every runtime
+        pull/delete). Each tag is enriched from the recommended overlay when
+        it matches a curated family; otherwise it's advertised as a bare
+        ``ModelInfo(id=tag, name=tag)``. Per-model ``enabled`` filtering is
+        applied downstream by the core ``AIService`` (ADR-0019), so it's
+        intentionally not done here.
         """
         return [self._model_info_for_tag(tag) for tag in self._installed_tags]
 
@@ -448,9 +459,7 @@ class OllamaAI(AIBackend):
                 usage = data.get("usage")
                 if isinstance(usage, dict):
                     usage_input = int(usage.get("prompt_tokens", usage_input) or 0)
-                    usage_output = int(
-                        usage.get("completion_tokens", usage_output) or 0
-                    )
+                    usage_output = int(usage.get("completion_tokens", usage_output) or 0)
 
                 choices = data.get("choices") or []
                 if not choices:
@@ -639,9 +648,7 @@ class OllamaAI(AIBackend):
                         {
                             "role": "assistant",
                             "content": msg.content or None,
-                            "tool_calls": [
-                                self._encode_tool_call(tc) for tc in msg.tool_calls
-                            ],
+                            "tool_calls": [self._encode_tool_call(tc) for tc in msg.tool_calls],
                         }
                     )
                     for tr in msg.tool_results:

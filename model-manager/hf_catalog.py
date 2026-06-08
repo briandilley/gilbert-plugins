@@ -30,12 +30,23 @@ __all__ = [
     "CatalogModel",
     "Quant",
     "HF_API_BASE",
+    "HF_RESOLVE_BASE",
     "SORT_KEY_MAP",
     "search",
     "list_quants",
+    "fetch_context_window",
 ]
 
 HF_API_BASE = "https://huggingface.co/api"
+# Raw-file CDN base — ``<base>/<repo>/resolve/main/<path>`` serves a repo file
+# (e.g. ``config.json``) directly. Used best-effort for context-window seeding.
+HF_RESOLVE_BASE = "https://huggingface.co"
+
+# Keys a Hugging Face ``config.json`` uses for the model's max context length,
+# in preference order. ``max_position_embeddings`` is the modern Transformers
+# field; ``n_positions`` / ``n_ctx`` are older GPT-style names. First positive
+# integer wins.
+_CONTEXT_WINDOW_KEYS = ("max_position_embeddings", "n_positions", "n_ctx")
 
 # Map the UI's sort keys → the Hugging Face Hub API's ``sort`` field names.
 # ``size`` has no server-side equivalent (HF doesn't sort repos by file
@@ -220,6 +231,38 @@ def _parse_sibling(sib: object) -> Quant | None:
         quant_label=parse_quant_label(filename),
         size_bytes=_as_opt_int(size),
     )
+
+
+async def fetch_context_window(
+    model_id: str,
+    *,
+    client: httpx.AsyncClient | None = None,
+) -> int | None:
+    """Best-effort context window (max sequence length) for a repo, or ``None``.
+
+    Reads the repo's ``config.json`` from the HF raw-file CDN
+    (``/<repo>/resolve/main/config.json``) and returns the first positive
+    integer found under :data:`_CONTEXT_WINDOW_KEYS`
+    (``max_position_embeddings`` / ``n_positions`` / ``n_ctx``).
+
+    **Best-effort by design**: GGUF quant repos frequently have no
+    ``config.json`` at all (the metadata lives inside the .gguf header,
+    which we don't parse here), the field may be absent, or the CDN may be
+    unreachable. Any of those returns ``None`` — the caller seeds the
+    per-model ``context_window`` only when this is known and never fails the
+    pull over it. Reliability is therefore partial: present for many
+    Transformers-derived repos that ship a config.json, absent for the rest.
+    """
+    url = f"{HF_RESOLVE_BASE}/{model_id}/resolve/main/config.json"
+    data = await _get_json(url, {}, client)
+    if not isinstance(data, dict):
+        return None
+    for key in _CONTEXT_WINDOW_KEYS:
+        value = data.get(key)
+        ctx = _as_opt_int(value)
+        if ctx is not None and ctx > 0:
+            return ctx
+    return None
 
 
 async def _get_json(
