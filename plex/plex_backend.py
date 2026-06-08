@@ -340,7 +340,9 @@ class PlexBackend(MediaLibraryBackend):
     # ── Backend metadata / config ───────────────────────────────────
 
     @classmethod
-    def runtime_dependencies(cls) -> list[RuntimeDependency]:
+    def runtime_dependencies(
+        cls, config: dict[str, Any] | None = None
+    ) -> list[RuntimeDependency]:
         return []
 
     @classmethod

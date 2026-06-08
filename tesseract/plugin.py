@@ -22,7 +22,9 @@ class TesseractPlugin(Plugin):
             requires=[],
         )
 
-    def runtime_dependencies(self) -> list[RuntimeDependency]:
+    def runtime_dependencies(
+        self, config: dict | None = None
+    ) -> list[RuntimeDependency]:
         return [
             RuntimeDependency(
                 name="tesseract-ocr binary",

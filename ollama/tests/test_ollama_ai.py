@@ -2,6 +2,7 @@
 
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 from gilbert_plugin_ollama.ollama_ai import OllamaAI
 
@@ -174,3 +175,121 @@ async def test_generate_raises_when_not_initialized(backend: OllamaAI) -> None:
         await backend.generate(
             AIRequest(messages=[Message(role=MessageRole.USER, content="x")])
         )
+
+
+# --- Dynamic available_models() from /api/tags + overlay enrichment ---
+
+
+def test_no_enabled_models_config_param() -> None:
+    """The legacy ``enabled_models`` param is gone — per-model ``enabled``
+    is enforced by core AIService now (ADR-0019)."""
+    params = OllamaAI.backend_config_params()
+    assert all(p.key != "enabled_models" for p in params)
+
+
+def test_available_models_empty_before_refresh() -> None:
+    """Dynamic listing: nothing installed (cache empty) → no models."""
+    backend = OllamaAI()
+    assert backend.available_models() == []
+
+
+def test_available_models_reflects_installed_tags() -> None:
+    """A bare installed tag with no overlay match → ``id == name == tag``."""
+    backend = OllamaAI()
+    backend._installed_tags = ["some-obscure-model:7b"]
+    models = backend.available_models()
+    assert len(models) == 1
+    assert models[0].id == "some-obscure-model:7b"
+    assert models[0].name == "some-obscure-model:7b"
+
+
+def test_available_models_enriches_from_overlay_exact() -> None:
+    """An installed tag matching the recommended overlay borrows its
+    friendly name/description; the advertised id stays the real tag."""
+    backend = OllamaAI()
+    backend._installed_tags = ["llama3.3"]
+    models = backend.available_models()
+    assert len(models) == 1
+    assert models[0].id == "llama3.3"
+    assert models[0].name == "Llama 3.3 70B"
+    assert "Meta" in models[0].description
+
+
+def test_available_models_enriches_from_overlay_by_family() -> None:
+    """``qwen2.5-coder:32b`` borrows the ``qwen2.5-coder`` overlay name but
+    advertises the full installed tag as its id so chat round-trips it."""
+    backend = OllamaAI()
+    backend._installed_tags = ["qwen2.5-coder:32b"]
+    models = backend.available_models()
+    assert len(models) == 1
+    assert models[0].id == "qwen2.5-coder:32b"
+    assert models[0].name == "Qwen 2.5 Coder"
+
+
+async def test_refresh_installed_models_queries_api_tags(backend: OllamaAI) -> None:
+    """``refresh_installed_models`` parses ``/api/tags`` into the cache and
+    queries the daemon root (not the ``/v1`` chat path)."""
+    await backend.initialize({})  # initialize seeds via refresh — mock after
+    mock_resp = MagicMock()
+    mock_resp.raise_for_status.return_value = None
+    mock_resp.json.return_value = {
+        "models": [
+            {"name": "llama3.3:latest", "size": 42_000_000_000},
+            {"name": "mistral:7b"},
+        ]
+    }
+    assert backend._client is not None
+    backend._client.get = AsyncMock(return_value=mock_resp)  # type: ignore[method-assign]
+    await backend.refresh_installed_models()
+    assert backend._installed_tags == ["llama3.3:latest", "mistral:7b"]
+    # Hit the native /api/tags route at the daemon root.
+    called_url = backend._client.get.call_args[0][0]
+    assert called_url.endswith("/api/tags")
+    assert "/v1/" not in called_url
+    await backend.close()
+
+
+async def test_refresh_installed_models_survives_daemon_down(
+    backend: OllamaAI,
+) -> None:
+    """A daemon that's unreachable leaves the cache untouched, not crashing."""
+    await backend.initialize({})
+    backend._installed_tags = ["llama3.3"]
+    assert backend._client is not None
+    backend._client.get = AsyncMock(side_effect=httpx.ConnectError("down"))  # type: ignore[method-assign]
+    await backend.refresh_installed_models()
+    assert backend._installed_tags == ["llama3.3"]
+    await backend.close()
+
+
+# --- Per-model generation param consumption ---
+
+
+def test_request_temperature_and_max_tokens_override_globals() -> None:
+    """Resolved per-call values on the request override the backend globals."""
+    backend = OllamaAI()
+    backend._model = "llama3.3"
+    backend._max_tokens = 8192
+    backend._temperature = 0.7
+    body = backend._build_request_body(
+        AIRequest(
+            messages=[Message(role=MessageRole.USER, content="hi")],
+            temperature=0.2,
+            max_tokens=256,
+        )
+    )
+    assert body["temperature"] == 0.2
+    assert body["max_tokens"] == 256
+
+
+def test_request_falls_back_to_globals_when_none() -> None:
+    """``None`` on the request means 'use the backend default'."""
+    backend = OllamaAI()
+    backend._model = "llama3.3"
+    backend._max_tokens = 8192
+    backend._temperature = 0.7
+    body = backend._build_request_body(
+        AIRequest(messages=[Message(role=MessageRole.USER, content="hi")])
+    )
+    assert body["temperature"] == 0.7
+    assert body["max_tokens"] == 8192

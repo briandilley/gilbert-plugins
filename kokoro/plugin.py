@@ -22,7 +22,9 @@ class KokoroPlugin(Plugin):
             requires=[],
         )
 
-    def runtime_dependencies(self) -> list[RuntimeDependency]:
+    def runtime_dependencies(
+        self, config: dict | None = None
+    ) -> list[RuntimeDependency]:
         # Exercise the full stack (kokoro + torch + av) with a tiny synth.
         # The python -c string imports both libraries and runs one phoneme
         # through a KPipeline so a misconfigured torch/CUDA/libgomp install
