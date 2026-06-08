@@ -250,6 +250,42 @@ async def test_pull_emits_progress_events_keyed_by_ref() -> None:
 
 
 @pytest.mark.asyncio
+async def test_pull_emits_immediate_keepalive_before_runtime_streams() -> None:
+    """The handler pushes one keepalive event BEFORE awaiting the runtime, so a
+    slow first Ollama frame can't leave the frontend's pull RPC un-reset (and
+    thus spuriously timing out into "Retry") during the manifest-fetch gap.
+
+    Regression for the "pull immediately goes to Retry" report: a runtime that
+    never reports progress (e.g. a very slow manifest fetch) must still produce
+    at least one keepalive keyed to the request id.
+    """
+
+    class _SilentRuntime(_FakeRuntime):
+        """Pulls successfully but reports NO progress frames of its own."""
+
+        async def pull_model(self, ref: str, on_progress: Any = None) -> None:
+            self.pulled.append(ref)
+            # Deliberately never calls on_progress — mimics Ollama not yet
+            # streaming while it fetches the manifest.
+
+    svc = await _start(_SilentRuntime(), per_model=None)
+    conn = _Conn(0)
+    resp = await svc._ws_pull(conn, {"id": "p-imm", "ref": "hf.co/owner/Repo:Q4_K_M"})
+    assert resp["type"] == "model_manager.pull.result"
+
+    progress = [
+        f for f in conn.enqueued if f.get("event_type") == "model_manager.pull.progress"
+    ]
+    assert progress, "expected an immediate keepalive even with a silent runtime"
+    # The first keepalive is keyed to the originating request id (so the
+    # frontend resets THAT pending RPC's deadline) and shaped as a gilbert.event.
+    assert progress[0]["type"] == "gilbert.event"
+    assert progress[0]["data"]["ref"] == "p-imm"
+    assert progress[0]["data"]["status"] == "starting"
+    await svc.stop()
+
+
+@pytest.mark.asyncio
 async def test_pull_context_window_none_when_metadata_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -317,6 +353,20 @@ async def test_pull_rejects_unrecognized_quant_in_prebuilt_ref() -> None:
     assert resp["type"] == "gilbert.error"
     assert resp["code"] == 400
     assert runtime.pulled == []
+    await svc.stop()
+
+
+@pytest.mark.asyncio
+async def test_pull_accepts_bare_ollama_registry_tag() -> None:
+    """An Ollama-library pull is a bare registry tag (``llama3.3:70b``) whose
+    suffix is a SIZE, not a quantization scheme. The quant pre-flight must skip
+    it (no ``hf.co/`` prefix, no ``repo_id``) — otherwise every Ollama pull would
+    be wrongly rejected as an invalid quant."""
+    runtime = _FakeRuntime()
+    svc = await _start(runtime, _FakePerModelConfig())
+    resp = await svc._ws_pull(_Conn(0), {"id": "p-oll", "ref": "llama3.3:70b"})
+    assert resp["type"] == "model_manager.pull.result"
+    assert runtime.pulled == ["llama3.3:70b"]
     await svc.stop()
 
 

@@ -60,18 +60,21 @@ import {
   Trash2Icon,
   Loader2Icon,
   CheckCircle2Icon,
+  LayersIcon,
 } from "lucide-react";
 import { useModelManagerApi } from "./api";
 import type {
-  CatalogModel,
-  CatalogQuant,
-  CatalogQuantsResponse,
-  CatalogSearchResponse,
   CatalogSort,
   FitVerdict,
   HostResourcesResponse,
   InstalledModel,
   InstalledModelsResponse,
+  SourceDescriptor,
+  SourceModel,
+  SourcesListResponse,
+  SourceSearchResponse,
+  SourceVariant,
+  SourceVariantsResponse,
 } from "./types";
 
 /** Query key for the installed-models list — shared so pull/delete mutations
@@ -354,9 +357,115 @@ function InstalledRow({ model }: { model: InstalledModel }) {
   );
 }
 
-// --- Browse section -------------------------------------------------------
+// --- Browse section (multi-source, S10) -----------------------------------
 
+/** The Browse section: pick a SOURCE first, then that source's own search /
+ *  filter affordances appear, then find a model and pull a variant. The source
+ *  list drives everything, so adding a source is purely additive (no edits
+ *  here). */
 function BrowseSection() {
+  const api = useModelManagerApi();
+  const { connected } = useWebSocket();
+
+  const { data: sourcesData, isLoading: sourcesLoading } =
+    useQuery<SourcesListResponse>({
+      queryKey: ["model_manager", "sources"],
+      queryFn: api.listSources,
+      enabled: connected,
+      staleTime: 5 * 60_000,
+    });
+
+  const sources = sourcesData?.sources ?? [];
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+
+  // Default to the first source once they load (Hugging Face today).
+  useEffect(() => {
+    if (selectedId === null && sources.length > 0) setSelectedId(sources[0].id);
+  }, [selectedId, sources]);
+
+  const selected = sources.find((s) => s.id === selectedId) ?? null;
+
+  return (
+    <section>
+      <h2 className="text-sm font-semibold text-foreground/80 mb-2">
+        Browse &amp; install
+      </h2>
+
+      <HostSummary hostResources={api.hostResources} />
+
+      {sourcesLoading ? (
+        <LoadingPlaceholder label="Loading sources…" />
+      ) : sources.length === 0 ? (
+        <LoadingPlaceholder label="No model sources available." />
+      ) : (
+        <>
+          <SourceSelector
+            sources={sources}
+            selectedId={selectedId}
+            onSelect={setSelectedId}
+          />
+          {selected && <SourceBrowser key={selected.id} source={selected} />}
+        </>
+      )}
+    </section>
+  );
+}
+
+/** Step 1 — the source selector. A row of cards; the active one is highlighted.
+ *  Curated sources carry a small badge so it's clear they're a hand-picked list
+ *  rather than a full search. */
+function SourceSelector({
+  sources,
+  selectedId,
+  onSelect,
+}: {
+  sources: SourceDescriptor[];
+  selectedId: string | null;
+  onSelect: (id: string) => void;
+}) {
+  return (
+    <div
+      className="mb-4 grid gap-2 sm:grid-cols-2"
+      role="radiogroup"
+      aria-label="Model source"
+    >
+      {sources.map((s) => {
+        const active = s.id === selectedId;
+        return (
+          <button
+            key={s.id}
+            type="button"
+            role="radio"
+            aria-checked={active}
+            onClick={() => onSelect(s.id)}
+            className={`flex flex-col gap-1 rounded-lg border p-3 text-left transition-colors ${
+              active
+                ? "border-primary bg-primary/5 ring-1 ring-primary/30"
+                : "border-border bg-card hover:bg-muted/50"
+            }`}
+          >
+            <span className="flex items-center gap-2">
+              <LayersIcon
+                className={`h-4 w-4 ${active ? "text-primary" : "text-muted-foreground"}`}
+              />
+              <span className="text-sm font-medium">{s.label}</span>
+              {s.kind === "curated" && (
+                <Badge variant="secondary" className="ml-auto text-[10px]">
+                  Curated list
+                </Badge>
+              )}
+            </span>
+            <span className="text-xs text-muted-foreground">{s.description}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/** Step 2/3 — the per-source browser: search/filter affordances driven by the
+ *  source descriptor, then the result list with per-variant fit + pull. */
+function SourceBrowser({ source }: { source: SourceDescriptor }) {
   const api = useModelManagerApi();
   const { connected } = useWebSocket();
 
@@ -377,35 +486,39 @@ function BrowseSection() {
     });
   }, []);
 
-  // Best fit verdict per model, reported up by each CatalogRow once its
-  // quants load. The "Compatible" filter reads this to hide models whose best
-  // loaded quant won't fit. Honest caveat: a model's fit is only known after
-  // its row has been expanded (quants are fetched lazily), so list-level
-  // filtering can only act on already-loaded models — never-expanded models
-  // stay visible. Per-quant filtering inside an expanded row is exact.
+  // Whether sort applies for this source (HF yes, curated Ollama no). A curated
+  // source ignores it server-side anyway, but hiding the control is clearer.
+  const effectiveSort = source.supports_sort ? sort : "downloads";
+
+  // Best fit verdict per model, reported up by each ModelRow once its variants
+  // load. The "Compatible" filter reads this to hide models whose best loaded
+  // variant won't fit. Honest caveat: a model's fit is only known after its row
+  // has been expanded (variants are fetched lazily), so list-level filtering
+  // only acts on already-loaded models. Per-variant filtering inside a row is
+  // exact.
   const [modelFit, setModelFit] = useState<Record<string, FitVerdict>>({});
   const reportFit = useCallback((modelId: string, fit: FitVerdict) => {
     setModelFit((prev) => (prev[modelId] === fit ? prev : { ...prev, [modelId]: fit }));
   }, []);
 
-  const { data, isFetching, isError } = useQuery<CatalogSearchResponse>({
-    // recommendedOnly is part of the key so the server-sourced overlay and the
-    // generic results are cached separately.
-    queryKey: ["model_manager", "catalog", submittedQuery, sort, recommendedOnly],
-    queryFn: () => api.searchCatalog(submittedQuery, sort, 25, recommendedOnly),
+  const { data, isFetching, isError } = useQuery<SourceSearchResponse>({
+    queryKey: [
+      "model_manager",
+      "source",
+      source.id,
+      submittedQuery,
+      effectiveSort,
+      recommendedOnly,
+    ],
+    queryFn: () =>
+      api.searchSource(source.id, submittedQuery, effectiveSort, 25, recommendedOnly),
     enabled: connected,
     staleTime: 60_000,
   });
 
-  const all: CatalogModel[] = data?.models ?? [];
+  const all: SourceModel[] = data?.models ?? [];
   const models = all.filter((m) => {
-    // Compatible filter: a FILTER, not a sort weight. Hide a model only once
-    // we *know* its best loaded quant won't fit; unknown / not-yet-loaded
-    // models stay visible so the user can still expand them.
     if (compatibleOnly && modelFit[m.id] === "wont-fit") return false;
-    // Size-class filter (client-side over params_b). Empty set ⇒ show all;
-    // otherwise the model's bucket must be one of the selected ones. A model
-    // with unknown params has no bucket, so it's hidden once any bucket is on.
     if (sizeClasses.size > 0) {
       const sc = sizeClassOf(m.params_b);
       if (sc === null || !sizeClasses.has(sc)) return false;
@@ -414,13 +527,7 @@ function BrowseSection() {
   });
 
   return (
-    <section>
-      <h2 className="text-sm font-semibold text-foreground/80 mb-2">
-        Browse Hugging Face
-      </h2>
-
-      <HostSummary hostResources={api.hostResources} />
-
+    <div>
       <div className="flex flex-wrap items-center gap-2 mb-3">
         <form
           className="relative flex-1 min-w-[12rem]"
@@ -433,24 +540,26 @@ function BrowseSection() {
           <Input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search GGUF models (e.g. qwen, llama)…"
+            placeholder={source.search_placeholder}
             className="pl-8"
-            aria-label="Search Hugging Face GGUF models"
+            aria-label={`Search ${source.label}`}
           />
         </form>
 
-        <Select value={sort} onValueChange={(v) => setSort(v as CatalogSort)}>
-          <SelectTrigger className="w-[9.5rem]" aria-label="Sort by">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            {SORT_OPTIONS.map((opt) => (
-              <SelectItem key={opt.value} value={opt.value}>
-                {opt.label}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
+        {source.supports_sort && (
+          <Select value={sort} onValueChange={(v) => setSort(v as CatalogSort)}>
+            <SelectTrigger className="w-[9.5rem]" aria-label="Sort by">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {SORT_OPTIONS.map((opt) => (
+                <SelectItem key={opt.value} value={opt.value}>
+                  {opt.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        )}
 
         <div className="flex items-center gap-2">
           <Switch
@@ -461,29 +570,30 @@ function BrowseSection() {
           <Label
             htmlFor="compatible-only"
             className="text-xs text-muted-foreground whitespace-nowrap"
-            title="Hide quantizations (and models) that won't run on this host."
+            title={`Hide ${source.variant_noun}s (and models) that won't run on this host.`}
           >
             Compatible
           </Label>
         </div>
 
-        <div className="flex items-center gap-2">
-          <Switch
-            id="recommended-only"
-            checked={recommendedOnly}
-            onCheckedChange={setRecommendedOnly}
-          />
-          <Label
-            htmlFor="recommended-only"
-            className="text-xs text-muted-foreground whitespace-nowrap"
-          >
-            Recommended only
-          </Label>
-        </div>
+        {source.supports_recommended_only && (
+          <div className="flex items-center gap-2">
+            <Switch
+              id="recommended-only"
+              checked={recommendedOnly}
+              onCheckedChange={setRecommendedOnly}
+            />
+            <Label
+              htmlFor="recommended-only"
+              className="text-xs text-muted-foreground whitespace-nowrap"
+            >
+              Recommended only
+            </Label>
+          </div>
+        )}
       </div>
 
-      {/* Size-class quick filter (client-side over params_b). Toggleable
-          buckets; none selected ⇒ show all. Composes with Compatible (AND). */}
+      {/* Size-class quick filter (client-side over params_b). */}
       <div className="mb-3 flex flex-wrap items-center gap-2">
         <span className="text-xs text-muted-foreground">Size:</span>
         {SIZE_CLASSES.map((sc) => {
@@ -505,10 +615,16 @@ function BrowseSection() {
             </button>
           );
         })}
-        {isDerivedSort(sort) && (
+        {source.supports_sort && isDerivedSort(sort) && (
           <span className="ml-auto text-[11px] text-muted-foreground">
             “{sort === "powerful" ? "Most powerful" : "Smallest"}” re-ranks the
             top matches by parameter count (HF has no params sort).
+          </span>
+        )}
+        {source.kind === "curated" && (
+          <span className="ml-auto text-[11px] text-muted-foreground">
+            Curated list — {source.label} has no public search API, so this is a
+            hand-picked set, not a full catalog.
           </span>
         )}
       </div>
@@ -516,23 +632,26 @@ function BrowseSection() {
       {isError ? (
         <CatalogErrorPlaceholder />
       ) : isFetching && all.length === 0 ? (
-        <LoadingPlaceholder label="Searching Hugging Face…" />
+        <LoadingPlaceholder label={`Searching ${source.label}…`} />
       ) : models.length === 0 ? (
-        <CatalogEmptyPlaceholder recommendedOnly={recommendedOnly} />
+        <CatalogEmptyPlaceholder
+          recommendedOnly={recommendedOnly && source.supports_recommended_only}
+        />
       ) : (
         <ul className="divide-y rounded-lg border bg-card">
           {models.map((model) => (
-            <CatalogRow
+            <ModelRow
               key={model.id}
+              source={source}
               model={model}
-              listQuants={api.listQuants}
+              listVariants={api.listSourceVariants}
               compatibleOnly={compatibleOnly}
               onFitResolved={reportFit}
             />
           ))}
         </ul>
       )}
-    </section>
+    </div>
   );
 }
 
@@ -603,41 +722,50 @@ function HostSummary({
   );
 }
 
-function CatalogRow({
+/** One model row in a source's result list. Expands to the model's pullable
+ *  variants (HF quants / Ollama size tags), each with a fit verdict and a pull
+ *  action. Source-neutral: the variant noun + popularity columns adapt to the
+ *  source descriptor. */
+function ModelRow({
+  source,
   model,
-  listQuants,
+  listVariants,
   compatibleOnly,
   onFitResolved,
 }: {
-  model: CatalogModel;
-  listQuants: (modelId: string) => Promise<CatalogQuantsResponse>;
+  source: SourceDescriptor;
+  model: SourceModel;
+  listVariants: (
+    source: string,
+    modelId: string,
+  ) => Promise<SourceVariantsResponse>;
   compatibleOnly: boolean;
   onFitResolved: (modelId: string, fit: FitVerdict) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
 
-  const { data, isFetching, isError } = useQuery<CatalogQuantsResponse>({
-    queryKey: ["model_manager", "catalog", "quants", model.id],
-    queryFn: () => listQuants(model.id),
+  const { data, isFetching, isError } = useQuery<SourceVariantsResponse>({
+    queryKey: ["model_manager", "source", source.id, "variants", model.id],
+    queryFn: () => listVariants(source.id, model.id),
     enabled: expanded,
     staleTime: 5 * 60_000,
   });
 
-  const quants: CatalogQuant[] = data?.quants ?? [];
+  const variants: SourceVariant[] = data?.variants ?? [];
 
-  // Report this model's best-case fit up to BrowseSection so the Compatible
-  // filter can act on it. Runs once quants are loaded for the row.
+  // Report this model's best-case fit up so the Compatible filter can act on it.
   useEffect(() => {
-    if (data) onFitResolved(model.id, bestFit(quants.map((q) => q.fit)));
+    if (data) onFitResolved(model.id, bestFit(variants.map((v) => v.fit)));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [data]);
 
-  // When Compatible is on, drop the quants that won't fit — but keep unknown
-  // ones (we can't honestly rule them out). Filtering happens inside the
-  // expanded row; list-level filtering is in BrowseSection.
-  const shownQuants = compatibleOnly
-    ? quants.filter((q) => q.fit !== "wont-fit")
-    : quants;
+  // When Compatible is on, drop the variants that won't fit — keep unknowns.
+  const shownVariants = compatibleOnly
+    ? variants.filter((v) => v.fit !== "wont-fit")
+    : variants;
+
+  // Popularity columns only make sense for a source with real signals (HF).
+  const hasPopularity = source.kind === "search";
 
   return (
     <li className="px-4 py-3">
@@ -653,71 +781,81 @@ function CatalogRow({
           ) : (
             <ChevronRightIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
           )}
-          <span className="font-mono text-sm truncate">{model.id}</span>
+          <span className="font-mono text-sm truncate">
+            {model.name ?? model.id}
+          </span>
           <span
             className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground tabular-nums"
             title={
               model.params_b !== null
-                ? `≈${model.params_b}B parameters (parsed from the repo id)`
-                : "Parameter count unknown — no recognizable token in the repo id."
+                ? `≈${model.params_b}B parameters`
+                : "Parameter count unknown."
             }
           >
             {paramChip(model.params_b)}
           </span>
-          {model.recommended && (
+          {model.recommended && source.supports_recommended_only && (
             <Badge variant="success" className="shrink-0 gap-1">
               <StarIcon className="h-3 w-3" />
               Recommended
             </Badge>
           )}
         </div>
-        <div className="flex shrink-0 items-center gap-3 text-xs text-muted-foreground tabular-nums">
-          <span className="flex items-center gap-1" title="Downloads">
-            <DownloadIcon className="h-3 w-3" />
-            {compactCount(model.downloads)}
-          </span>
-          <span className="flex items-center gap-1" title="Likes">
-            <HeartIcon className="h-3 w-3" />
-            {compactCount(model.likes)}
-          </span>
-        </div>
+        {hasPopularity && (
+          <div className="flex shrink-0 items-center gap-3 text-xs text-muted-foreground tabular-nums">
+            <span className="flex items-center gap-1" title="Downloads">
+              <DownloadIcon className="h-3 w-3" />
+              {compactCount(model.downloads)}
+            </span>
+            <span className="flex items-center gap-1" title="Likes">
+              <HeartIcon className="h-3 w-3" />
+              {compactCount(model.likes)}
+            </span>
+          </div>
+        )}
       </button>
 
       {expanded && (
         <div className="mt-3 ml-6 rounded-md border bg-muted/30 p-2">
           {isError ? (
             <p className="px-2 py-1 text-xs text-rose-600">
-              Couldn&apos;t load quantizations for this model.
+              Couldn&apos;t load {source.variant_noun}s for this model.
             </p>
           ) : isFetching ? (
             <p className="px-2 py-1 text-xs text-muted-foreground">
-              Loading quantizations…
+              Loading {source.variant_noun}s…
             </p>
-          ) : quants.length === 0 ? (
+          ) : variants.length === 0 ? (
             <p className="px-2 py-1 text-xs text-muted-foreground">
-              No GGUF files found in this repo.
+              No {source.variant_noun}s found for this model.
             </p>
-          ) : shownQuants.length === 0 ? (
+          ) : shownVariants.length === 0 ? (
             <p className="px-2 py-1 text-xs text-muted-foreground">
-              No compatible quantizations — turn off “Compatible” to see all{" "}
-              {quants.length}.
+              No compatible {source.variant_noun}s — turn off “Compatible” to see
+              all {variants.length}.
             </p>
           ) : (
             <ul className="divide-y divide-border/60">
-              {shownQuants.map((q) => (
+              {shownVariants.map((v) => (
                 <li
-                  key={q.filename}
+                  key={v.variant_id}
                   className="flex items-center justify-between gap-3 px-2 py-1.5"
                 >
-                  <span className="font-mono text-xs truncate">
-                    {q.quant_label ?? q.filename}
-                  </span>
+                  <span className="font-mono text-xs truncate">{v.label}</span>
                   <div className="flex shrink-0 items-center gap-2">
-                    <FitBadge fit={q.fit} />
-                    <span className="text-xs text-muted-foreground tabular-nums">
-                      {humanSize(q.size_bytes)}
+                    <FitBadge fit={v.fit} />
+                    <span
+                      className="text-xs text-muted-foreground tabular-nums"
+                      title={
+                        v.size_estimated
+                          ? "Estimated size (Ollama serves no per-tag size); fit is approximate."
+                          : undefined
+                      }
+                    >
+                      {v.size_estimated && v.size_bytes !== null ? "~" : ""}
+                      {humanSize(v.size_bytes)}
                     </span>
-                    <PullButton repoId={model.id} quant={q} />
+                    <PullButton variant={v} repoId={model.id} source={source} />
                   </div>
                 </li>
               ))}
@@ -729,51 +867,49 @@ function CatalogRow({
   );
 }
 
-/** Per-quant Pull button.
+/** Per-variant Pull button (source-neutral).
  *
- * Pulls ``hf.co/<repoId>:<quant_label>`` into Ollama. Progress is coarse by
- * design (gilbert#40): the RPC is awaited to completion, so this shows a
- * "Pulling…" spinner while in flight and a brief "Installed" tick on success —
- * a byte-level progress bar is intentionally out of scope (faking one would be
- * dishonest). On success the installed-models query is invalidated so the
- * Installed section refetches and the model appears there (and in chat).
+ * Pulls the variant's exact ``pull_ref`` into Ollama (``hf.co/<repo>:<quant>``
+ * for HF, a bare registry tag like ``llama3.3:70b`` for Ollama). Progress is
+ * coarse by design (gilbert#40): the RPC is awaited to completion behind a
+ * 10-minute keepalive backstop, so this shows a "Pulling…" spinner while in
+ * flight and an "Installed" tick on success. On success the installed-models
+ * query is invalidated so the Installed section refetches.
  *
- * Ollama's ``hf.co/<repo>:<quant>`` ref needs a quant label, so the button is
- * disabled for a gguf whose filename has no recognizable quant marker — and
- * also for a quant whose tag Ollama doesn't recognize (``pullable === false``,
- * e.g. a community ``Q8_K_P``), which would otherwise 400. */
-function PullButton({ repoId, quant }: { repoId: string; quant: CatalogQuant }) {
+ * Disabled for a non-pullable variant (no buildable ref, or a quant tag Ollama
+ * doesn't recognize), which would otherwise 400. */
+function PullButton({
+  variant,
+  repoId,
+  source,
+}: {
+  variant: SourceVariant;
+  repoId: string;
+  source: SourceDescriptor;
+}) {
   const api = useModelManagerApi();
   const queryClient = useQueryClient();
 
   const pull = useMutation({
-    mutationFn: () => api.pull(repoId, quant.quant_label as string),
+    // Only HF benefits from server-side per-model-config seeding from the repo
+    // id; for Ollama the installed tag carries no HF metadata, so omit repoId.
+    mutationFn: () =>
+      api.pullRef(
+        variant.pull_ref,
+        source.id === "huggingface" ? repoId : undefined,
+      ),
     onSuccess: () =>
       queryClient.invalidateQueries({ queryKey: INSTALLED_QUERY_KEY }),
   });
 
-  if (!quant.quant_label) {
+  if (!variant.pullable || !variant.pull_ref) {
     return (
       <Button
         variant="outline"
         size="sm"
         className="h-6 px-2 text-[11px]"
         disabled
-        title="No quantization label — can't build an Ollama pull reference."
-      >
-        <DownloadCloudIcon className="h-3 w-3" />
-      </Button>
-    );
-  }
-
-  if (!quant.pullable) {
-    return (
-      <Button
-        variant="outline"
-        size="sm"
-        className="h-6 px-2 text-[11px]"
-        disabled
-        title="Ollama doesn't support this quantization tag — try a standard quant (Q4_K_M, Q8_0…)."
+        title={`This ${source.variant_noun} can't be pulled into Ollama — try a standard one.`}
       >
         <DownloadCloudIcon className="h-3 w-3" />
       </Button>
@@ -792,36 +928,52 @@ function PullButton({ repoId, quant }: { repoId: string; quant: CatalogQuant }) 
     );
   }
 
+  // Surface the real failure message (from the server's gilbert.error) inline,
+  // not just a bare "Retry" — a multi-GB pull that genuinely fails (bad ref,
+  // not-found, daemon down) deserves an honest reason next to the button.
+  const errorMessage =
+    pull.isError && pull.error instanceof Error ? pull.error.message : null;
+
   return (
-    <Button
-      variant="outline"
-      size="sm"
-      className="h-6 gap-1 px-2 text-[11px]"
-      onClick={() => pull.mutate()}
-      disabled={pull.isPending}
-      title={
-        pull.isError
-          ? "Pull failed — click to retry."
-          : `Pull ${quant.quant_label} into Ollama`
-      }
-    >
-      {pull.isPending ? (
-        <>
-          <Loader2Icon className="h-3 w-3 animate-spin" />
-          Pulling…
-        </>
-      ) : pull.isError ? (
-        <>
-          <DownloadCloudIcon className="h-3 w-3 text-rose-600" />
-          Retry
-        </>
-      ) : (
-        <>
-          <DownloadCloudIcon className="h-3 w-3" />
-          Pull
-        </>
+    <div className="flex flex-col items-end gap-0.5">
+      <Button
+        variant="outline"
+        size="sm"
+        className="h-6 gap-1 px-2 text-[11px]"
+        onClick={() => pull.mutate()}
+        disabled={pull.isPending}
+        title={
+          errorMessage
+            ? `${errorMessage} — click to retry.`
+            : `Pull ${variant.label} into Ollama`
+        }
+      >
+        {pull.isPending ? (
+          <>
+            <Loader2Icon className="h-3 w-3 animate-spin" />
+            Pulling…
+          </>
+        ) : pull.isError ? (
+          <>
+            <DownloadCloudIcon className="h-3 w-3 text-rose-600" />
+            Retry
+          </>
+        ) : (
+          <>
+            <DownloadCloudIcon className="h-3 w-3" />
+            Pull
+          </>
+        )}
+      </Button>
+      {errorMessage && (
+        <span
+          className="max-w-[14rem] truncate text-right text-[10px] text-rose-600"
+          title={errorMessage}
+        >
+          {errorMessage}
+        </span>
       )}
-    </Button>
+    </div>
   );
 }
 
