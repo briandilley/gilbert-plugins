@@ -244,6 +244,12 @@ class OllamaAI(AIBackend):
         self._model: str = _DEFAULT_MODEL
         self._max_tokens: int = 8192
         self._temperature: float = 0.7
+        # Per-model ``/api/show`` cache: ``{model: {"context_length": int|None,
+        # "thinking": bool}}``. Populated lazily before a request (one show
+        # call per model, then reused) so ``_build_request_body`` can clamp
+        # ``num_ctx`` to the model's real max and only set ``think`` on models
+        # that actually support it.
+        self._model_info: dict[str, dict[str, Any]] = {}
 
     @property
     def _installed_tags(self) -> list[str]:
@@ -352,6 +358,53 @@ class OllamaAI(AIBackend):
         """Absolute URL for ``/api/tags`` at the Ollama daemon root."""
         return f"{self._root_url()}/api/tags"
 
+    def _show_url(self) -> str:
+        """Absolute URL for the native ``/api/show`` endpoint."""
+        return f"{self._root_url()}/api/show"
+
+    async def _ensure_model_info(self, model: str) -> dict[str, Any]:
+        """Resolve + cache a model's ``context_length`` and thinking support.
+
+        Queries ``POST /api/show`` once per model (then reuses the cache). The
+        max context length lets us clamp ``num_ctx`` to what the model actually
+        supports (a wildly oversized value makes Ollama allocate an impossible
+        KV cache and the request hangs); ``capabilities`` tells us whether the
+        model supports ``think`` so we only send it when it won't 400.
+
+        Best-effort: a failed lookup caches an empty record so we don't retry
+        every request, and the request proceeds without clamping / thinking.
+        """
+        cached = self._model_info.get(model)
+        if cached is not None:
+            return cached
+        info: dict[str, Any] = {"context_length": None, "thinking": False}
+        if self._client is not None:
+            try:
+                resp = await self._client.post(self._show_url(), json={"name": model})
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as exc:
+                logger.debug("Ollama /api/show failed for %s: %s", model, exc)
+                data = None
+            if isinstance(data, dict):
+                model_info = data.get("model_info")
+                if isinstance(model_info, dict):
+                    ctx = next(
+                        (
+                            v
+                            for k, v in model_info.items()
+                            if k.endswith(".context_length") and isinstance(v, (int, float))
+                        ),
+                        None,
+                    )
+                    if ctx is not None:
+                        info["context_length"] = int(ctx)
+                caps = data.get("capabilities")
+                if isinstance(caps, list) and "thinking" in caps:
+                    info["thinking"] = True
+        self._model_info[model] = info
+        return info
+
     def available_models(self) -> list[ModelInfo]:
         """Advertise one ``ModelInfo`` per **installed** Ollama tag.
 
@@ -392,17 +445,24 @@ class OllamaAI(AIBackend):
         if self._client is None:
             raise RuntimeError("OllamaAI not initialized")
 
+        await self._ensure_model_info(request.model or self._model)
         body = self._build_request_body(request)
         body["stream"] = False
 
         ai_logger.debug(
-            "Ollama request: model=%s messages=%d num_ctx=%s",
+            "Ollama request: model=%s messages=%d num_ctx=%s think=%s",
             body["model"],
             len(body["messages"]),
             body.get("options", {}).get("num_ctx"),
+            body.get("think", False),
         )
 
-        resp = await self._client.post(self._chat_url(), json=body)
+        try:
+            resp = await self._client.post(self._chat_url(), json=body)
+        except httpx.TimeoutException as exc:
+            raise self._timeout_error(body, exc) from exc
+        except httpx.TransportError as exc:
+            raise AIBackendError(f"Ollama request failed: {exc}", status=502) from exc
         if resp.is_error:
             raise self._error_from_response(resp.status_code, resp, body)
         data = resp.json()
@@ -434,83 +494,101 @@ class OllamaAI(AIBackend):
         if self._client is None:
             raise RuntimeError("OllamaAI not initialized")
 
+        await self._ensure_model_info(request.model or self._model)
         body = self._build_request_body(request)
         body["stream"] = True
 
         ai_logger.debug(
-            "Ollama stream request: model=%s messages=%d num_ctx=%s",
+            "Ollama stream request: model=%s messages=%d num_ctx=%s think=%s",
             body["model"],
             len(body["messages"]),
             body.get("options", {}).get("num_ctx"),
+            body.get("think", False),
         )
 
         text_parts: list[str] = []
+        reasoning_parts: list[str] = []
         tool_calls: list[ToolCall] = []
         done_reason = "stop"
         usage_input = 0
         usage_output = 0
         model_id = str(body["model"])
 
-        async with self._client.stream(
-            "POST",
-            self._chat_url(),
-            json=body,
-        ) as resp:
-            if resp.is_error:
-                err_bytes = await resp.aread()
-                raise self._error_from_stream_body(
-                    resp.status_code,
-                    err_bytes,
-                )
+        try:
+            async with self._client.stream(
+                "POST",
+                self._chat_url(),
+                json=body,
+            ) as resp:
+                if resp.is_error:
+                    err_bytes = await resp.aread()
+                    raise self._error_from_stream_body(
+                        resp.status_code,
+                        err_bytes,
+                    )
 
-            async for line in resp.aiter_lines():
-                if not line.strip():
-                    continue
-                try:
-                    data = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(data, dict):
-                    continue
+                async for line in resp.aiter_lines():
+                    if not line.strip():
+                        continue
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(data, dict):
+                        continue
 
-                model_id = str(data.get("model") or model_id)
+                    model_id = str(data.get("model") or model_id)
 
-                message = data.get("message")
-                if isinstance(message, dict):
-                    content = message.get("content")
-                    if isinstance(content, str) and content:
-                        text_parts.append(content)
-                        yield StreamEvent(
-                            type=StreamEventType.TEXT_DELTA,
-                            text=content,
-                        )
-                    raw_tool_calls = message.get("tool_calls")
-                    if isinstance(raw_tool_calls, list):
-                        for tc in self._parse_tool_calls(
-                            raw_tool_calls, start=len(tool_calls)
-                        ):
-                            tool_calls.append(tc)
+                    message = data.get("message")
+                    if isinstance(message, dict):
+                        # Reasoning (``think`` models) streams in a separate
+                        # ``thinking`` field, distinct from the answer ``content``.
+                        thinking = message.get("thinking")
+                        if isinstance(thinking, str) and thinking:
+                            reasoning_parts.append(thinking)
                             yield StreamEvent(
-                                type=StreamEventType.TOOL_CALL_START,
-                                tool_call_id=tc.tool_call_id,
-                                tool_name=tc.tool_name,
+                                type=StreamEventType.REASONING_DELTA,
+                                text=thinking,
                             )
+                        content = message.get("content")
+                        if isinstance(content, str) and content:
+                            text_parts.append(content)
                             yield StreamEvent(
-                                type=StreamEventType.TOOL_CALL_END,
-                                tool_call_id=tc.tool_call_id,
-                                tool_name=tc.tool_name,
+                                type=StreamEventType.TEXT_DELTA,
+                                text=content,
                             )
+                        raw_tool_calls = message.get("tool_calls")
+                        if isinstance(raw_tool_calls, list):
+                            for tc in self._parse_tool_calls(
+                                raw_tool_calls, start=len(tool_calls)
+                            ):
+                                tool_calls.append(tc)
+                                yield StreamEvent(
+                                    type=StreamEventType.TOOL_CALL_START,
+                                    tool_call_id=tc.tool_call_id,
+                                    tool_name=tc.tool_name,
+                                )
+                                yield StreamEvent(
+                                    type=StreamEventType.TOOL_CALL_END,
+                                    tool_call_id=tc.tool_call_id,
+                                    tool_name=tc.tool_name,
+                                )
 
-                if data.get("done"):
-                    done_reason = str(data.get("done_reason") or done_reason)
-                    usage_input = int(data.get("prompt_eval_count", usage_input) or 0)
-                    usage_output = int(data.get("eval_count", usage_output) or 0)
+                    if data.get("done"):
+                        done_reason = str(data.get("done_reason") or done_reason)
+                        usage_input = int(data.get("prompt_eval_count", usage_input) or 0)
+                        usage_output = int(data.get("eval_count", usage_output) or 0)
+        except httpx.TimeoutException as exc:
+            raise self._timeout_error(body, exc) from exc
+        except httpx.TransportError as exc:
+            raise AIBackendError(f"Ollama request failed: {exc}", status=502) from exc
 
         stop_reason = self._stop_reason(done_reason, bool(tool_calls))
 
         final_message = Message(
             role=MessageRole.ASSISTANT,
             content="".join(text_parts),
+            reasoning="".join(reasoning_parts),
             tool_calls=tool_calls,
         )
         usage_obj = TokenUsage(
@@ -598,13 +676,25 @@ class OllamaAI(AIBackend):
             "num_predict": max_tokens,
         }
         if request.context_window is not None:
-            options["num_ctx"] = request.context_window
+            # Clamp to the model's real max (from /api/show, when known): a
+            # value beyond it makes Ollama try to allocate an impossible KV
+            # cache and the request hangs instead of returning an error.
+            model_max = self._model_info.get(model, {}).get("context_length")
+            num_ctx = request.context_window
+            if isinstance(model_max, int) and model_max > 0:
+                num_ctx = min(num_ctx, model_max)
+            options["num_ctx"] = num_ctx
 
         body: dict[str, Any] = {
             "model": model,
             "messages": self._build_messages(request.messages, request.system_prompt),
             "options": options,
         }
+
+        # Ask for reasoning only on models that advertise it (per /api/show);
+        # sending ``think`` to a non-thinking model 400s.
+        if self._model_info.get(model, {}).get("thinking"):
+            body["think"] = True
 
         if request.tools:
             body["tools"] = self._build_tools(request.tools)
@@ -762,6 +852,32 @@ class OllamaAI(AIBackend):
 
     # --- Error & Response Parsing ---
 
+    def _timeout_error(self, body: dict[str, Any], exc: Exception) -> AIBackendError:
+        """A clear ``AIBackendError`` for an httpx timeout, not a bare error.
+
+        The usual culprit is an oversized ``num_ctx`` — Ollama hangs trying to
+        allocate a KV cache the host can't fit — so name it in the message
+        instead of letting the chat surface an opaque "Unknown error".
+        """
+        num_ctx = body.get("options", {}).get("num_ctx")
+        ai_logger.warning(
+            "Ollama request timed out (model=%s, num_ctx=%s): %s",
+            body.get("model"),
+            num_ctx,
+            exc,
+        )
+        hint = ""
+        if num_ctx:
+            hint = (
+                f" The request used num_ctx={num_ctx}; if that's large the host "
+                "may not be able to allocate it — lower the model's context window."
+            )
+        return AIBackendError(
+            "Ollama request timed out — the model may still be loading, or its "
+            f"context window is too large for available memory.{hint}",
+            status=504,
+        )
+
     def _error_from_response(
         self,
         status: int,
@@ -829,6 +945,8 @@ class OllamaAI(AIBackend):
             message = {}
         raw_content = message.get("content")
         content_text = raw_content if isinstance(raw_content, str) else ""
+        raw_thinking = message.get("thinking")
+        reasoning_text = raw_thinking if isinstance(raw_thinking, str) else ""
 
         raw_tool_calls = message.get("tool_calls")
         tool_calls = (
@@ -847,6 +965,7 @@ class OllamaAI(AIBackend):
         assistant_msg = Message(
             role=MessageRole.ASSISTANT,
             content=content_text,
+            reasoning=reasoning_text,
             tool_calls=tool_calls,
         )
 

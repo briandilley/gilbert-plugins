@@ -491,6 +491,116 @@ async def test_generate_stream_parses_native_ndjson() -> None:
     assert complete.response.usage.output_tokens == 3
 
 
+async def test_ensure_model_info_parses_show() -> None:
+    """``/api/show`` populates the model's context_length + thinking support."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/show"
+        return httpx.Response(
+            200,
+            json={
+                "capabilities": ["completion", "thinking"],
+                "model_info": {"qwen3.context_length": 262144},
+            },
+        )
+
+    backend = OllamaAI()
+    backend._base_url = "http://localhost:11434"
+    backend._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    info = await backend._ensure_model_info("qwen3:8b")
+    await backend.close()
+    assert info["context_length"] == 262144
+    assert info["thinking"] is True
+
+
+def test_build_request_body_clamps_num_ctx_to_model_max() -> None:
+    """A context window beyond the model's max is clamped — an impossible
+    num_ctx makes Ollama hang allocating a KV cache it can't fit."""
+    backend = OllamaAI()
+    backend._model = "m"
+    backend._model_info["m"] = {"context_length": 32768, "thinking": False}
+    body = backend._build_request_body(
+        AIRequest(
+            messages=[Message(role=MessageRole.USER, content="hi")],
+            context_window=999999,
+        )
+    )
+    assert body["options"]["num_ctx"] == 32768
+    assert "think" not in body
+
+
+def test_build_request_body_sets_think_when_model_supports_it() -> None:
+    backend = OllamaAI()
+    backend._model = "m"
+    backend._model_info["m"] = {"context_length": None, "thinking": True}
+    body = backend._build_request_body(
+        AIRequest(messages=[Message(role=MessageRole.USER, content="hi")])
+    )
+    assert body["think"] is True
+
+
+async def test_generate_stream_emits_reasoning_deltas() -> None:
+    """``message.thinking`` deltas surface as REASONING_DELTA and accumulate
+    onto the final response's ``message.reasoning`` (distinct from content)."""
+    capture: dict = {}
+    backend = _streaming_backend(
+        [
+            {"model": "m", "message": {"role": "assistant", "thinking": "Let me "}, "done": False},
+            {"model": "m", "message": {"role": "assistant", "thinking": "think."}, "done": False},
+            {
+                "model": "m",
+                "message": {"role": "assistant", "content": "Answer"},
+                "done": True,
+                "done_reason": "stop",
+                "prompt_eval_count": 3,
+                "eval_count": 2,
+            },
+        ],
+        capture,
+    )
+    backend._model_info["m"] = {"context_length": None, "thinking": True}
+    events = [
+        ev
+        async for ev in backend.generate_stream(
+            AIRequest(model="m", messages=[Message(role=MessageRole.USER, content="hi")])
+        )
+    ]
+    await backend.close()
+
+    assert capture["body"]["think"] is True
+    reasoning = "".join(
+        e.text or "" for e in events if e.type == StreamEventType.REASONING_DELTA
+    )
+    assert reasoning == "Let me think."
+    complete = next(e for e in events if e.type == StreamEventType.MESSAGE_COMPLETE)
+    assert complete.response.message.reasoning == "Let me think."
+    assert complete.response.message.content == "Answer"
+
+
+async def test_generate_raises_clear_error_on_timeout() -> None:
+    """An httpx timeout becomes a descriptive AIBackendError (504), not a bare
+    exception that surfaces as 'Unknown error'."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("read timed out", request=request)
+
+    backend = OllamaAI()
+    backend._base_url = "http://localhost:11434"
+    backend._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    backend._model_info["m"] = {"context_length": None, "thinking": False}
+    with pytest.raises(AIBackendError) as exc_info:
+        await backend.generate(
+            AIRequest(
+                model="m",
+                messages=[Message(role=MessageRole.USER, content="hi")],
+                context_window=999999,
+            )
+        )
+    await backend.close()
+    assert exc_info.value.status == 504
+    assert "timed out" in str(exc_info.value).lower()
+
+
 async def test_generate_stream_emits_tool_calls() -> None:
     capture: dict = {}
     backend = _streaming_backend(
