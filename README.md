@@ -48,6 +48,7 @@ The table below is an index — jump to each plugin's detail section for configu
 | [mentra](#mentra) | `mentra` service (`MentraService` + `mentra_webhook` capability) — Gilbert on Mentra smart glasses (Even Realities G1, Vuzix Z100, Mentra Live) | `websockets>=12` | Wearables |
 | [messaging](#messaging) | `messaging` service (`MessagingService` + `send_text_message` AI tool, `/messages` SPA page) — RCS / MMS / SMS, RCS by default | — (pure stdlib) | Communication |
 | [mistral](#mistral) | `AIBackend "mistral"` | — (uses `httpx`) | Intelligence |
+| [model-manager](#model-manager) | `model_manager` service (`/models` SPA page listing installed models) — gated on the Ollama backend being enabled | — (uses the `local_model_runtime` capability) | Intelligence |
 | [ngrok](#ngrok) | `TunnelBackend "ngrok"` | `pyngrok` | Infrastructure |
 | [ntfy](#ntfy) | `PushNotificationBackend "ntfy"` | — (uses `httpx`) | Notifications |
 | [ollama](#ollama) | `AIBackend "ollama"`, `Service "ollama_runtime"` (`local_model_runtime`) | — (uses `httpx`) | Intelligence |
@@ -882,6 +883,25 @@ Mistral AI chat backend, speaking the [OpenAI-compatible La Plateforme API](http
 **Attachments.** Pixtral models accept `image_url` content parts with base64 data URLs (same shape as OpenAI). Non-vision models receive images as text stubs. Document (PDF) attachments become text stubs pointing the model at the workspace tools.
 
 **Config action** — `test_connection`: issues a one-word completion to verify credentials.
+
+---
+
+### model-manager
+
+The local-model **manager** — an in-app admin page for browsing, fit-checking, and pulling local models via Ollama (PRD: gilbert#32). This is the **skeleton slice**: the `/models` page lists the models currently installed in the runtime; Hugging Face catalog browsing, hardware-fit verdicts, and one-click pull are later slices that build on this shell.
+
+**Service registered** — `ModelManagerService` (capability `model_manager`). Declares `requires = {local_model_runtime}` and an **enablement dependency** on the Ollama backend (`EnablementDep(capability="ai_chat", backend="ollama")`, ADR-0018): when the Ollama AI backend is **disabled** the manager does **not** start and is surfaced as *disabled, with the reason* (a Settings → Services badge + a toast on the toggle) — Gilbert never auto-enables Ollama for you.
+
+**Reaches Ollama only through the capability.** The manager drives list/pull/delete and resolves the runtime's `base_url` through the provider-neutral `LocalModelRuntimeProvider` capability that the [ollama](#ollama) plugin advertises — it never reads the AI backend's config, and a future runtime could replace Ollama unchanged.
+
+**UI** — a `UIRoute` page at `/models` (nav entry "Models" under the **System** group, admin-only), gated on the `model_manager` capability so both the nav link and the SPA route disappear when the manager isn't running. The page renders the installed-models list (tag + human-readable on-disk size) read via the `model_manager.installed.list` WS RPC (admin-gated). Frontend lives under `model-manager/frontend/`.
+
+**Configure** (Settings → Services)
+- `enabled` — Enable the local model manager (default `true`). Requires the Ollama AI backend to be enabled.
+
+**Prerequisite** — the Ollama AI backend must be enabled, which in turn needs a reachable Ollama daemon (the [ollama](#ollama) plugin declares the enablement-aware daemon `RuntimeDependency` that `./gilbert.sh doctor` checks).
+
+**No third-party Python dependencies** — talks to the runtime only through the `local_model_runtime` capability.
 
 ---
 

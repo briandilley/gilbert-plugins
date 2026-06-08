@@ -1,0 +1,14 @@
+[project]
+name = "gilbert-plugin-model-manager"
+version = "1.0.0"
+description = "Local model manager for Gilbert — browse, fit-check, and pull local models via Ollama"
+requires-python = ">=3.12"
+# No third-party deps in the skeleton — the manager talks to the local
+# runtime (Ollama) only through the existing ``local_model_runtime``
+# capability the ollama plugin advertises, never directly over the
+# network. Later slices (HF catalog browse / hardware fit / pull) may add
+# their own deps; for now there's nothing beyond Gilbert's core.
+dependencies = []
+
+[tool.uv]
+package = false
