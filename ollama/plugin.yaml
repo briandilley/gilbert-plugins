@@ -1,9 +1,10 @@
 name: ollama
-version: "1.0.0"
-description: "Ollama backend — local LLM inference via Ollama's OpenAI-compatible API"
+version: "1.1.0"
+description: "Ollama backend + local-model runtime service — local LLM inference via Ollama's OpenAI-compatible API"
 
 provides:
   - ollama_ai
+  - local_model_runtime
 
 requires: []
 

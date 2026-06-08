@@ -213,7 +213,7 @@ Plugins that need binaries or system libraries beyond what `pyproject.toml` can 
 ```python
 from gilbert.interfaces.plugin import RuntimeDependency
 
-def runtime_dependencies(self) -> list[RuntimeDependency]:
+def runtime_dependencies(self, config: dict | None = None) -> list[RuntimeDependency]:
     return [
         RuntimeDependency(
             name="ffmpeg",
@@ -227,7 +227,9 @@ def runtime_dependencies(self) -> list[RuntimeDependency]:
 
 Users run `./gilbert.sh doctor` (or `./gilbert.sh doctor --plugin <name>`) which iterates every plugin's deps, runs each `check_cmd` via `/bin/sh -c`, and prints PASS/FAIL with the install hint on failure. `--install` runs each failing check's `auto_install_cmd` for plugins that opted in (reserve auto-install for unattended-safe paths like Playwright's per-user browser cache; sudo apt-get installs should stay manual).
 
-The check should ideally exercise the dep, not just probe its file path — Playwright's previous `executable_path` probe passed even when launching headless failed because the headless-shell binary or OS libs were missing. Doing a real `chromium.launch(headless=True)` catches both.
+`doctor` passes the **resolved config** it already loads into `runtime_dependencies(config)` (ADR-0008), so a plugin can return a dependency **only when its backend/service is enabled** — e.g. the `ollama` plugin advertises the Ollama-daemon dep only when the `ollama` AI backend is enabled, so an operator who doesn't use it isn't nagged. `config` may be `None` (treat as "no config available"). Overrides that don't need it accept and ignore the argument; `doctor` calls the hook signature-robustly, so older zero-arg overrides still work.
+
+The check should ideally exercise the dep, not just probe its file path — Playwright's previous `executable_path` probe passed even when launching headless failed because the headless-shell binary or OS libs were missing. Doing a real `chromium.launch(headless=True)` catches both (and the Ollama dep hits `GET /api/tags` rather than checking for the binary).
 
 ## Configuration
 

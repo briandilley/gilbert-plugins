@@ -50,7 +50,7 @@ The table below is an index — jump to each plugin's detail section for configu
 | [mistral](#mistral) | `AIBackend "mistral"` | — (uses `httpx`) | Intelligence |
 | [ngrok](#ngrok) | `TunnelBackend "ngrok"` | `pyngrok` | Infrastructure |
 | [ntfy](#ntfy) | `PushNotificationBackend "ntfy"` | — (uses `httpx`) | Notifications |
-| [ollama](#ollama) | `AIBackend "ollama"` | — (uses `httpx`) | Intelligence |
+| [ollama](#ollama) | `AIBackend "ollama"`, `Service "ollama_runtime"` (`local_model_runtime`) | — (uses `httpx`) | Intelligence |
 | [open-meteo](#open-meteo) | `WeatherBackend "open-meteo"` | — (uses `httpx`) | Intelligence |
 | [openai](#openai) | `AIBackend "openai"`, `BatchTranscriptionBackend "openai_whisper"` | — (uses `httpx`) | Intelligence / Speech |
 | [openai-compatible](#openai-compatible) | `AIBackend "openai_compatible"` | — (uses `httpx`) | Intelligence |
@@ -946,22 +946,27 @@ Local Ollama AI backend — chat against any open-weight model you've `ollama pu
 
 **Backend registered** — `AIBackend.backend_name = "ollama"`: tool-use capable (model-dependent), streaming, image-input capable on multimodal tags (`llava`, `llama3.2-vision`, `qwen2.5-vl`), per-call model override.
 
-**Models.** Whatever the user has pulled locally — `ollama pull llama3.3`, `ollama pull qwen2.5-coder:32b`, etc. The `model` field is free-text because the available set depends on local installs. A curated list of common tool-capable tags ships as suggestions in the `enabled_models` dropdown: `llama3.3`, `llama3.2`, `qwen2.5`, `qwen2.5-coder`, `deepseek-r1`, `mistral`, `mistral-nemo`, `phi4`, `gemma3`.
+**Service registered** — `OllamaRuntimeService` (capability `local_model_runtime`), implementing the core `LocalModelRuntimeProvider` capability: `list_models` / `pull_model` / `delete_model` / `base_url`. A separate local-model manager plugin can drive installs/removals through this without reading the AI backend's config — the runtime service resolves `base_url` / `api_key` from the same `ai.backends.ollama.*` config the backend uses, hitting the daemon's native `/api/tags`, `/api/pull`, `/api/delete` endpoints (at the server root, one level above `/v1`).
+
+**Models (dynamic).** `available_models()` reflects the tags **actually installed** in the Ollama daemon — fetched from `GET /api/tags` and cached in `initialize()` (re-pull with `refresh_installed_models()`). Each installed tag is enriched with a friendly name/description from a built-in **recommended overlay** (`llama3.3`, `llama3.2`, `qwen2.5`, `qwen2.5-coder`, `deepseek-r1`, `mistral`, `mistral-nemo`, `phi4`, `gemma3`) when it matches that family; unmatched tags appear under their bare tag name. There is no `enabled_models` config any more — per-model visibility is governed by the core per-model `enabled` flag (ADR-0019), enforced by `AIService`, so pulling a tag makes it chat-selectable and disabling one hides it from the picker.
+
+**Per-model generation params.** The backend honors the resolved `temperature` / `max_tokens` carried on each `AIRequest` (the layered *backend ← per-model ← profile ← call* resolution from ADR-0019), falling back to its own `temperature` / `max_tokens` globals when a field is unset.
 
 **Configure** (Settings → Intelligence → AI, with the `ollama` backend selected)
 - `enabled` — Initialize this backend at startup (default `true`).
 - `api_key` *(sensitive, optional)* — Leave blank for local Ollama. Populate only when Ollama sits behind a reverse proxy that gates access.
 - `base_url` — Ollama server URL (default `http://localhost:11434/v1`). Point at another host/port if Ollama runs elsewhere on your LAN.
 - `model` — Default model tag (default `llama3.3`). Must be a tag you've pulled — Ollama rejects unknown tags.
-- `enabled_models` — Suggested subset shown in the chat UI / AI profile editor.
-- `max_tokens` — Per-response cap (default `8192`).
-- `temperature` — Sampling temperature (default `0.7`).
+- `max_tokens` — Per-response cap (default `8192`); the backend-default layer for the resolved per-model value.
+- `temperature` — Sampling temperature (default `0.7`); the backend-default layer for the resolved per-model value.
 
 **Streaming.** OpenAI-compatible SSE — `delta.content` → `TEXT_DELTA`, streamed `tool_calls[i].function.arguments` deltas reassembled into complete `ToolCall`s. `capabilities()` reports `streaming=True, attachments_user=True`.
 
 **Attachments.** Multimodal Ollama models accept `image_url` content parts with base64 data URLs. Text-only models ignore vision parts, so the same payload is safe regardless of which tag is selected.
 
 **Config action** — `test_connection`: issues a one-word completion to verify the server is reachable and the default model tag is installed.
+
+**Runtime dependency (`doctor`).** When the `ollama` backend is enabled, `./gilbert.sh doctor` checks the `ollama-daemon` dependency by hitting the daemon's `/api/tags` (`curl -fsS <base_url-root>/api/tags`) — an *exercise*, not a path probe. Install is manual (`auto_install_cmd` empty): `curl -fsSL https://ollama.com/install.sh | sh`, then `ollama serve`. When the backend is disabled the dependency is omitted entirely, so operators who don't use Ollama aren't nagged (ADR-0008).
 
 ---
 

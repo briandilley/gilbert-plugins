@@ -50,10 +50,15 @@ ai_logger = logging.getLogger("gilbert.ai")
 _DEFAULT_BASE_URL = "http://localhost:11434/v1"
 _DEFAULT_MODEL = "llama3.3"
 
-# A curated list of common tool-capable Ollama model tags. The user's
-# actual available models are whatever they've ``ollama pull``ed — the
-# ``model`` field is free-text so any tag works.
-_AVAILABLE_MODELS = [
+# Recommended overlay: a curated set of common tool-capable model
+# families, keyed by the base tag. ``available_models()`` is now
+# **dynamic** — it reflects whatever tags are actually installed in the
+# Ollama daemon (``GET /api/tags``). When an installed tag matches an
+# entry here (exactly, or by family prefix), we borrow its friendly name
+# + description; otherwise the tag is advertised as a bare
+# ``ModelInfo(id=tag, name=tag)``. Per-model ``enabled`` filtering is now
+# enforced by the core ``AIService`` (ADR-0019), not here.
+_RECOMMENDED_OVERLAY = [
     ModelInfo(
         id="llama3.3",
         name="Llama 3.3 70B",
@@ -109,7 +114,6 @@ class OllamaAI(AIBackend):
 
     @classmethod
     def backend_config_params(cls) -> list[ConfigParam]:
-        all_model_ids = [m.id for m in _AVAILABLE_MODELS]
         return [
             ConfigParam(
                 key="enabled",
@@ -151,16 +155,6 @@ class OllamaAI(AIBackend):
                     "depends on what you've pulled."
                 ),
                 default=_DEFAULT_MODEL,
-            ),
-            ConfigParam(
-                key="enabled_models",
-                type=ToolParameterType.ARRAY,
-                description=(
-                    "Models available for selection in the chat UI and model "
-                    "tier mappings. Only enabled models can be assigned to tiers."
-                ),
-                default=all_model_ids,
-                choices=tuple(all_model_ids),
             ),
             ConfigParam(
                 key="max_tokens",
@@ -235,8 +229,13 @@ class OllamaAI(AIBackend):
 
     def __init__(self) -> None:
         self._client: httpx.AsyncClient | None = None
+        self._base_url: str = _DEFAULT_BASE_URL
         self._model: str = _DEFAULT_MODEL
-        self._enabled_models: list[str] = [m.id for m in _AVAILABLE_MODELS]
+        # Tags actually installed in the Ollama daemon, refreshed from
+        # ``GET /api/tags`` in ``initialize()`` /
+        # ``refresh_installed_models()``. ``available_models()`` is sync,
+        # so it reads this cache rather than hitting the network.
+        self._installed_tags: list[str] = []
         self._max_tokens: int = 8192
         self._temperature: float = 0.7
 
@@ -247,9 +246,6 @@ class OllamaAI(AIBackend):
         api_key = str(config.get("api_key") or "").strip()
 
         self._model = str(config.get("model", _DEFAULT_MODEL))
-        raw_enabled = config.get("enabled_models")
-        if isinstance(raw_enabled, list) and raw_enabled:
-            self._enabled_models = [str(m) for m in raw_enabled]
         self._max_tokens = int(config.get("max_tokens", 8192))
         self._temperature = float(config.get("temperature", 0.7))
         base_url = str(config.get("base_url") or _DEFAULT_BASE_URL).rstrip("/")
@@ -260,20 +256,98 @@ class OllamaAI(AIBackend):
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
 
+        self._base_url = base_url
         self._client = httpx.AsyncClient(
             base_url=base_url,
             headers=headers,
             timeout=120.0,
         )
-        logger.info("Ollama AI backend initialized (model=%s)", self._model)
+        # Seed the installed-tag cache so ``available_models()`` reflects
+        # reality immediately. Best-effort: a daemon that's down at startup
+        # just yields an empty list until the next refresh.
+        await self.refresh_installed_models()
+        logger.info(
+            "Ollama AI backend initialized (model=%s, installed=%d)",
+            self._model,
+            len(self._installed_tags),
+        )
 
     async def close(self) -> None:
         if self._client:
             await self._client.aclose()
             self._client = None
 
+    async def refresh_installed_models(self) -> None:
+        """Refresh the cached set of installed Ollama tags from the daemon.
+
+        Queries ``GET /api/tags`` (the daemon's native API, which sits at
+        the server root — *not* under the OpenAI-compatible ``/v1`` path)
+        and stores the tag names in ``self._installed_tags`` so the sync
+        ``available_models()`` can reflect them without doing network I/O.
+        Best-effort: a daemon that's unreachable or returns an unexpected
+        shape leaves the previous cache untouched.
+        """
+        if self._client is None:
+            return
+        try:
+            resp = await self._client.get(self._tags_url())
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:  # daemon down / network / bad JSON
+            logger.debug("Ollama /api/tags refresh failed: %s", exc)
+            return
+        if not isinstance(data, dict):
+            return
+        models = data.get("models")
+        if not isinstance(models, list):
+            return
+        tags: list[str] = []
+        for entry in models:
+            if isinstance(entry, dict):
+                name = entry.get("name") or entry.get("model")
+                if isinstance(name, str) and name:
+                    tags.append(name)
+        self._installed_tags = tags
+
+    def _tags_url(self) -> str:
+        """Absolute URL for ``/api/tags`` at the Ollama daemon root.
+
+        The httpx client's ``base_url`` points at the OpenAI-compatible
+        ``/v1`` endpoint; the native ``/api/*`` routes live one level up,
+        so strip a trailing ``/v1`` before appending.
+        """
+        root = self._base_url
+        if root.endswith("/v1"):
+            root = root[: -len("/v1")]
+        return f"{root.rstrip('/')}/api/tags"
+
     def available_models(self) -> list[ModelInfo]:
-        return [m for m in _AVAILABLE_MODELS if m.id in self._enabled_models]
+        """Advertise one ``ModelInfo`` per **installed** Ollama tag.
+
+        Sourced from ``self._installed_tags`` (refreshed from the daemon's
+        ``/api/tags``). Each tag is enriched from the recommended overlay
+        when it matches a curated family; otherwise it's advertised as a
+        bare ``ModelInfo(id=tag, name=tag)``. Per-model ``enabled``
+        filtering is applied downstream by the core ``AIService``
+        (ADR-0019), so it's intentionally not done here.
+        """
+        return [self._model_info_for_tag(tag) for tag in self._installed_tags]
+
+    @staticmethod
+    def _model_info_for_tag(tag: str) -> ModelInfo:
+        """Build a ``ModelInfo`` for an installed tag, enriched from overlay.
+
+        Matches the recommended overlay exactly first, then by family
+        prefix (an installed ``llama3.3:latest`` / ``qwen2.5-coder:32b``
+        borrows the friendly name of the ``llama3.3`` / ``qwen2.5-coder``
+        overlay entry). The advertised ``id`` is always the real installed
+        tag so chat selection round-trips to Ollama verbatim.
+        """
+        base = tag.split(":", 1)[0]
+        for rec in _RECOMMENDED_OVERLAY:
+            if rec.id == tag or rec.id == base:
+                return ModelInfo(id=tag, name=rec.name, description=rec.description)
+        return ModelInfo(id=tag, name=tag)
 
     def capabilities(self) -> AIBackendCapabilities:
         return AIBackendCapabilities(
@@ -517,10 +591,15 @@ class OllamaAI(AIBackend):
 
     def _build_request_body(self, request: AIRequest) -> dict[str, Any]:
         model = request.model or self._model
+        # Layered generation params (ADR-0019): the request carries the
+        # already-resolved per-model / profile / per-call values when set;
+        # ``None`` means "use this backend's own global default".
+        max_tokens = request.max_tokens if request.max_tokens is not None else self._max_tokens
+        temperature = request.temperature if request.temperature is not None else self._temperature
         body: dict[str, Any] = {
             "model": model,
-            "max_tokens": self._max_tokens,
-            "temperature": self._temperature,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
             "messages": self._build_messages(request.messages, request.system_prompt),
         }
 

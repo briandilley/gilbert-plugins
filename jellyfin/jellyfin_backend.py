@@ -347,7 +347,9 @@ class JellyfinBackend(MediaLibraryBackend):
         self._user_id_cache: dict[str, str] = {}
 
     @classmethod
-    def runtime_dependencies(cls) -> list[RuntimeDependency]:
+    def runtime_dependencies(
+        cls, config: dict[str, Any] | None = None
+    ) -> list[RuntimeDependency]:
         return []
 
     @classmethod
