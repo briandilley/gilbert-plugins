@@ -14,8 +14,10 @@ import type {
   CatalogQuantsResponse,
   CatalogSearchResponse,
   CatalogSort,
+  DeleteResponse,
   HostResourcesResponse,
   InstalledModelsResponse,
+  PullResponse,
 } from "./types";
 
 export function useModelManagerApi() {
@@ -42,6 +44,21 @@ export function useModelManagerApi() {
       hostResources: () =>
         rpc<HostResourcesResponse>({
           type: "model_manager.host.resources",
+        }),
+      // Pull a catalog quant. The server builds ``hf.co/<repo>:<quant>``, but
+      // we also send the constructed ``ref`` for clarity; ``repo_id`` lets the
+      // server seed per-model config (best-effort context window from HF).
+      pull: (repoId: string, quant: string) =>
+        rpc<PullResponse>({
+          type: "model_manager.pull",
+          ref: `hf.co/${repoId}:${quant}`,
+          repo_id: repoId,
+          quant,
+        }),
+      deleteModel: (tag: string) =>
+        rpc<DeleteResponse>({
+          type: "model_manager.delete",
+          tag,
         }),
     }),
     [rpc],

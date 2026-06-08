@@ -12,19 +12,23 @@
  *    fits-VRAM/fast, fits-RAM/slow, won't-fit, unknown), a host-summary line
  *    explains the host, and a "Compatible" toggle filters out quants — and
  *    models whose best loaded quant won't fit — without reordering anything.
- *
- * One-click pull is a later slice; Browse shows all models by default.
+ *  - **Pull / delete** (S8) — each catalog quant has a Pull button
+ *    (``model_manager.pull``; coarse progress: a spinner while the awaited
+ *    pull runs, then a refresh of the Installed list); each installed model
+ *    has a Delete button (``model_manager.delete``, confirm-gated). A pulled
+ *    model becomes immediately chat-selectable.
  *
  * The route itself is gated on the ``model_manager`` capability in
  * plugin.py, so this page only mounts when the manager is running.
  */
 
 import { useCallback, useEffect, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useWebSocket } from "@/hooks/useWebSocket";
 import { PluginPanelSlot } from "@/components/PluginPanelSlot";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
 import {
@@ -43,6 +47,7 @@ import {
   ChevronRightIcon,
   ChevronDownIcon,
   DownloadIcon,
+  DownloadCloudIcon,
   HeartIcon,
   ZapIcon,
   CpuIcon,
@@ -50,6 +55,9 @@ import {
   HelpCircleIcon,
   MemoryStickIcon,
   ServerIcon,
+  Trash2Icon,
+  Loader2Icon,
+  CheckCircle2Icon,
 } from "lucide-react";
 import { useModelManagerApi } from "./api";
 import type {
@@ -63,6 +71,10 @@ import type {
   InstalledModel,
   InstalledModelsResponse,
 } from "./types";
+
+/** Query key for the installed-models list — shared so pull/delete mutations
+ *  can invalidate it and the Installed section refetches. */
+const INSTALLED_QUERY_KEY = ["model_manager", "installed"];
 
 /** Human-readable on-disk size. ``null`` ⇒ "unknown" (the runtime didn't
  *  report a size). Uses binary units (GiB) to match how Ollama reports
@@ -213,7 +225,7 @@ function InstalledSection() {
   const { connected } = useWebSocket();
 
   const { data, isLoading, isError } = useQuery<InstalledModelsResponse>({
-    queryKey: ["model_manager", "installed"],
+    queryKey: INSTALLED_QUERY_KEY,
     queryFn: api.listInstalled,
     enabled: connected,
     staleTime: 30_000,
@@ -235,22 +247,65 @@ function InstalledSection() {
       ) : (
         <ul className="divide-y rounded-lg border bg-card">
           {models.map((model) => (
-            <li
-              key={model.tag}
-              className="flex items-center justify-between gap-3 px-4 py-3"
-            >
-              <div className="flex items-center gap-3 min-w-0">
-                <BoxIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
-                <span className="font-mono text-sm truncate">{model.tag}</span>
-              </div>
-              <span className="shrink-0 rounded bg-muted px-2 py-0.5 text-xs font-medium text-muted-foreground tabular-nums">
-                {humanSize(model.size_bytes)}
-              </span>
-            </li>
+            <InstalledRow key={model.tag} model={model} />
           ))}
         </ul>
       )}
     </section>
+  );
+}
+
+/** One installed-model row with a Delete action. Deleting confirms first,
+ *  then removes the model from Ollama (and the chat picker) and refetches the
+ *  installed list. */
+function InstalledRow({ model }: { model: InstalledModel }) {
+  const api = useModelManagerApi();
+  const queryClient = useQueryClient();
+
+  const del = useMutation({
+    mutationFn: () => api.deleteModel(model.tag),
+    onSuccess: () =>
+      queryClient.invalidateQueries({ queryKey: INSTALLED_QUERY_KEY }),
+  });
+
+  const onDelete = () => {
+    // No global toast/dialog library here; a native confirm is the honest,
+    // dependency-free guard against an accidental destructive delete.
+    if (window.confirm(`Delete ${model.tag}? This frees its disk space.`)) {
+      del.mutate();
+    }
+  };
+
+  return (
+    <li className="flex items-center justify-between gap-3 px-4 py-3">
+      <div className="flex items-center gap-3 min-w-0">
+        <BoxIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
+        <span className="font-mono text-sm truncate">{model.tag}</span>
+      </div>
+      <div className="flex shrink-0 items-center gap-2">
+        <span className="rounded bg-muted px-2 py-0.5 text-xs font-medium text-muted-foreground tabular-nums">
+          {humanSize(model.size_bytes)}
+        </span>
+        <Button
+          variant="ghost"
+          size="sm"
+          className="h-7 px-2 text-muted-foreground hover:text-rose-600"
+          onClick={onDelete}
+          disabled={del.isPending}
+          aria-label={`Delete ${model.tag}`}
+          title="Delete this model"
+        >
+          {del.isPending ? (
+            <Loader2Icon className="h-4 w-4 animate-spin" />
+          ) : (
+            <Trash2Icon className="h-4 w-4" />
+          )}
+        </Button>
+      </div>
+      {del.isError && (
+        <span className="text-xs text-rose-600">delete failed</span>
+      )}
+    </li>
   );
 }
 
@@ -557,6 +612,7 @@ function CatalogRow({
                     <span className="text-xs text-muted-foreground tabular-nums">
                       {humanSize(q.size_bytes)}
                     </span>
+                    <PullButton repoId={model.id} quant={q} />
                   </div>
                 </li>
               ))}
@@ -565,6 +621,86 @@ function CatalogRow({
         </div>
       )}
     </li>
+  );
+}
+
+/** Per-quant Pull button.
+ *
+ * Pulls ``hf.co/<repoId>:<quant_label>`` into Ollama. Progress is coarse by
+ * design (gilbert#40): the RPC is awaited to completion, so this shows a
+ * "Pulling…" spinner while in flight and a brief "Installed" tick on success —
+ * a byte-level progress bar is intentionally out of scope (faking one would be
+ * dishonest). On success the installed-models query is invalidated so the
+ * Installed section refetches and the model appears there (and in chat).
+ *
+ * Ollama's ``hf.co/<repo>:<quant>`` ref needs a quant label, so the button is
+ * disabled for a gguf whose filename has no recognizable quant marker. */
+function PullButton({ repoId, quant }: { repoId: string; quant: CatalogQuant }) {
+  const api = useModelManagerApi();
+  const queryClient = useQueryClient();
+
+  const pull = useMutation({
+    mutationFn: () => api.pull(repoId, quant.quant_label as string),
+    onSuccess: () =>
+      queryClient.invalidateQueries({ queryKey: INSTALLED_QUERY_KEY }),
+  });
+
+  if (!quant.quant_label) {
+    return (
+      <Button
+        variant="outline"
+        size="sm"
+        className="h-6 px-2 text-[11px]"
+        disabled
+        title="No quantization label — can't build an Ollama pull reference."
+      >
+        <DownloadCloudIcon className="h-3 w-3" />
+      </Button>
+    );
+  }
+
+  if (pull.isSuccess) {
+    return (
+      <span
+        className="inline-flex items-center gap-1 text-[11px] text-emerald-600"
+        title="Installed — now selectable in chat."
+      >
+        <CheckCircle2Icon className="h-3.5 w-3.5" />
+        Installed
+      </span>
+    );
+  }
+
+  return (
+    <Button
+      variant="outline"
+      size="sm"
+      className="h-6 gap-1 px-2 text-[11px]"
+      onClick={() => pull.mutate()}
+      disabled={pull.isPending}
+      title={
+        pull.isError
+          ? "Pull failed — click to retry."
+          : `Pull ${quant.quant_label} into Ollama`
+      }
+    >
+      {pull.isPending ? (
+        <>
+          <Loader2Icon className="h-3 w-3 animate-spin" />
+          Pulling…
+        </>
+      ) : pull.isError ? (
+        <>
+          <DownloadCloudIcon className="h-3 w-3 text-rose-600" />
+          Retry
+        </>
+      ) : (
+        <>
+          <DownloadCloudIcon className="h-3 w-3" />
+          Pull
+        </>
+      )}
+    </Button>
   );
 }
 

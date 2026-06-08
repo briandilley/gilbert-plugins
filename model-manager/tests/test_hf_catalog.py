@@ -15,6 +15,7 @@ from gilbert_plugin_model_manager.hf_catalog import (
     SORT_KEY_MAP,
     CatalogModel,
     Quant,
+    fetch_context_window,
     list_quants,
     parse_quant_label,
     search,
@@ -227,3 +228,40 @@ async def test_list_quants_size_unknown_when_absent() -> None:
 )
 def test_parse_quant_label(filename: str, label: str | None) -> None:
     assert parse_quant_label(filename) == label
+
+
+# --- fetch_context_window() best-effort metadata --------------------------
+
+
+@pytest.mark.asyncio
+async def test_fetch_context_window_reads_max_position_embeddings() -> None:
+    client = _fake_client({"max_position_embeddings": 32768, "n_ctx": 2048})
+    ctx = await fetch_context_window("owner/Repo-GGUF", client=client)
+    # ``max_position_embeddings`` wins over the older ``n_ctx`` key.
+    assert ctx == 32768
+    # Reads the repo's config.json from the raw-file CDN, not the JSON API.
+    url = client.get.call_args[0][0]
+    assert url == "https://huggingface.co/owner/Repo-GGUF/resolve/main/config.json"
+
+
+@pytest.mark.asyncio
+async def test_fetch_context_window_falls_back_to_n_ctx() -> None:
+    client = _fake_client({"n_ctx": 4096})
+    assert await fetch_context_window("owner/Repo", client=client) == 4096
+
+
+@pytest.mark.asyncio
+async def test_fetch_context_window_none_when_absent() -> None:
+    client = _fake_client({"hidden_size": 4096})  # no context-window key
+    assert await fetch_context_window("owner/Repo", client=client) is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_context_window_none_when_no_config() -> None:
+    # GGUF-only repos often have no config.json — _get_json returns None on
+    # the 404, and the helper degrades to None rather than raising.
+    resp = MagicMock()
+    resp.raise_for_status.side_effect = RuntimeError("404")
+    client = MagicMock()
+    client.get = AsyncMock(return_value=resp)
+    assert await fetch_context_window("owner/Gguf-Only", client=client) is None

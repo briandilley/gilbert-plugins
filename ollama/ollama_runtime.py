@@ -30,6 +30,8 @@ from gilbert.interfaces.service import (
     ServiceResolver,
 )
 
+from . import _installed_cache
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_BASE_URL = "http://localhost:11434/v1"
@@ -124,6 +126,24 @@ class OllamaRuntimeService(Service):
                     out.append(InstalledModel(tag=name, size_bytes=size))
         return out
 
+    async def _refresh_installed_cache(self) -> None:
+        """Re-fetch ``/api/tags`` and publish the tags into the shared cache.
+
+        Called after a successful ``pull_model`` / ``delete_model`` so the
+        Ollama AI backend's sync ``available_models()`` — which reads the same
+        host-global ``_installed_cache`` — reflects the change *immediately*,
+        making a freshly-pulled model chat-selectable without a restart.
+        Best-effort: a transient ``/api/tags`` failure here leaves the cache
+        as it was rather than failing the pull/delete the user already
+        completed (it'll resync on the next refresh).
+        """
+        try:
+            installed = await self.list_models()
+        except Exception as exc:
+            logger.debug("post-op /api/tags refresh failed: %s", exc)
+            return
+        _installed_cache.set([m.tag for m in installed])
+
     async def pull_model(self, ref: str) -> None:
         """Pull a model via ``POST /api/pull``, awaiting completion.
 
@@ -152,6 +172,9 @@ class OllamaRuntimeService(Service):
                         continue
                     if isinstance(frame, dict) and frame.get("error"):
                         raise RuntimeError(f"Ollama pull error: {frame['error']}")
+        # Pull succeeded — resync the host-global installed cache so the AI
+        # backend's available_models() shows the new tag immediately.
+        await self._refresh_installed_cache()
 
     async def delete_model(self, tag: str) -> None:
         """Delete an installed tag via ``DELETE /api/delete``."""
@@ -160,3 +183,6 @@ class OllamaRuntimeService(Service):
             resp = await client.request("DELETE", url, json={"name": tag})
             if resp.is_error:
                 raise RuntimeError(f"Ollama delete failed ({resp.status_code}): {resp.text[:500]}")
+        # Delete succeeded — resync the host-global installed cache so the AI
+        # backend's available_models() drops the tag immediately.
+        await self._refresh_installed_cache()

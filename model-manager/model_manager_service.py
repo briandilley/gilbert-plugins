@@ -17,6 +17,14 @@ S7 (gilbert#39) adds **hardware-fit**: ``catalog.quants`` attaches a per-quant
 ``host_resources`` capability and whether the runtime's ``base_url`` is local
 or remote, and a ``host.resources`` RPC surfaces the host summary so the UI
 can explain an "unknown" verdict.
+
+S8 (gilbert#40) adds **one-click pull + delete**: ``model_manager.pull``
+installs a catalog quant via the runtime capability (awaited to completion)
+and, on success, SEEDS the model's per-model config (``enabled=True`` +
+best-effort ``context_window`` from HF metadata) through the optional
+``ai_model_config`` capability so the pulled tag is immediately
+chat-selectable; ``model_manager.delete`` removes an installed tag. Both are
+admin-gated.
 """
 
 from __future__ import annotations
@@ -27,6 +35,7 @@ from urllib.parse import urlparse
 
 import httpx
 
+from gilbert.interfaces.ai import ModelConfig, PerModelConfigProvider
 from gilbert.interfaces.configuration import ConfigParam
 from gilbert.interfaces.host_resources import HostResources, HostResourcesProvider
 from gilbert.interfaces.local_models import LocalModelRuntimeProvider
@@ -47,6 +56,15 @@ logger = logging.getLogger(__name__)
 _DEFAULT_SEARCH_SORT = "downloads"
 _DEFAULT_SEARCH_LIMIT = 25
 _MAX_SEARCH_LIMIT = 100
+
+# The AI-backend name the local runtime (Ollama) maps to. Per-model config is
+# keyed by ``(backend, model)``; a pulled tag is an ``ollama`` model, so we
+# seed its config under this backend so the chat picker (which reads the
+# ollama backend's available_models() filtered by per-model ``enabled``)
+# surfaces it. The manager talks to the runtime through the provider-neutral
+# capability, but per-model config is inherently per-backend, and the only
+# runtime the manager pulls into today is Ollama (ADR-0007).
+_RUNTIME_BACKEND = "ollama"
 
 # Hostnames that mean "Ollama runs on this very box" — the only case where the
 # localhost-only host-resources probe describes the right machine. Anything
@@ -96,6 +114,11 @@ class ModelManagerService(Service):
         # (a stripped-down install, the core service disabled), in which case
         # fit verdicts are "unknown" rather than a crash.
         self._host_resources: HostResourcesProvider | None = None
+        # Optional per-model config capability (``ai_model_config``, advertised
+        # by AIService, ADR-0019). Used to SEED a freshly-pulled model's
+        # per-model config (enabled=True + best-effort context_window) so it's
+        # immediately chat-selectable. Absent ⇒ pull still works, just no seed.
+        self._per_model_config: PerModelConfigProvider | None = None
         # Whether the runtime's resolved base_url points off-box. Fit reflects
         # the machine Ollama runs on; only localhost can be probed, so a remote
         # runtime yields "unknown". Computed once in start() from base_url().
@@ -115,7 +138,9 @@ class ModelManagerService(Service):
             requires=frozenset({"local_model_runtime"}),
             # host_resources is optional — the fit verdict degrades to
             # "unknown" when it's absent rather than failing to start (S7).
-            optional=frozenset({"host_resources"}),
+            # ai_model_config is optional too — a pull still installs the model
+            # when it's absent, it just can't seed per-model defaults (S8).
+            optional=frozenset({"host_resources", "ai_model_config"}),
             requires_enabled=(EnablementDep(capability="ai_chat", backend="ollama"),),
             toggleable=True,
             toggle_description=("Browse, fit-check, and pull local models via Ollama."),
@@ -138,6 +163,10 @@ class ModelManagerService(Service):
         # Absent ⇒ self._host_resources stays None ⇒ fit verdicts are unknown.
         host = resolver.get_capability("host_resources")
         self._host_resources = host if isinstance(host, HostResourcesProvider) else None
+        # ai_model_config is also optional — narrow against the provider
+        # protocol (never the concrete AIService). Absent ⇒ pull seeds nothing.
+        pmc = resolver.get_capability("ai_model_config")
+        self._per_model_config = pmc if isinstance(pmc, PerModelConfigProvider) else None
         # Derive remote-ness from where the runtime actually lives. The
         # localhost-only probe only describes this box, so a remote base_url
         # means we can't honestly judge fit.
@@ -152,6 +181,7 @@ class ModelManagerService(Service):
             await self._http.aclose()
             self._http = None
         self._host_resources = None
+        self._per_model_config = None
         self._remote = False
         self._enabled = False
 
@@ -191,6 +221,8 @@ class ModelManagerService(Service):
             "model_manager.catalog.search": self._ws_catalog_search,
             "model_manager.catalog.quants": self._ws_catalog_quants,
             "model_manager.host.resources": self._ws_host_resources,
+            "model_manager.pull": self._ws_pull,
+            "model_manager.delete": self._ws_delete,
         }
 
     async def _ws_installed_list(
@@ -355,6 +387,161 @@ class ModelManagerService(Service):
             "gpus": gpus,
             "remote": self._remote,
         }
+
+    async def _ws_pull(self, conn: WsConnectionBase, frame: dict[str, Any]) -> dict[str, Any]:
+        """Pull a model into the local runtime, then seed its per-model config.
+
+        Admin-gated (manager actions are admin-global, ADR-0009). The client
+        sends a pre-built Ollama pull ``ref`` (``hf.co/<repo_id>:<quant>``);
+        as a convenience the handler also accepts ``repo_id`` + ``quant`` and
+        builds the ref itself (see :meth:`_pull_ref`).
+
+        **Progress is coarse, by design.** The pull is awaited to completion
+        and this RPC returns only when the model is installed — the frontend
+        shows a "pulling…" spinner while the RPC is in flight, then refreshes
+        the installed list. Granular byte-level progress is intentionally out
+        of scope (gilbert#40): faking a progress bar would be dishonest, so a
+        spinner + completion is the deliverable.
+
+        On success it SEEDS per-model config (when the optional
+        ``ai_model_config`` capability is present): ``enabled=True`` plus a
+        best-effort ``context_window`` read from the repo's HF metadata. That
+        makes the pulled tag immediately chat-selectable (it now appears in
+        the ollama backend's dynamic ``available_models()``, which the
+        runtime refreshes on pull). A missing ``ai_model_config`` capability
+        does NOT fail the pull — the model still installs, just without a seed.
+        """
+        denied = require_admin(conn, frame)
+        if denied is not None:
+            return denied
+        if self._runtime is None:
+            return {
+                "type": "gilbert.error",
+                "ref": frame.get("id"),
+                "error": "local model runtime unavailable",
+                "code": 503,
+            }
+        ref = self._pull_ref(frame)
+        if not ref:
+            return {
+                "type": "gilbert.error",
+                "ref": frame.get("id"),
+                "error": "ref (or repo_id + quant) is required",
+                "code": 400,
+            }
+        try:
+            await self._runtime.pull_model(ref)
+        except Exception as exc:
+            logger.exception("model_manager.pull failed for %s", ref)
+            return {
+                "type": "gilbert.error",
+                "ref": frame.get("id"),
+                "error": f"pull failed: {exc}",
+                "code": 502,
+            }
+        # The installed tag is the ref Ollama now serves chat requests under
+        # (``hf.co/<repo>:<quant>``). Seed per-model config so it's enabled
+        # and carries a sensible context window.
+        repo_id = str(frame.get("repo_id") or "")
+        seeded_context = await self._seed_model_config(ref, repo_id)
+        return {
+            "type": "model_manager.pull.result",
+            "ref": frame.get("id"),
+            "model": ref,
+            "seeded": self._per_model_config is not None,
+            "context_window": seeded_context,
+        }
+
+    async def _ws_delete(self, conn: WsConnectionBase, frame: dict[str, Any]) -> dict[str, Any]:
+        """Delete an installed model tag from the local runtime.
+
+        Admin-gated. ``tag`` is the installed tag from the installed list.
+        On success the runtime drops it from the host-global installed cache,
+        so it disappears from both the installed list and the chat picker.
+        """
+        denied = require_admin(conn, frame)
+        if denied is not None:
+            return denied
+        if self._runtime is None:
+            return {
+                "type": "gilbert.error",
+                "ref": frame.get("id"),
+                "error": "local model runtime unavailable",
+                "code": 503,
+            }
+        tag = str(frame.get("tag") or "")
+        if not tag:
+            return {
+                "type": "gilbert.error",
+                "ref": frame.get("id"),
+                "error": "tag is required",
+                "code": 400,
+            }
+        try:
+            await self._runtime.delete_model(tag)
+        except Exception as exc:
+            logger.exception("model_manager.delete failed for %s", tag)
+            return {
+                "type": "gilbert.error",
+                "ref": frame.get("id"),
+                "error": f"delete failed: {exc}",
+                "code": 502,
+            }
+        return {
+            "type": "model_manager.delete.result",
+            "ref": frame.get("id"),
+            "tag": tag,
+        }
+
+    @staticmethod
+    def _pull_ref(frame: dict[str, Any]) -> str:
+        """Resolve the Ollama pull ref from the frame.
+
+        Prefers a pre-built ``ref`` from the client; otherwise constructs the
+        Hugging Face GGUF reference Ollama accepts —
+        ``hf.co/<repo_id>:<quant>`` — from ``repo_id`` + ``quant``. Returns
+        ``""`` when neither is supplied so the caller can reject the request.
+        """
+        ref = str(frame.get("ref") or "").strip()
+        if ref:
+            return ref
+        repo_id = str(frame.get("repo_id") or "").strip()
+        quant = str(frame.get("quant") or "").strip()
+        if repo_id and quant:
+            return f"hf.co/{repo_id}:{quant}"
+        return ""
+
+    async def _seed_model_config(self, model: str, repo_id: str) -> int | None:
+        """Seed per-model config for a freshly-pulled model. Returns the
+        seeded context window (or ``None``).
+
+        Best-effort and non-fatal: when the ``ai_model_config`` capability is
+        absent, or reading the HF context window fails, the pull still
+        succeeds — we just store less (or nothing). The seed enables the model
+        (so it shows in the chat picker) and records a context window when one
+        can be read from HF metadata.
+        """
+        if self._per_model_config is None:
+            return None
+        context_window: int | None = None
+        if repo_id:
+            try:
+                context_window = await hf_catalog.fetch_context_window(repo_id, client=self._http)
+            except Exception:
+                logger.debug("context-window lookup failed for %s; leaving unset", repo_id)
+                context_window = None
+        try:
+            await self._per_model_config.set_model_config(
+                ModelConfig(
+                    backend=_RUNTIME_BACKEND,
+                    model=model,
+                    enabled=True,
+                    context_window=context_window,
+                )
+            )
+        except Exception:
+            logger.exception("seeding per-model config failed for %s", model)
+        return context_window
 
     async def _host_snapshot(self) -> HostResources | None:
         """Read the host-resources snapshot once, degrading to ``None``.
