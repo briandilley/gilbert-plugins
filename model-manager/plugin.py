@@ -28,8 +28,9 @@ class ModelManagerPlugin(Plugin):
             name="model-manager",
             version="1.0.0",
             description=(
-                "Local model manager — browse, fit-check, and pull local "
-                "models via Ollama. Skeleton: lists installed models."
+                "Local model manager — browse the Hugging Face GGUF catalog "
+                "(HF-native sort/search + a Recommended overlay) and list "
+                "installed models via Ollama."
             ),
             provides=["model_manager"],
             requires=["local_model_runtime"],
@@ -51,8 +52,8 @@ class ModelManagerPlugin(Plugin):
                 panel_id="model-manager.page",
                 label="Models",
                 description=(
-                    "Browse, fit-check, and pull local models via Ollama. "
-                    "Lists the models currently installed in the runtime."
+                    "Browse the Hugging Face GGUF catalog and list the "
+                    "models installed in the local runtime (Ollama)."
                 ),
                 icon="package",
                 required_role="admin",
