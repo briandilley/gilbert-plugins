@@ -18,10 +18,20 @@ export interface InstalledModelsResponse {
 
 // --- Hugging Face catalog browse (S6) ------------------------------------
 
-/** UI sort keys for the catalog Browse list. Mapped to Hugging Face's own
- *  ``sort`` fields server-side (``downloads``/``likes``/``trendingScore``/
- *  ``lastModified``). */
-export type CatalogSort = "downloads" | "likes" | "trending" | "recent";
+/** UI sort keys for the catalog Browse list.
+ *
+ *  The first four map to Hugging Face's own ``sort`` fields server-side
+ *  (``downloads``/``likes``/``trendingScore``/``lastModified``). ``powerful``
+ *  and ``smallest`` are **derived** — HF can't sort by parameter count, so the
+ *  server fetches a larger page by downloads and re-ranks it by ``params_b``
+ *  (the top matches, not all of HF). */
+export type CatalogSort =
+  | "downloads"
+  | "likes"
+  | "trending"
+  | "recent"
+  | "powerful"
+  | "smallest";
 
 /** One GGUF repo from the Hugging Face Hub catalog. Mirrors the backend
  *  ``CatalogModel`` serialized by ``model_manager.catalog.search``. */
@@ -36,6 +46,9 @@ export interface CatalogModel {
   last_modified: string | null;
   /** True iff the repo is in Gilbert's recommended overlay. */
   recommended: boolean;
+  /** Approximate parameter count in billions parsed from the id, or ``null``
+   *  when no recognizable token. Drives the param chip + size-class filter. */
+  params_b: number | null;
 }
 
 export interface CatalogSearchResponse {
@@ -62,6 +75,10 @@ export interface CatalogQuant {
   size_bytes: number | null;
   /** Hardware-fit verdict on the host where Ollama runs. */
   fit: FitVerdict;
+  /** True iff Ollama accepts this quant tag as a pull reference. A junk /
+   *  community tag (e.g. ``Q8_K_P``) is not pullable, so the Pull button is
+   *  disabled with an explanatory tooltip. */
+  pullable: boolean;
 }
 
 export interface CatalogQuantsResponse {

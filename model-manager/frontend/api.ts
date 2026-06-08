@@ -29,12 +29,18 @@ export function useModelManagerApi() {
         rpc<InstalledModelsResponse>({
           type: "model_manager.installed.list",
         }),
-      searchCatalog: (query: string, sort: CatalogSort, limit: number) =>
+      searchCatalog: (
+        query: string,
+        sort: CatalogSort,
+        limit: number,
+        recommendedOnly = false,
+      ) =>
         rpc<CatalogSearchResponse>({
           type: "model_manager.catalog.search",
           query,
           sort,
           limit,
+          recommended_only: recommendedOnly,
         }),
       listQuants: (modelId: string) =>
         rpc<CatalogQuantsResponse>({

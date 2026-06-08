@@ -5,8 +5,10 @@
  *  - **Installed** — the models currently installed in the local runtime
  *    (Ollama), read via ``model_manager.installed.list``.
  *  - **Browse** (S6) — search the Hugging Face Hub for GGUF models with
- *    HF-native sort, a "Recommended only" client-side filter, and a per-row
- *    expand that lists each quantization with its human-readable size
+ *    HF-native sort plus derived "Most powerful" / "Smallest" param re-ranks,
+ *    a server-sourced "Recommended only" overlay, a size-class quick filter,
+ *    a param chip per row, and a per-row expand that lists each quantization
+ *    with its human-readable size
  *    (``model_manager.catalog.search`` / ``model_manager.catalog.quants``).
  *  - **Hardware fit** (S7) — each quant carries a fit verdict (badge:
  *    fits-VRAM/fast, fits-RAM/slow, won't-fit, unknown), a host-summary line
@@ -181,7 +183,50 @@ const SORT_OPTIONS: { value: CatalogSort; label: string }[] = [
   { value: "likes", label: "Likes" },
   { value: "trending", label: "Trending" },
   { value: "recent", label: "Recent" },
+  // Derived re-ranks (not true HF sorts) — see the dropdown's note below.
+  { value: "powerful", label: "Most powerful" },
+  { value: "smallest", label: "Smallest" },
 ];
+
+/** A "derived" sort re-ranks the top matches by parameter count rather than
+ *  being a true Hub sort (HF can't sort by params). Used to surface an honest
+ *  caveat under the sort dropdown. */
+function isDerivedSort(sort: CatalogSort): boolean {
+  return sort === "powerful" || sort === "smallest";
+}
+
+// --- Size-class filter ----------------------------------------------------
+
+/** A parameter-size bucket the user can toggle (client-side over
+ *  ``params_b``). Composes with the Compatible filter (AND). */
+type SizeClass = "tiny" | "small" | "medium" | "large";
+
+const SIZE_CLASSES: { value: SizeClass; label: string; title: string }[] = [
+  { value: "tiny", label: "≤4B", title: "4 billion parameters or fewer" },
+  { value: "small", label: "7–9B", title: "7 to 9 billion parameters" },
+  { value: "medium", label: "13–34B", title: "13 to 34 billion parameters" },
+  { value: "large", label: "70B+", title: "70 billion parameters or more" },
+];
+
+/** Which size bucket a parameter count (in billions) falls into, or ``null``
+ *  when unknown (no recognizable token) — unknowns never match a bucket, so a
+ *  model with unknown params is hidden once any bucket is selected. */
+function sizeClassOf(paramsB: number | null): SizeClass | null {
+  if (paramsB === null || paramsB === undefined) return null;
+  if (paramsB <= 4) return "tiny";
+  if (paramsB < 13) return "small"; // 7–9B band (and anything 4<p<13)
+  if (paramsB < 70) return "medium"; // 13–34B band (and anything 13<=p<70)
+  return "large";
+}
+
+/** Human param chip text: ``~32B`` / ``~3.8B`` / ``~500M`` / ``~?``. */
+function paramChip(paramsB: number | null): string {
+  if (paramsB === null || paramsB === undefined) return "~?";
+  if (paramsB < 1) return `~${Math.round(paramsB * 1000)}M`;
+  // Whole numbers render without a decimal; ``3.8`` keeps one.
+  const v = Number.isInteger(paramsB) ? paramsB : Math.round(paramsB * 10) / 10;
+  return `~${v}B`;
+}
 
 export function ModelManagerPage() {
   const { connected } = useWebSocket();
@@ -320,6 +365,17 @@ function BrowseSection() {
   const [sort, setSort] = useState<CatalogSort>("downloads");
   const [recommendedOnly, setRecommendedOnly] = useState(false);
   const [compatibleOnly, setCompatibleOnly] = useState(false);
+  // Selected size-class buckets (client-side filter over params_b). Empty ⇒
+  // show all. Composes with Compatible (AND).
+  const [sizeClasses, setSizeClasses] = useState<Set<SizeClass>>(new Set());
+  const toggleSizeClass = useCallback((sc: SizeClass) => {
+    setSizeClasses((prev) => {
+      const next = new Set(prev);
+      if (next.has(sc)) next.delete(sc);
+      else next.add(sc);
+      return next;
+    });
+  }, []);
 
   // Best fit verdict per model, reported up by each CatalogRow once its
   // quants load. The "Compatible" filter reads this to hide models whose best
@@ -333,19 +389,27 @@ function BrowseSection() {
   }, []);
 
   const { data, isFetching, isError } = useQuery<CatalogSearchResponse>({
-    queryKey: ["model_manager", "catalog", submittedQuery, sort],
-    queryFn: () => api.searchCatalog(submittedQuery, sort, 25),
+    // recommendedOnly is part of the key so the server-sourced overlay and the
+    // generic results are cached separately.
+    queryKey: ["model_manager", "catalog", submittedQuery, sort, recommendedOnly],
+    queryFn: () => api.searchCatalog(submittedQuery, sort, 25, recommendedOnly),
     enabled: connected,
     staleTime: 60_000,
   });
 
   const all: CatalogModel[] = data?.models ?? [];
   const models = all.filter((m) => {
-    if (recommendedOnly && !m.recommended) return false;
     // Compatible filter: a FILTER, not a sort weight. Hide a model only once
     // we *know* its best loaded quant won't fit; unknown / not-yet-loaded
     // models stay visible so the user can still expand them.
     if (compatibleOnly && modelFit[m.id] === "wont-fit") return false;
+    // Size-class filter (client-side over params_b). Empty set ⇒ show all;
+    // otherwise the model's bucket must be one of the selected ones. A model
+    // with unknown params has no bucket, so it's hidden once any bucket is on.
+    if (sizeClasses.size > 0) {
+      const sc = sizeClassOf(m.params_b);
+      if (sc === null || !sizeClasses.has(sc)) return false;
+    }
     return true;
   });
 
@@ -416,6 +480,37 @@ function BrowseSection() {
             Recommended only
           </Label>
         </div>
+      </div>
+
+      {/* Size-class quick filter (client-side over params_b). Toggleable
+          buckets; none selected ⇒ show all. Composes with Compatible (AND). */}
+      <div className="mb-3 flex flex-wrap items-center gap-2">
+        <span className="text-xs text-muted-foreground">Size:</span>
+        {SIZE_CLASSES.map((sc) => {
+          const active = sizeClasses.has(sc.value);
+          return (
+            <button
+              key={sc.value}
+              type="button"
+              onClick={() => toggleSizeClass(sc.value)}
+              aria-pressed={active}
+              title={sc.title}
+              className={`rounded-full border px-2.5 py-0.5 text-xs font-medium transition-colors ${
+                active
+                  ? "border-primary bg-primary/10 text-primary"
+                  : "border-border bg-card text-muted-foreground hover:bg-muted"
+              }`}
+            >
+              {sc.label}
+            </button>
+          );
+        })}
+        {isDerivedSort(sort) && (
+          <span className="ml-auto text-[11px] text-muted-foreground">
+            “{sort === "powerful" ? "Most powerful" : "Smallest"}” re-ranks the
+            top matches by parameter count (HF has no params sort).
+          </span>
+        )}
       </div>
 
       {isError ? (
@@ -559,6 +654,16 @@ function CatalogRow({
             <ChevronRightIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
           )}
           <span className="font-mono text-sm truncate">{model.id}</span>
+          <span
+            className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground tabular-nums"
+            title={
+              model.params_b !== null
+                ? `≈${model.params_b}B parameters (parsed from the repo id)`
+                : "Parameter count unknown — no recognizable token in the repo id."
+            }
+          >
+            {paramChip(model.params_b)}
+          </span>
           {model.recommended && (
             <Badge variant="success" className="shrink-0 gap-1">
               <StarIcon className="h-3 w-3" />
@@ -634,7 +739,9 @@ function CatalogRow({
  * Installed section refetches and the model appears there (and in chat).
  *
  * Ollama's ``hf.co/<repo>:<quant>`` ref needs a quant label, so the button is
- * disabled for a gguf whose filename has no recognizable quant marker. */
+ * disabled for a gguf whose filename has no recognizable quant marker — and
+ * also for a quant whose tag Ollama doesn't recognize (``pullable === false``,
+ * e.g. a community ``Q8_K_P``), which would otherwise 400. */
 function PullButton({ repoId, quant }: { repoId: string; quant: CatalogQuant }) {
   const api = useModelManagerApi();
   const queryClient = useQueryClient();
@@ -653,6 +760,20 @@ function PullButton({ repoId, quant }: { repoId: string; quant: CatalogQuant }) 
         className="h-6 px-2 text-[11px]"
         disabled
         title="No quantization label — can't build an Ollama pull reference."
+      >
+        <DownloadCloudIcon className="h-3 w-3" />
+      </Button>
+    );
+  }
+
+  if (!quant.pullable) {
+    return (
+      <Button
+        variant="outline"
+        size="sm"
+        className="h-6 px-2 text-[11px]"
+        disabled
+        title="Ollama doesn't support this quantization tag — try a standard quant (Q4_K_M, Q8_0…)."
       >
         <DownloadCloudIcon className="h-3 w-3" />
       </Button>

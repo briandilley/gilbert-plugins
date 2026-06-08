@@ -162,6 +162,23 @@ async def test_list_quants_filters_to_gguf_and_parses() -> None:
     ]
     assert [q.quant_label for q in quants] == ["Q4_K_M", "Q8_0"]
     assert [q.size_bytes for q in quants] == [42_000_000_000, 75_000_000_000]
+    # Both are standard Ollama-recognized quant tags → pullable.
+    assert all(q.pullable for q in quants)
+
+
+@pytest.mark.asyncio
+async def test_list_quants_marks_junk_quant_not_pullable() -> None:
+    payload = {
+        "siblings": [
+            {"rfilename": "model-Q8_K_P.gguf", "size": 10},  # community/junk tag
+            {"rfilename": "model-Q4_K_M.gguf", "size": 20},
+        ]
+    }
+    client = _fake_client(payload)
+    quants = await list_quants("owner/Repo-GGUF", client=client)
+    by_label = {q.quant_label: q for q in quants}
+    assert by_label["Q8_K_P"].pullable is False
+    assert by_label["Q4_K_M"].pullable is True
 
 
 @pytest.mark.asyncio

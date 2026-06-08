@@ -93,6 +93,39 @@ def _is_remote_base_url(base_url: str) -> bool:
     return host.lower() not in _LOCAL_HOSTS
 
 
+# Substrings that mark a pull failure as *expected* (operator-actionable, not a
+# bug): an HTTP 4xx, a manifest problem, a missing repo, or a quantization
+# complaint from Ollama. These get a WARNING (no traceback); everything else
+# keeps the full ``logger.exception`` trace. Matched case-insensitively.
+_EXPECTED_PULL_FAILURE_MARKERS = (
+    "manifest",
+    "quantization",
+    "not found",
+    "404",
+    "400",
+    "401",
+    "403",
+    "not a valid",
+)
+
+
+def _is_expected_pull_failure(exc: Exception) -> bool:
+    """True iff ``exc`` looks like an expected, operator-actionable pull
+    failure (4xx / manifest / not-found / quantization) rather than a bug."""
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _EXPECTED_PULL_FAILURE_MARKERS)
+
+
+def _clean_pull_error(exc: Exception) -> str:
+    """Return a single-line, bounded error message for a failed pull.
+
+    Collapses whitespace and truncates so a verbose multi-line daemon error
+    (or a streamed manifest dump) doesn't flood the UI toast.
+    """
+    msg = " ".join(str(exc).split())
+    return msg[:300] if msg else exc.__class__.__name__
+
+
 class ModelManagerService(Service):
     """Drives the in-app local-model manager.
 
@@ -278,8 +311,14 @@ class ModelManagerService(Service):
         query = str(frame.get("query") or "")
         sort = str(frame.get("sort") or _DEFAULT_SEARCH_SORT)
         limit = self._coerce_limit(frame.get("limit"))
+        # ``recommended_only`` sources the curated overlay server-side (the old
+        # client-side post-filter over a generic page almost never surfaced the
+        # ~10 curated repos, so it returned empty).
+        recommended_only = bool(frame.get("recommended_only", False))
         try:
-            models = await hf_catalog.search(query, sort, limit, client=self._http)
+            models = await hf_catalog.search(
+                query, sort, limit, recommended_only=recommended_only, client=self._http
+            )
         except Exception as exc:
             logger.exception("model_manager.catalog.search failed")
             return {
@@ -298,6 +337,7 @@ class ModelManagerService(Service):
                     "likes": m.likes,
                     "last_modified": m.last_modified,
                     "recommended": m.recommended,
+                    "params_b": m.params_b,
                 }
                 for m in models
             ],
@@ -349,6 +389,7 @@ class ModelManagerService(Service):
                     "quant_label": q.quant_label,
                     "size_bytes": q.size_bytes,
                     "fit": verdict,
+                    "pullable": q.pullable,
                 }
             )
         return {
@@ -429,16 +470,25 @@ class ModelManagerService(Service):
                 "error": "ref (or repo_id + quant) is required",
                 "code": 400,
             }
-        try:
-            await self._runtime.pull_model(ref)
-        except Exception as exc:
-            logger.exception("model_manager.pull failed for %s", ref)
+        # Pre-flight: a junk/community quant tag (e.g. ``Q8_K_P``) 400s in
+        # Ollama with "not a valid quantization scheme". Reject it cleanly here
+        # — never hand it to the runtime, never surface a traceback.
+        quant_tag = self._pull_quant(frame, ref)
+        if quant_tag and not hf_catalog.is_pullable_quant(quant_tag):
             return {
                 "type": "gilbert.error",
                 "ref": frame.get("id"),
-                "error": f"pull failed: {exc}",
-                "code": 502,
+                "error": (
+                    f"Ollama can't pull quantization '{quant_tag}' — it's not a "
+                    "recognized scheme. Try a standard quant (e.g. Q4_K_M, Q8_0) "
+                    "or a different repo."
+                ),
+                "code": 400,
             }
+        try:
+            await self._runtime.pull_model(ref)
+        except Exception as exc:
+            return self._pull_error_response(frame, ref, exc)
         # The installed tag is the ref Ollama now serves chat requests under
         # (``hf.co/<repo>:<quant>``). Seed per-model config so it's enabled
         # and carries a sensible context window.
@@ -510,6 +560,49 @@ class ModelManagerService(Service):
         if repo_id and quant:
             return f"hf.co/{repo_id}:{quant}"
         return ""
+
+    @staticmethod
+    def _pull_quant(frame: dict[str, Any], ref: str) -> str:
+        """Extract the quant tag the pull will use, for pre-flight validation.
+
+        Prefers an explicit ``quant`` field; otherwise reads the tag after the
+        final ``:`` in the resolved ref (``hf.co/<repo>:<tag>``). Returns ``""``
+        when no tag is present (a bare registry ref like ``llama3.3`` has none —
+        nothing to validate, so the pull proceeds).
+        """
+        quant = str(frame.get("quant") or "").strip()
+        if quant:
+            return quant
+        # ``hf.co/<repo>:<tag>`` — the tag is whatever follows the last colon,
+        # but only when that colon is part of the path tail (after the host).
+        if ":" in ref:
+            tail = ref.rsplit("/", 1)[-1]
+            if ":" in tail:
+                return tail.rsplit(":", 1)[-1].strip()
+        return ""
+
+    def _pull_error_response(
+        self, frame: dict[str, Any], ref: str, exc: Exception
+    ) -> dict[str, Any]:
+        """Build the ``gilbert.error`` for a failed pull, logging proportionate
+        to how expected the failure is.
+
+        An *expected* pull failure — a 4xx, a manifest error, a "not found", or
+        a "quantization" complaint from Ollama — is operator-actionable, not a
+        bug: log it at WARNING (no traceback) and return a cleaned message.
+        Anything else is genuinely unexpected, so keep the full
+        ``logger.exception`` traceback for debugging.
+        """
+        if _is_expected_pull_failure(exc):
+            logger.warning("model_manager.pull failed for %s: %s", ref, exc)
+        else:
+            logger.exception("model_manager.pull failed for %s", ref)
+        return {
+            "type": "gilbert.error",
+            "ref": frame.get("id"),
+            "error": f"pull failed: {_clean_pull_error(exc)}",
+            "code": 502,
+        }
 
     async def _seed_model_config(self, model: str, repo_id: str) -> int | None:
         """Seed per-model config for a freshly-pulled model. Returns the
