@@ -79,6 +79,7 @@ async def test_catalog_search_returns_serialized_results(
                 likes=67,
                 last_modified="2026-01-02T03:04:05.000Z",
                 recommended=True,
+                params_b=70.0,
             ),
             CatalogModel(
                 id="someone/Random-GGUF",
@@ -86,6 +87,7 @@ async def test_catalog_search_returns_serialized_results(
                 likes=0,
                 last_modified=None,
                 recommended=False,
+                params_b=None,
             ),
         ]
 
@@ -106,6 +108,7 @@ async def test_catalog_search_returns_serialized_results(
             "likes": 67,
             "last_modified": "2026-01-02T03:04:05.000Z",
             "recommended": True,
+            "params_b": 70.0,
         },
         {
             "id": "someone/Random-GGUF",
@@ -113,6 +116,7 @@ async def test_catalog_search_returns_serialized_results(
             "likes": 0,
             "last_modified": None,
             "recommended": False,
+            "params_b": None,
         },
     ]
 
@@ -131,6 +135,63 @@ async def test_catalog_search_defaults_args(svc: Any, monkeypatch: pytest.Monkey
     assert captured["query"] == ""
     assert captured["sort"] == "downloads"
     assert isinstance(captured["limit"], int) and captured["limit"] > 0
+
+
+@pytest.mark.asyncio
+async def test_catalog_search_passes_recommended_only_flag(
+    svc: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The RPC forwards ``recommended_only`` to the catalog client so the
+    overlay is sourced server-side (S9 fix), not post-filtered client-side."""
+    captured: dict[str, Any] = {}
+
+    async def fake_search(
+        query: str, sort: str, limit: int, *, recommended_only: bool = False, **kw: Any
+    ) -> list[CatalogModel]:
+        captured["recommended_only"] = recommended_only
+        return []
+
+    monkeypatch.setattr(hf_catalog, "search", fake_search)
+    await svc._ws_catalog_search(_Conn(0), {"id": "req-r", "query": "", "recommended_only": True})
+    assert captured["recommended_only"] is True
+
+
+@pytest.mark.asyncio
+async def test_catalog_search_recommended_only_defaults_false(
+    svc: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, Any] = {}
+
+    async def fake_search(
+        query: str, sort: str, limit: int, *, recommended_only: bool = False, **kw: Any
+    ) -> list[CatalogModel]:
+        captured["recommended_only"] = recommended_only
+        return []
+
+    monkeypatch.setattr(hf_catalog, "search", fake_search)
+    await svc._ws_catalog_search(_Conn(0), {"id": "req-r2"})
+    assert captured["recommended_only"] is False
+
+
+@pytest.mark.asyncio
+async def test_catalog_search_serializes_params_b(
+    svc: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def fake_search(query: str, sort: str, limit: int, **kw: Any) -> list[CatalogModel]:
+        return [
+            CatalogModel(
+                id="owner/Big-70B-GGUF",
+                downloads=1,
+                likes=0,
+                last_modified=None,
+                recommended=False,
+                params_b=70.0,
+            ),
+        ]
+
+    monkeypatch.setattr(hf_catalog, "search", fake_search)
+    resp = await svc._ws_catalog_search(_Conn(0), {"id": "req-p", "query": "x"})
+    assert resp["models"][0]["params_b"] == 70.0
 
 
 @pytest.mark.asyncio
@@ -164,8 +225,18 @@ async def test_catalog_quants_returns_serialized_quants(
     async def fake_quants(model_id: str, **kw: Any) -> list[Quant]:
         captured["model_id"] = model_id
         return [
-            Quant(filename="m-Q4_K_M.gguf", quant_label="Q4_K_M", size_bytes=42_000_000_000),
-            Quant(filename="m-Q8_0.gguf", quant_label="Q8_0", size_bytes=None),
+            Quant(
+                filename="m-Q4_K_M.gguf",
+                quant_label="Q4_K_M",
+                size_bytes=42_000_000_000,
+                pullable=True,
+            ),
+            Quant(
+                filename="m-Q8_K_P.gguf",
+                quant_label="Q8_K_P",
+                size_bytes=None,
+                pullable=False,
+            ),
         ]
 
     monkeypatch.setattr(hf_catalog, "list_quants", fake_quants)
@@ -178,19 +249,22 @@ async def test_catalog_quants_returns_serialized_quants(
     assert resp["model_id"] == "owner/Repo-GGUF"
     # No host_resources capability is wired in this fixture, so every quant's
     # fit verdict is "unknown" (the per-tier verdicts are covered in
-    # test_host_fit_rpcs.py / test_fit.py). The S6 fields are still present.
+    # test_host_fit_rpcs.py / test_fit.py). The S6 fields are still present,
+    # plus the S9 ``pullable`` flag (Q8_K_P is junk → not pullable).
     assert resp["quants"] == [
         {
             "filename": "m-Q4_K_M.gguf",
             "quant_label": "Q4_K_M",
             "size_bytes": 42_000_000_000,
             "fit": "unknown",
+            "pullable": True,
         },
         {
-            "filename": "m-Q8_0.gguf",
-            "quant_label": "Q8_0",
+            "filename": "m-Q8_K_P.gguf",
+            "quant_label": "Q8_K_P",
             "size_bytes": None,
             "fit": "unknown",
+            "pullable": False,
         },
     ]
 

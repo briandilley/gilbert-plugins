@@ -85,7 +85,7 @@ RECOMMENDED_MODELS: tuple[RecommendedModel, ...] = (
         description="Mistral's 12B instruct model, Apache 2.0, strong tool use.",
     ),
     RecommendedModel(
-        repo_id="bartowski/Phi-4-GGUF",
+        repo_id="bartowski/phi-4-GGUF",
         name="Phi-4",
         description="Microsoft's compact reasoning model — punches above its size.",
     ),

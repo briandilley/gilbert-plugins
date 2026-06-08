@@ -229,13 +229,154 @@ async def test_pull_context_window_none_when_metadata_unavailable(
 
 
 @pytest.mark.asyncio
-async def test_pull_surfaces_runtime_failure() -> None:
+async def test_pull_surfaces_runtime_failure(caplog: pytest.LogCaptureFixture) -> None:
     runtime = _ExplodingRuntime()
     svc = await _start(runtime, _FakePerModelConfig())
     resp = await svc._ws_pull(_Conn(0), {"id": "p5", "ref": "hf.co/owner/Repo:Q4_K_M"})
     assert resp["type"] == "gilbert.error"
     assert resp["code"] == 502
     assert "pull access denied" in resp["error"]
+    await svc.stop()
+
+
+# --- S9: pre-flight quant validation (the Q8_K_P traceback fix) -----------
+
+
+@pytest.mark.asyncio
+async def test_pull_rejects_unrecognized_quant_without_calling_runtime() -> None:
+    """A junk quant tag (``Q8_K_P``) is rejected with a clean 400 BEFORE the
+    runtime is touched — no Ollama 400 traceback."""
+    runtime = _FakeRuntime()
+    svc = await _start(runtime, _FakePerModelConfig())
+    resp = await svc._ws_pull(
+        _Conn(0),
+        {"id": "p8", "repo_id": "owner/Repo-GGUF", "quant": "Q8_K_P"},
+    )
+    assert resp["type"] == "gilbert.error"
+    assert resp["code"] == 400
+    assert "Q8_K_P" in resp["error"]
+    assert "Q4_K_M" in resp["error"]  # actionable suggestion
+    # The runtime was never driven.
+    assert runtime.pulled == []
+    await svc.stop()
+
+
+@pytest.mark.asyncio
+async def test_pull_rejects_unrecognized_quant_in_prebuilt_ref() -> None:
+    """The quant is extracted from a pre-built ``hf.co/<repo>:<tag>`` ref and
+    validated too, not just the ``quant`` field."""
+    runtime = _FakeRuntime()
+    svc = await _start(runtime, _FakePerModelConfig())
+    resp = await svc._ws_pull(
+        _Conn(0),
+        {"id": "p9", "ref": "hf.co/owner/Repo-GGUF:Q8_K_P"},
+    )
+    assert resp["type"] == "gilbert.error"
+    assert resp["code"] == 400
+    assert runtime.pulled == []
+    await svc.stop()
+
+
+@pytest.mark.asyncio
+async def test_pull_accepts_standard_quant(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A recognized quant passes validation and reaches the runtime."""
+    runtime = _FakeRuntime()
+    svc = await _start(runtime, _FakePerModelConfig())
+
+    async def _ctx(model_id: str, **kw: Any) -> int | None:
+        return None
+
+    monkeypatch.setattr(hf_catalog, "fetch_context_window", _ctx)
+
+    resp = await svc._ws_pull(
+        _Conn(0),
+        {"id": "p10", "repo_id": "owner/Repo-GGUF", "quant": "Q4_K_M"},
+    )
+    assert resp["type"] == "model_manager.pull.result"
+    assert runtime.pulled == ["hf.co/owner/Repo-GGUF:Q4_K_M"]
+    await svc.stop()
+
+
+# --- S9: graceful pull failures (no traceback for expected 4xx) ------------
+
+
+class _ManifestErrorRuntime(_FakeRuntime):
+    async def pull_model(self, ref: str) -> None:
+        raise RuntimeError(
+            "Ollama pull failed (400): pull model manifest: 400 not a valid quantization scheme"
+        )
+
+
+class _NotFoundRuntime(_FakeRuntime):
+    async def pull_model(self, ref: str) -> None:
+        raise RuntimeError("Ollama pull failed (404): repository not found")
+
+
+class _UnexpectedRuntime(_FakeRuntime):
+    async def pull_model(self, ref: str) -> None:
+        raise RuntimeError("kernel panic: totally unexpected explosion")
+
+
+@pytest.mark.asyncio
+async def test_pull_expected_failure_logs_warning_not_exception(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An expected pull failure (manifest / 4xx / quantization) logs at WARNING
+    with no exception traceback, and returns a clean ``gilbert.error``."""
+    import logging
+
+    svc = await _start(_ManifestErrorRuntime(), _FakePerModelConfig())
+    with caplog.at_level(logging.DEBUG):
+        resp = await svc._ws_pull(
+            _Conn(0),
+            {"id": "p11", "ref": "hf.co/owner/Repo-GGUF:Q4_K_M"},
+        )
+    assert resp["type"] == "gilbert.error"
+    assert resp["code"] == 502
+    # No exception-level record (logger.exception emits ERROR with exc_info).
+    assert not any(rec.levelno >= logging.ERROR and rec.exc_info for rec in caplog.records), (
+        "expected pull failures must not log a traceback"
+    )
+    # It did log at warning so operators still see it.
+    assert any(rec.levelno == logging.WARNING for rec in caplog.records)
+    await svc.stop()
+
+
+@pytest.mark.asyncio
+async def test_pull_not_found_failure_is_graceful(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+
+    svc = await _start(_NotFoundRuntime(), _FakePerModelConfig())
+    with caplog.at_level(logging.DEBUG):
+        resp = await svc._ws_pull(
+            _Conn(0),
+            {"id": "p12", "ref": "hf.co/owner/Missing-GGUF:Q4_K_M"},
+        )
+    assert resp["type"] == "gilbert.error"
+    assert not any(rec.exc_info for rec in caplog.records)
+    await svc.stop()
+
+
+@pytest.mark.asyncio
+async def test_pull_unexpected_failure_still_logs_exception(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A genuinely unexpected error keeps the full ``logger.exception`` trace —
+    we only suppress tracebacks for *expected* 4xx/manifest/quant failures."""
+    import logging
+
+    svc = await _start(_UnexpectedRuntime(), _FakePerModelConfig())
+    with caplog.at_level(logging.DEBUG):
+        resp = await svc._ws_pull(
+            _Conn(0),
+            {"id": "p13", "ref": "hf.co/owner/Repo-GGUF:Q4_K_M"},
+        )
+    assert resp["type"] == "gilbert.error"
+    assert resp["code"] == 502
+    # Unexpected → traceback preserved.
+    assert any(rec.exc_info for rec in caplog.records)
     await svc.stop()
 
 
