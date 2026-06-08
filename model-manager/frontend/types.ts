@@ -42,8 +42,17 @@ export interface CatalogSearchResponse {
   models: CatalogModel[];
 }
 
+/** Hardware-fit verdict for a quant on the host where Ollama runs. Stable
+ *  wire values from the manager's fit policy (``fit.py``):
+ *  - ``"fits-vram"`` — fully on GPU (fast).
+ *  - ``"fits-ram"``  — CPU / partial offload (slow).
+ *  - ``"wont-fit"``  — exceeds both VRAM and RAM.
+ *  - ``"unknown"``   — remote Ollama, or no host-resources data. */
+export type FitVerdict = "fits-vram" | "fits-ram" | "wont-fit" | "unknown";
+
 /** One ``*.gguf`` quantization of a repo. Mirrors the backend ``Quant``
- *  serialized by ``model_manager.catalog.quants``. */
+ *  serialized by ``model_manager.catalog.quants`` (with the S7 ``fit``
+ *  field attached). */
 export interface CatalogQuant {
   /** File path within the repo. */
   filename: string;
@@ -51,9 +60,34 @@ export interface CatalogQuant {
   quant_label: string | null;
   /** File size in bytes, or ``null`` when HF doesn't report it. */
   size_bytes: number | null;
+  /** Hardware-fit verdict on the host where Ollama runs. */
+  fit: FitVerdict;
 }
 
 export interface CatalogQuantsResponse {
   model_id: string;
   quants: CatalogQuant[];
+}
+
+// --- Host resources (S7) -------------------------------------------------
+
+/** One GPU on the host. Mirrors the backend ``GPUInfo``. */
+export interface HostGpu {
+  /** GPU name (e.g. ``"NVIDIA GeForce RTX 4090"``). */
+  name: string;
+  /** Total VRAM in bytes, or ``null`` when it couldn't be determined. */
+  total_vram_bytes: number | null;
+}
+
+/** Host summary for the fit line + "unknown" explainer. Mirrors the frame
+ *  serialized by ``model_manager.host.resources``. */
+export interface HostResourcesResponse {
+  /** Total system RAM in bytes, or ``null`` when host data is unavailable. */
+  total_ram_bytes: number | null;
+  /** Available system RAM in bytes, or ``null`` when unavailable. */
+  available_ram_bytes: number | null;
+  /** Detected GPUs (empty when none detected or host data unavailable). */
+  gpus: HostGpu[];
+  /** True when Ollama's ``base_url`` is off-box ⇒ every fit is "unknown". */
+  remote: boolean;
 }
