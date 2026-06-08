@@ -8,15 +8,18 @@
  *    HF-native sort, a "Recommended only" client-side filter, and a per-row
  *    expand that lists each quantization with its human-readable size
  *    (``model_manager.catalog.search`` / ``model_manager.catalog.quants``).
+ *  - **Hardware fit** (S7) — each quant carries a fit verdict (badge:
+ *    fits-VRAM/fast, fits-RAM/slow, won't-fit, unknown), a host-summary line
+ *    explains the host, and a "Compatible" toggle filters out quants — and
+ *    models whose best loaded quant won't fit — without reordering anything.
  *
- * The hardware "Compatible" fit filter and one-click pull are later slices;
- * Browse shows all models by default.
+ * One-click pull is a later slice; Browse shows all models by default.
  *
  * The route itself is gated on the ``model_manager`` capability in
  * plugin.py, so this page only mounts when the manager is running.
  */
 
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useWebSocket } from "@/hooks/useWebSocket";
 import { PluginPanelSlot } from "@/components/PluginPanelSlot";
@@ -41,6 +44,12 @@ import {
   ChevronDownIcon,
   DownloadIcon,
   HeartIcon,
+  ZapIcon,
+  CpuIcon,
+  XCircleIcon,
+  HelpCircleIcon,
+  MemoryStickIcon,
+  ServerIcon,
 } from "lucide-react";
 import { useModelManagerApi } from "./api";
 import type {
@@ -49,6 +58,8 @@ import type {
   CatalogQuantsResponse,
   CatalogSearchResponse,
   CatalogSort,
+  FitVerdict,
+  HostResourcesResponse,
   InstalledModel,
   InstalledModelsResponse,
 } from "./types";
@@ -74,6 +85,83 @@ function compactCount(n: number): string {
   if (n >= 1_000_000) return `${Math.round(n / 100_000) / 10}M`;
   if (n >= 1_000) return `${Math.round(n / 100) / 10}K`;
   return `${n}`;
+}
+
+// --- Hardware fit ---------------------------------------------------------
+
+/** Best-to-worst ordering of fit verdicts. Mirrors ``_VERDICT_RANK`` in the
+ *  backend ``fit.py`` so the UI's model-level aggregation matches the policy. */
+const FIT_RANK: Record<FitVerdict, number> = {
+  "fits-vram": 0,
+  "fits-ram": 1,
+  "wont-fit": 2,
+  unknown: 3,
+};
+
+/** Reduce a model's per-quant verdicts to its single best-case verdict — a
+ *  model is as compatible as its best-fitting quant. Mirrors the backend
+ *  ``model_best_fit``. Empty (no quants loaded yet) ⇒ "unknown". */
+function bestFit(verdicts: FitVerdict[]): FitVerdict {
+  let best: FitVerdict = "unknown";
+  for (const v of verdicts) {
+    if (FIT_RANK[v] < FIT_RANK[best]) best = v;
+  }
+  return best;
+}
+
+const FIT_META: Record<
+  FitVerdict,
+  {
+    label: string;
+    title: string;
+    Icon: typeof ZapIcon;
+    className: string;
+  }
+> = {
+  "fits-vram": {
+    label: "Fits VRAM",
+    title: "Fits in GPU VRAM — runs fully on GPU (fast).",
+    Icon: ZapIcon,
+    className:
+      "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
+  },
+  "fits-ram": {
+    label: "Fits RAM",
+    title: "Fits in system RAM — runs on CPU or partial offload (slower).",
+    Icon: CpuIcon,
+    className:
+      "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300",
+  },
+  "wont-fit": {
+    label: "Won't fit",
+    title: "Exceeds both VRAM and available RAM — won't load on this host.",
+    Icon: XCircleIcon,
+    className:
+      "border-rose-500/40 bg-rose-500/10 text-rose-700 dark:text-rose-300",
+  },
+  unknown: {
+    label: "Unknown",
+    title:
+      "Fit unknown — Ollama runs remotely, or host resources are unavailable.",
+    Icon: HelpCircleIcon,
+    className: "border-border bg-muted text-muted-foreground",
+  },
+};
+
+/** Per-quant fit badge: green/fast (VRAM), amber/slow (RAM), red (won't fit),
+ *  neutral (unknown). */
+function FitBadge({ fit }: { fit: FitVerdict }) {
+  const meta = FIT_META[fit] ?? FIT_META.unknown;
+  const { Icon } = meta;
+  return (
+    <span
+      title={meta.title}
+      className={`inline-flex shrink-0 items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] font-medium ${meta.className}`}
+    >
+      <Icon className="h-3 w-3" />
+      {meta.label}
+    </span>
+  );
 }
 
 const SORT_OPTIONS: { value: CatalogSort; label: string }[] = [
@@ -176,6 +264,18 @@ function BrowseSection() {
   const [submittedQuery, setSubmittedQuery] = useState("");
   const [sort, setSort] = useState<CatalogSort>("downloads");
   const [recommendedOnly, setRecommendedOnly] = useState(false);
+  const [compatibleOnly, setCompatibleOnly] = useState(false);
+
+  // Best fit verdict per model, reported up by each CatalogRow once its
+  // quants load. The "Compatible" filter reads this to hide models whose best
+  // loaded quant won't fit. Honest caveat: a model's fit is only known after
+  // its row has been expanded (quants are fetched lazily), so list-level
+  // filtering can only act on already-loaded models — never-expanded models
+  // stay visible. Per-quant filtering inside an expanded row is exact.
+  const [modelFit, setModelFit] = useState<Record<string, FitVerdict>>({});
+  const reportFit = useCallback((modelId: string, fit: FitVerdict) => {
+    setModelFit((prev) => (prev[modelId] === fit ? prev : { ...prev, [modelId]: fit }));
+  }, []);
 
   const { data, isFetching, isError } = useQuery<CatalogSearchResponse>({
     queryKey: ["model_manager", "catalog", submittedQuery, sort],
@@ -185,13 +285,22 @@ function BrowseSection() {
   });
 
   const all: CatalogModel[] = data?.models ?? [];
-  const models = recommendedOnly ? all.filter((m) => m.recommended) : all;
+  const models = all.filter((m) => {
+    if (recommendedOnly && !m.recommended) return false;
+    // Compatible filter: a FILTER, not a sort weight. Hide a model only once
+    // we *know* its best loaded quant won't fit; unknown / not-yet-loaded
+    // models stay visible so the user can still expand them.
+    if (compatibleOnly && modelFit[m.id] === "wont-fit") return false;
+    return true;
+  });
 
   return (
     <section>
       <h2 className="text-sm font-semibold text-foreground/80 mb-2">
         Browse Hugging Face
       </h2>
+
+      <HostSummary hostResources={api.hostResources} />
 
       <div className="flex flex-wrap items-center gap-2 mb-3">
         <form
@@ -226,6 +335,21 @@ function BrowseSection() {
 
         <div className="flex items-center gap-2">
           <Switch
+            id="compatible-only"
+            checked={compatibleOnly}
+            onCheckedChange={setCompatibleOnly}
+          />
+          <Label
+            htmlFor="compatible-only"
+            className="text-xs text-muted-foreground whitespace-nowrap"
+            title="Hide quantizations (and models) that won't run on this host."
+          >
+            Compatible
+          </Label>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <Switch
             id="recommended-only"
             checked={recommendedOnly}
             onCheckedChange={setRecommendedOnly}
@@ -248,7 +372,13 @@ function BrowseSection() {
       ) : (
         <ul className="divide-y rounded-lg border bg-card">
           {models.map((model) => (
-            <CatalogRow key={model.id} model={model} listQuants={api.listQuants} />
+            <CatalogRow
+              key={model.id}
+              model={model}
+              listQuants={api.listQuants}
+              compatibleOnly={compatibleOnly}
+              onFitResolved={reportFit}
+            />
           ))}
         </ul>
       )}
@@ -256,12 +386,83 @@ function BrowseSection() {
   );
 }
 
+/** A one-line host summary above the Browse list: RAM + GPU/VRAM, or a
+ *  "remote Ollama — fit unknown" note. Explains why fit verdicts read the way
+ *  they do. Silently renders nothing while loading or on error — it's an
+ *  affordance, not load-bearing. */
+function HostSummary({
+  hostResources,
+}: {
+  hostResources: () => Promise<HostResourcesResponse>;
+}) {
+  const { connected } = useWebSocket();
+  const { data } = useQuery<HostResourcesResponse>({
+    queryKey: ["model_manager", "host", "resources"],
+    queryFn: hostResources,
+    enabled: connected,
+    staleTime: 60_000,
+  });
+
+  if (!data) return null;
+
+  if (data.remote) {
+    return (
+      <p className="mb-3 flex items-center gap-1.5 text-xs text-muted-foreground">
+        <ServerIcon className="h-3.5 w-3.5" />
+        Remote Ollama — hardware fit is unknown (only the local host can be
+        probed).
+      </p>
+    );
+  }
+
+  const ram =
+    data.available_ram_bytes !== null && data.total_ram_bytes !== null
+      ? `${humanSize(data.available_ram_bytes)} free of ${humanSize(data.total_ram_bytes)} RAM`
+      : null;
+  const gpu =
+    data.gpus.length > 0
+      ? data.gpus
+          .map((g) =>
+            g.total_vram_bytes !== null
+              ? `${g.name} (${humanSize(g.total_vram_bytes)} VRAM)`
+              : `${g.name} (VRAM unknown)`,
+          )
+          .join(", ")
+      : "no GPU detected";
+
+  if (ram === null) {
+    return (
+      <p className="mb-3 flex items-center gap-1.5 text-xs text-muted-foreground">
+        <HelpCircleIcon className="h-3.5 w-3.5" />
+        Host resources unavailable — hardware fit is unknown.
+      </p>
+    );
+  }
+
+  return (
+    <p className="mb-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
+      <span className="flex items-center gap-1.5">
+        <MemoryStickIcon className="h-3.5 w-3.5" />
+        {ram}
+      </span>
+      <span className="flex items-center gap-1.5">
+        <CpuIcon className="h-3.5 w-3.5" />
+        {gpu}
+      </span>
+    </p>
+  );
+}
+
 function CatalogRow({
   model,
   listQuants,
+  compatibleOnly,
+  onFitResolved,
 }: {
   model: CatalogModel;
   listQuants: (modelId: string) => Promise<CatalogQuantsResponse>;
+  compatibleOnly: boolean;
+  onFitResolved: (modelId: string, fit: FitVerdict) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
 
@@ -273,6 +474,20 @@ function CatalogRow({
   });
 
   const quants: CatalogQuant[] = data?.quants ?? [];
+
+  // Report this model's best-case fit up to BrowseSection so the Compatible
+  // filter can act on it. Runs once quants are loaded for the row.
+  useEffect(() => {
+    if (data) onFitResolved(model.id, bestFit(quants.map((q) => q.fit)));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [data]);
+
+  // When Compatible is on, drop the quants that won't fit — but keep unknown
+  // ones (we can't honestly rule them out). Filtering happens inside the
+  // expanded row; list-level filtering is in BrowseSection.
+  const shownQuants = compatibleOnly
+    ? quants.filter((q) => q.fit !== "wont-fit")
+    : quants;
 
   return (
     <li className="px-4 py-3">
@@ -322,9 +537,14 @@ function CatalogRow({
             <p className="px-2 py-1 text-xs text-muted-foreground">
               No GGUF files found in this repo.
             </p>
+          ) : shownQuants.length === 0 ? (
+            <p className="px-2 py-1 text-xs text-muted-foreground">
+              No compatible quantizations — turn off “Compatible” to see all{" "}
+              {quants.length}.
+            </p>
           ) : (
             <ul className="divide-y divide-border/60">
-              {quants.map((q) => (
+              {shownQuants.map((q) => (
                 <li
                   key={q.filename}
                   className="flex items-center justify-between gap-3 px-2 py-1.5"
@@ -332,9 +552,12 @@ function CatalogRow({
                   <span className="font-mono text-xs truncate">
                     {q.quant_label ?? q.filename}
                   </span>
-                  <span className="shrink-0 text-xs text-muted-foreground tabular-nums">
-                    {humanSize(q.size_bytes)}
-                  </span>
+                  <div className="flex shrink-0 items-center gap-2">
+                    <FitBadge fit={q.fit} />
+                    <span className="text-xs text-muted-foreground tabular-nums">
+                      {humanSize(q.size_bytes)}
+                    </span>
+                  </div>
                 </li>
               ))}
             </ul>

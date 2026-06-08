@@ -176,9 +176,22 @@ async def test_catalog_quants_returns_serialized_quants(
     assert resp["ref"] == "req-5"
     assert captured["model_id"] == "owner/Repo-GGUF"
     assert resp["model_id"] == "owner/Repo-GGUF"
+    # No host_resources capability is wired in this fixture, so every quant's
+    # fit verdict is "unknown" (the per-tier verdicts are covered in
+    # test_host_fit_rpcs.py / test_fit.py). The S6 fields are still present.
     assert resp["quants"] == [
-        {"filename": "m-Q4_K_M.gguf", "quant_label": "Q4_K_M", "size_bytes": 42_000_000_000},
-        {"filename": "m-Q8_0.gguf", "quant_label": "Q8_0", "size_bytes": None},
+        {
+            "filename": "m-Q4_K_M.gguf",
+            "quant_label": "Q4_K_M",
+            "size_bytes": 42_000_000_000,
+            "fit": "unknown",
+        },
+        {
+            "filename": "m-Q8_0.gguf",
+            "quant_label": "Q8_0",
+            "size_bytes": None,
+            "fit": "unknown",
+        },
     ]
 
 

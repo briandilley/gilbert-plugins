@@ -27,10 +27,10 @@ if _pkg_name not in sys.modules:
     pkg.__package__ = _pkg_name
     sys.modules[_pkg_name] = pkg
 
-    # Leaf modules first, then dependents (recommended ← hf_catalog ←
+    # Leaf modules first, then dependents (recommended ← hf_catalog, fit ←
     # model_manager_service ← plugin), so each relative import binds to the
     # already-registered single copy.
-    for _mod_name in ("recommended", "hf_catalog", "model_manager_service", "plugin"):
+    for _mod_name in ("recommended", "hf_catalog", "fit", "model_manager_service", "plugin"):
         _spec = importlib.util.spec_from_file_location(
             f"{_pkg_name}.{_mod_name}",
             _plugin_dir / f"{_mod_name}.py",

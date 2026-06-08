@@ -14,6 +14,7 @@ import type {
   CatalogQuantsResponse,
   CatalogSearchResponse,
   CatalogSort,
+  HostResourcesResponse,
   InstalledModelsResponse,
 } from "./types";
 
@@ -37,6 +38,10 @@ export function useModelManagerApi() {
         rpc<CatalogQuantsResponse>({
           type: "model_manager.catalog.quants",
           model_id: modelId,
+        }),
+      hostResources: () =>
+        rpc<HostResourcesResponse>({
+          type: "model_manager.host.resources",
         }),
     }),
     [rpc],
