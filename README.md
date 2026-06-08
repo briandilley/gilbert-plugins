@@ -44,6 +44,7 @@ The table below is an index — jump to each plugin's detail section for configu
 | [hk-webhook](#hk-webhook) | `HealthBackend "hk-webhook"` | — (pure stdlib) | Health |
 | [jellyfin](#jellyfin) | `MediaLibraryBackend "jellyfin"` | — (uses `httpx`) | Media |
 | [kokoro](#kokoro) | `TTSBackend "kokoro"` | `kokoro`, `torch`, `av`, `numpy` | Speech |
+| [llmfit](#llmfit) | `HostResourcesBackend "llmfit"` — multi-vendor GPU detection (NVIDIA/AMD/Apple/Intel) feeding the model-manager hardware-fit verdicts | — (stdlib; shells out to the optional `llmfit` CLI) | Intelligence |
 | [lutron-radiora](#lutron-radiora) | `LightsBackend "lutron-radiora"`, `ShadesBackend "lutron-radiora"` | `pylutron` | Lighting |
 | [mentra](#mentra) | `mentra` service (`MentraService` + `mentra_webhook` capability) — Gilbert on Mentra smart glasses (Even Realities G1, Vuzix Z100, Mentra Live) | `websockets>=12` | Wearables |
 | [messaging](#messaging) | `messaging` service (`MessagingService` + `send_text_message` AI tool, `/messages` SPA page) — RCS / MMS / SMS, RCS by default | — (pure stdlib) | Communication |
@@ -758,6 +759,22 @@ Local text-to-speech backend powered by the open-weights [Kokoro-82M](https://hu
 
 ---
 
+### llmfit
+
+Optional **host-hardware detector** that broadens the model-manager's "does this model fit on my hardware?" verdicts. Wraps the [`llmfit`](https://github.com/AlexsJones/llmfit) CLI (`llmfit --json system`), which detects **NVIDIA, AMD (`rocm-smi`), Apple Silicon, and Intel Arc** GPUs plus unified-memory systems — broader than core's built-in NVIDIA-only `nvidia-smi` probe. The richer host snapshot feeds the [model-manager](#model-manager)'s existing `fit.py` policy unchanged.
+
+**Backend registered** — `HostResourcesBackend.backend_name = "llmfit"`, `priority = 10`. Core's `HostResourcesService` selects the highest-`priority` **available** backend: when the `llmfit` binary is on `PATH` this backend is auto-preferred; when it's absent (`is_available()` is `False`) the service transparently falls back to the built-in `local` (priority 0) probe. There's no config and no opt-in — install the binary to enable it, remove it to disable. (The `local` backend gained a `priority`/`is_available()` contract so the service can choose; `local` is the always-available floor.)
+
+**Scope — detection only.** Only `llmfit --json system` is consumed. llmfit's own fit verdicts and tokens/sec estimates are computed against its **embedded model database** and don't map to the arbitrary Hugging Face GGUF repos Gilbert sizes directly, so they're intentionally not used — Gilbert keeps its own size→verdict policy and takes only the host snapshot. RAM is reported by llmfit in GiB and scaled to bytes to match psutil (the `local` backend) so both feed the fit policy comparable numbers; on Apple Silicon the unified-memory pool is represented as the GPU's VRAM, so Metal earns a `fits-vram` (fast) verdict rather than `unknown`.
+
+**Configure** — none. The plugin has no settings; it's enabled purely by the presence of the `llmfit` binary.
+
+**Runtime dependency (`doctor`).** Declares the optional `llmfit` CLI. `./gilbert.sh doctor` checks it by *exercising* the tool (`llmfit --json system`), not by probing a path; `--install` runs `uv tool install llmfit` (a small, self-contained binary — also available via `cargo install llmfit`, Homebrew, or the [project releases](https://github.com/AlexsJones/llmfit)). Unconditional (no enablement gate): the host-resources service simply falls back to the NVIDIA-only probe when it's absent.
+
+**Provides** — `host_resources_llmfit`. No third-party Python deps (standard library + `gilbert.interfaces`; shells out to the binary).
+
+---
+
 ### lutron-radiora
 
 Lutron RadioRA 2 / HomeWorks integration. Registers two backends — one for the core `lights` service and one for the core `shades` service — both speaking telnet to the main repeater via [`pylutron`](https://pypi.org/project/pylutron/). Areas, dimmer/switch types, and shade outputs are auto-discovered from the repeater's XML database, so there's no per-room config.
@@ -1011,6 +1028,7 @@ Local Ollama AI backend — chat against any open-weight model you've `ollama pu
 - `model` — Default model tag (default `llama3.3`). Must be a tag you've pulled — Ollama rejects unknown tags.
 - `max_tokens` — Per-response cap (default `8192`); the backend-default layer for the resolved per-model value.
 - `temperature` — Sampling temperature (default `0.7`); the backend-default layer for the resolved per-model value.
+- `request_timeout` — Seconds to wait for the model to *respond* (httpx read timeout; default `600`). Local models are slow in ways hosted APIs aren't — a large model cold-loads 10s of GB from disk before its first token, and CPU-only reasoning models can think for minutes. Raise this if requests fail with `Ollama request timed out`; set to `0` to wait indefinitely. The *connect* timeout stays short (10s) regardless, so an unreachable daemon still fails fast.
 
 **Streaming.** Native NDJSON — one JSON object per line, `message.content` → `TEXT_DELTA` and `message.thinking` → `REASONING_DELTA` (see Reasoning above), with `done` + `done_reason` + `prompt_eval_count` / `eval_count` on the final line. Tool calls arrive complete in a single chunk (Ollama doesn't stream tool-argument deltas), surfaced as a `TOOL_CALL_START` + `TOOL_CALL_END` pair. `capabilities()` reports `streaming=True, attachments_user=True`.
 

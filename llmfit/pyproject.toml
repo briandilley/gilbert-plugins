@@ -1,0 +1,12 @@
+[project]
+name = "gilbert-plugin-llmfit"
+version = "1.0.0"
+description = "llmfit-backed host-resources probe (multi-vendor GPU detection) for Gilbert"
+requires-python = ">=3.12"
+# No third-party Python deps: the backend shells out to the optional
+# ``llmfit`` CLI binary (declared as a RuntimeDependency and checked by
+# ``doctor``) and otherwise uses only the standard library + gilbert.interfaces.
+dependencies = []
+
+[tool.uv]
+package = false

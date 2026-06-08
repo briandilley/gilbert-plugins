@@ -1,0 +1,10 @@
+name: llmfit
+version: "1.0.0"
+description: "llmfit-backed host-resources probe — multi-vendor GPU detection (NVIDIA/AMD/Apple/Intel) for the hardware-fit feature"
+
+provides:
+  - host_resources_llmfit
+
+requires: []
+
+depends_on: []
