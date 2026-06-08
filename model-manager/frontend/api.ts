@@ -10,7 +10,12 @@
 
 import { useMemo } from "react";
 import { useWebSocket } from "@/hooks/useWebSocket";
-import type { InstalledModelsResponse } from "./types";
+import type {
+  CatalogQuantsResponse,
+  CatalogSearchResponse,
+  CatalogSort,
+  InstalledModelsResponse,
+} from "./types";
 
 export function useModelManagerApi() {
   const { rpc } = useWebSocket();
@@ -20,6 +25,18 @@ export function useModelManagerApi() {
       listInstalled: () =>
         rpc<InstalledModelsResponse>({
           type: "model_manager.installed.list",
+        }),
+      searchCatalog: (query: string, sort: CatalogSort, limit: number) =>
+        rpc<CatalogSearchResponse>({
+          type: "model_manager.catalog.search",
+          query,
+          sort,
+          limit,
+        }),
+      listQuants: (modelId: string) =>
+        rpc<CatalogQuantsResponse>({
+          type: "model_manager.catalog.quants",
+          model_id: modelId,
         }),
     }),
     [rpc],
