@@ -1,0 +1,11 @@
+name: model-manager
+version: "1.0.0"
+description: "Local model manager — browse, fit-check, and pull local models via Ollama (skeleton: installed-models listing)"
+
+provides:
+  - model_manager
+
+requires:
+  - local_model_runtime
+
+depends_on: []
