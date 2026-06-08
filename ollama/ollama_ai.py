@@ -60,6 +60,16 @@ ai_logger = logging.getLogger("gilbert.ai")
 
 _DEFAULT_BASE_URL = "http://localhost:11434"
 _DEFAULT_MODEL = "llama3.3"
+# How long to wait for the daemon to *respond* (httpx read timeout), in
+# seconds. Local models are slow in ways hosted APIs aren't: a large model
+# cold-loads 10s of GB from disk into RAM before its first token, and CPU-only
+# inference of a reasoning model can think for minutes. 120s (the old hardcoded
+# value) silently killed both. Default generous; operators on tiny boxes can
+# raise it, and ``0`` disables the read timeout entirely.
+_DEFAULT_REQUEST_TIMEOUT = 600.0
+# Connecting to the daemon, by contrast, should be fast — keep this short so an
+# unreachable Ollama fails quickly instead of hanging for the whole read budget.
+_CONNECT_TIMEOUT = 10.0
 
 # Recommended overlay: a curated set of common tool-capable model
 # families, keyed by the base tag. ``available_models()`` is now
@@ -184,6 +194,19 @@ class OllamaAI(AIBackend):
                 description=("Sampling temperature (0.0 = deterministic, 1.0 = creative)."),
                 default=0.7,
             ),
+            ConfigParam(
+                key="request_timeout",
+                type=ToolParameterType.INTEGER,
+                description=(
+                    "Seconds to wait for the model to respond before giving up. "
+                    "Local models can be slow: a large model cold-loads from disk "
+                    "before its first token, and CPU-only reasoning models can "
+                    "think for minutes. Raise this if requests fail with 'Ollama "
+                    "request timed out'; set to 0 to wait indefinitely. Does not "
+                    "affect how long Gilbert waits to *connect* to the daemon."
+                ),
+                default=int(_DEFAULT_REQUEST_TIMEOUT),
+            ),
         ]
 
     @classmethod
@@ -244,6 +267,7 @@ class OllamaAI(AIBackend):
         self._model: str = _DEFAULT_MODEL
         self._max_tokens: int = 8192
         self._temperature: float = 0.7
+        self._request_timeout: float = _DEFAULT_REQUEST_TIMEOUT
         # Per-model ``/api/show`` cache: ``{model: {"context_length": int|None,
         # "thinking": bool}}``. Populated lazily before a request (one show
         # call per model, then reused) so ``_build_request_body`` can clamp
@@ -284,12 +308,25 @@ class OllamaAI(AIBackend):
             headers["Authorization"] = f"Bearer {api_key}"
 
         self._base_url = base_url
+        # ``request_timeout`` is the *read* budget — how long to wait for the
+        # model to respond — and is generous by default because local models
+        # legitimately need it (cold load, slow CPU reasoning). ``0`` (or any
+        # non-positive value) disables it for unbounded waits. Connect stays
+        # short so an unreachable daemon fails fast instead of hanging for the
+        # whole read budget.
+        self._request_timeout = float(config.get("request_timeout", _DEFAULT_REQUEST_TIMEOUT))
+        read_timeout: float | None = self._request_timeout if self._request_timeout > 0 else None
         # No ``base_url`` on the client: the native ``/api/*`` routes and the
         # legacy ``/v1`` shim live at different depths, so we build absolute
         # URLs from the normalised daemon root (``_root_url``) instead.
         self._client = httpx.AsyncClient(
             headers=headers,
-            timeout=120.0,
+            timeout=httpx.Timeout(
+                connect=_CONNECT_TIMEOUT,
+                read=read_timeout,
+                write=read_timeout,
+                pool=read_timeout,
+            ),
         )
         # Seed the installed-tag cache so ``available_models()`` reflects
         # reality immediately. Best-effort: a daemon that's down at startup

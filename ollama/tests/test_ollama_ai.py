@@ -601,6 +601,59 @@ async def test_generate_raises_clear_error_on_timeout() -> None:
     assert "timed out" in str(exc_info.value).lower()
 
 
+def test_request_timeout_config_param_exists() -> None:
+    """The request timeout must be operator-configurable. A large local
+    reasoning model (cold 18GB load + long thinking) legitimately needs more
+    than the old hardcoded 120s, and only the operator knows their hardware."""
+    params = OllamaAI.backend_config_params()
+    rt = next((p for p in params if p.key == "request_timeout"), None)
+    assert rt is not None
+    assert rt.type == ToolParameterType.INTEGER
+
+
+async def test_request_timeout_is_applied_to_client_read_timeout() -> None:
+    """A configured ``request_timeout`` governs how long Gilbert waits for the
+    model to respond (httpx *read* timeout), so a slow local model isn't killed
+    mid-generation or mid-load."""
+    backend = OllamaAI()
+    await backend.initialize({"request_timeout": 600})
+    assert backend._client is not None
+    assert backend._client.timeout.read == 600.0
+    await backend.close()
+
+
+async def test_default_request_timeout_exceeds_two_minutes() -> None:
+    """The old hardcoded 120s killed a cold-loading 18GB CPU model before it
+    emitted its first token. The default must give local models real headroom."""
+    backend = OllamaAI()
+    await backend.initialize({})
+    assert backend._client is not None
+    assert backend._client.timeout.read is not None
+    assert backend._client.timeout.read > 120.0
+    await backend.close()
+
+
+async def test_request_timeout_zero_disables_read_timeout() -> None:
+    """``0`` means 'wait as long as the daemon needs' — for very slow CPU-only
+    inference where any finite cap risks truncating a valid response."""
+    backend = OllamaAI()
+    await backend.initialize({"request_timeout": 0})
+    assert backend._client is not None
+    assert backend._client.timeout.read is None
+    await backend.close()
+
+
+async def test_connect_timeout_stays_short_for_fast_failure() -> None:
+    """Raising the generation timeout must not also make an unreachable daemon
+    hang: the *connect* timeout stays short so a down daemon fails fast."""
+    backend = OllamaAI()
+    await backend.initialize({"request_timeout": 600})
+    assert backend._client is not None
+    assert backend._client.timeout.connect is not None
+    assert backend._client.timeout.connect <= 30.0
+    await backend.close()
+
+
 async def test_generate_stream_emits_tool_calls() -> None:
     capture: dict = {}
     backend = _streaming_backend(
