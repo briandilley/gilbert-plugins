@@ -95,6 +95,11 @@ class GoogleCalendarBackend(CalendarBackend):
                 sensitive=True,
                 restart_required=True,
                 multiline=True,
+                visible_when_field="credential_mode",
+                visible_when_values=(
+                    "delegated_service_account",
+                    "shared_service_account",
+                ),
             ),
             ConfigParam(
                 key="delegated_user",
@@ -104,12 +109,16 @@ class GoogleCalendarBackend(CalendarBackend):
                     "delegation."
                 ),
                 restart_required=True,
+                visible_when_field="credential_mode",
+                visible_when_values=("delegated_service_account",),
             ),
             ConfigParam(
                 key="oauth_client_id",
                 type=ToolParameterType.STRING,
                 description="Google OAuth client ID for oauth_bot mode.",
                 restart_required=True,
+                visible_when_field="credential_mode",
+                visible_when_values=("oauth_bot",),
             ),
             ConfigParam(
                 key="oauth_client_secret",
@@ -117,6 +126,8 @@ class GoogleCalendarBackend(CalendarBackend):
                 description="Google OAuth client secret for oauth_bot mode.",
                 sensitive=True,
                 restart_required=True,
+                visible_when_field="credential_mode",
+                visible_when_values=("oauth_bot",),
             ),
             ConfigParam(
                 key="oauth_redirect_uri",
@@ -124,6 +135,8 @@ class GoogleCalendarBackend(CalendarBackend):
                 description="OAuth redirect URI registered for this backend.",
                 default="urn:ietf:wg:oauth:2.0:oob",
                 restart_required=True,
+                visible_when_field="credential_mode",
+                visible_when_values=("oauth_bot",),
             ),
             ConfigParam(
                 key="oauth_refresh_token",
@@ -131,6 +144,8 @@ class GoogleCalendarBackend(CalendarBackend):
                 description="OAuth refresh token populated by Connect Google.",
                 sensitive=True,
                 restart_required=True,
+                visible_when_field="credential_mode",
+                visible_when_values=("oauth_bot",),
             ),
             ConfigParam(
                 key="oauth_auth_code",
@@ -138,6 +153,8 @@ class GoogleCalendarBackend(CalendarBackend):
                 description="Temporary Google OAuth authorization code for Connect Google complete.",
                 sensitive=True,
                 restart_required=True,
+                visible_when_field="credential_mode",
+                visible_when_values=("oauth_bot",),
             ),
         ]
 

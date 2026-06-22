@@ -94,6 +94,8 @@ class GoogleTasksBackend(TaskBackend):
                 sensitive=True,
                 restart_required=True,
                 multiline=True,
+                visible_when_field="credential_mode",
+                visible_when_values=("delegated_service_account",),
             ),
             ConfigParam(
                 key="delegated_user",
@@ -104,12 +106,16 @@ class GoogleTasksBackend(TaskBackend):
                     "raise on initialize."
                 ),
                 restart_required=True,
+                visible_when_field="credential_mode",
+                visible_when_values=("delegated_service_account",),
             ),
             ConfigParam(
                 key="oauth_client_id",
                 type=ToolParameterType.STRING,
                 description="Google OAuth client ID for oauth_bot mode.",
                 restart_required=True,
+                visible_when_field="credential_mode",
+                visible_when_values=("oauth_bot",),
             ),
             ConfigParam(
                 key="oauth_client_secret",
@@ -117,6 +123,8 @@ class GoogleTasksBackend(TaskBackend):
                 description="Google OAuth client secret for oauth_bot mode.",
                 sensitive=True,
                 restart_required=True,
+                visible_when_field="credential_mode",
+                visible_when_values=("oauth_bot",),
             ),
             ConfigParam(
                 key="oauth_redirect_uri",
@@ -124,6 +132,8 @@ class GoogleTasksBackend(TaskBackend):
                 description="OAuth redirect URI registered for this backend.",
                 default="urn:ietf:wg:oauth:2.0:oob",
                 restart_required=True,
+                visible_when_field="credential_mode",
+                visible_when_values=("oauth_bot",),
             ),
             ConfigParam(
                 key="oauth_refresh_token",
@@ -131,6 +141,8 @@ class GoogleTasksBackend(TaskBackend):
                 description="OAuth refresh token populated by Connect Google.",
                 sensitive=True,
                 restart_required=True,
+                visible_when_field="credential_mode",
+                visible_when_values=("oauth_bot",),
             ),
             ConfigParam(
                 key="oauth_auth_code",
@@ -138,6 +150,8 @@ class GoogleTasksBackend(TaskBackend):
                 description="Temporary Google OAuth authorization code for Connect Google complete.",
                 sensitive=True,
                 restart_required=True,
+                visible_when_field="credential_mode",
+                visible_when_values=("oauth_bot",),
             ),
             ConfigParam(
                 key="tasklist_id",
