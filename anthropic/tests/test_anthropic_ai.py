@@ -429,6 +429,56 @@ def test_build_request_body_includes_system() -> None:
     assert body["temperature"] == 0.3
 
 
+def test_build_request_body_omits_temperature_for_opus_47_plus() -> None:
+    """Opus 4.7 and later reject ``temperature`` (and ``top_p``/``top_k``)
+    with a 400 ("temperature is deprecated for this model"). The backend
+    must NOT send ``temperature`` for those models.
+
+    Regression for the sales-assistant intake storm: every AI call 400'd,
+    so leads churned PENDING→QUALIFYING→PENDING on every 60s poll, hammering
+    the upstream leads server with two writes per lead per cycle."""
+    backend = AnthropicAI()
+    backend._max_tokens = 100
+    backend._temperature = 0.5
+    for model in ("claude-opus-4-8", "claude-opus-4-7", "claude-opus-5-0"):
+        backend._model = model
+        body = backend._build_request_body(
+            AIRequest(messages=[Message(role=MessageRole.USER, content="Hi")])
+        )
+        assert "temperature" not in body, f"{model} must not receive temperature"
+
+
+def test_build_request_body_includes_temperature_for_sampling_models() -> None:
+    """Sonnet 4.6, Haiku 4.5, and Opus 4.6 still accept ``temperature`` —
+    the omission is scoped to Opus 4.7+, not applied as a blanket rule."""
+    backend = AnthropicAI()
+    backend._max_tokens = 100
+    backend._temperature = 0.5
+    for model in ("claude-sonnet-4-6", "claude-haiku-4-5-20251001", "claude-opus-4-6"):
+        backend._model = model
+        body = backend._build_request_body(
+            AIRequest(messages=[Message(role=MessageRole.USER, content="Hi")])
+        )
+        assert body.get("temperature") == 0.5, f"{model} should receive temperature"
+
+
+def test_build_request_body_temperature_gate_honors_per_request_model() -> None:
+    """The gate keys off the model actually being used — a per-request
+    ``model`` override pointing at Opus 4.8 drops temperature even when the
+    backend default is a sampling-capable model."""
+    backend = AnthropicAI()
+    backend._max_tokens = 100
+    backend._temperature = 0.5
+    backend._model = "claude-sonnet-4-6"
+    body = backend._build_request_body(
+        AIRequest(
+            messages=[Message(role=MessageRole.USER, content="Hi")],
+            model="claude-opus-4-8",
+        )
+    )
+    assert "temperature" not in body
+
+
 def test_build_request_body_omits_empty_system() -> None:
     backend = AnthropicAI()
     backend._model = "test-model"
@@ -743,6 +793,108 @@ async def test_generate_raises_ai_backend_error_on_non_json_error(
     assert "Bad Gateway" in str(exc_info.value)
 
     await backend.close()
+
+
+async def test_generate_learns_and_retries_on_sampling_param_rejection() -> None:
+    """A 400 'temperature is deprecated for this model' must self-heal:
+    the backend records the model as sampling-unsupported, retries the
+    request WITHOUT temperature, and returns the successful response.
+
+    This covers a config change to a model the static version gate
+    (``_model_rejects_sampling_params``) doesn't yet know about — without
+    it, every call would 400 forever (the sales-assistant intake storm)."""
+    import json
+
+    import httpx as _httpx
+
+    # A model the STATIC gate treats as temperature-capable, so the
+    # first attempt sends temperature and gets rejected.
+    model = "claude-sonnet-4-6"
+    bodies: list[dict] = []
+    statuses = [400, 200]
+
+    def handler(request: _httpx.Request) -> _httpx.Response:
+        bodies.append(json.loads(request.content))
+        status = statuses.pop(0) if statuses else 200
+        if status == 400:
+            return _httpx.Response(
+                400,
+                json={
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "temperature is deprecated for this model.",
+                    },
+                },
+            )
+        return _httpx.Response(
+            200,
+            json={
+                "content": [{"type": "text", "text": "ok"}],
+                "model": model,
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        )
+
+    backend = AnthropicAI()
+    backend._model = model
+    backend._temperature = 0.5
+    backend._client = _httpx.AsyncClient(
+        base_url="https://api.anthropic.com/v1",
+        transport=_httpx.MockTransport(handler),
+    )
+
+    response = await backend.generate(
+        AIRequest(messages=[Message(role=MessageRole.USER, content="hi")])
+    )
+    await backend.close()
+
+    # It returned the successful retry, not the 400.
+    assert response.message.content == "ok"
+    # Two attempts: first WITH temperature, retry WITHOUT.
+    assert len(bodies) == 2
+    assert "temperature" in bodies[0]
+    assert "temperature" not in bodies[1]
+    # The model is now remembered so future calls skip temperature.
+    assert model in backend._sampling_unsupported
+
+
+async def test_generate_does_not_retry_unrelated_400() -> None:
+    """A 400 that is NOT about a sampling parameter must surface as an
+    error (no infinite retry, no learning)."""
+    import httpx as _httpx
+
+    calls = {"n": 0}
+
+    def handler(request: _httpx.Request) -> _httpx.Response:
+        calls["n"] += 1
+        return _httpx.Response(
+            400,
+            json={
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "messages: roles must alternate",
+                },
+            },
+        )
+
+    backend = AnthropicAI()
+    backend._model = "claude-sonnet-4-6"
+    backend._client = _httpx.AsyncClient(
+        base_url="https://api.anthropic.com/v1",
+        transport=_httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(AIBackendError):
+        await backend.generate(
+            AIRequest(messages=[Message(role=MessageRole.USER, content="hi")])
+        )
+    await backend.close()
+
+    assert calls["n"] == 1  # no retry
+    assert backend._sampling_unsupported == set()
 
 
 async def test_generate_raises_when_not_initialized(backend: AnthropicAI) -> None:
@@ -1186,6 +1338,86 @@ async def test_generate_stream_accumulates_cache_tokens(
     assert final.usage.output_tokens == 3
     assert final.usage.cache_creation_tokens == 200
     assert final.usage.cache_read_tokens == 1000
+
+    await backend.close()
+
+
+async def test_generate_stream_learns_and_retries_on_sampling_rejection(
+    backend: AnthropicAI,
+) -> None:
+    """The streaming path (used by ``chat()``) self-heals the same way:
+    a 400 sampling-param rejection is learned and the stream replayed
+    without temperature, yielding the successful events."""
+    from gilbert.interfaces.ai import StreamEventType
+
+    await backend.initialize({"api_key": "sk-test"})
+    assert backend._client is not None
+    backend._model = "claude-sonnet-4-6"
+
+    # First open → 400 sampling rejection; second open → a normal stream.
+    err = _FakeStreamResponse(
+        [
+            "event: error",
+            'data: {"type":"error","error":{"message":'
+            '"temperature is deprecated for this model."}}',
+            "",
+        ],
+        status_code=400,
+    )
+    err._body_bytes = (
+        b'{"type":"error","error":{"message":'
+        b'"temperature is deprecated for this model."}}'
+    )
+
+    ok_lines: list[str] = []
+    ok_lines += _sse(
+        "message_start",
+        {
+            "type": "message_start",
+            "message": {
+                "id": "m",
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": "claude-sonnet-4-6",
+                "stop_reason": None,
+                "usage": {"input_tokens": 1, "output_tokens": 0},
+            },
+        },
+    )
+    ok_lines += _sse(
+        "content_block_start",
+        {"type": "content_block_start", "index": 0,
+         "content_block": {"type": "text", "text": ""}},
+    )
+    ok_lines += _sse(
+        "content_block_delta",
+        {"type": "content_block_delta", "index": 0,
+         "delta": {"type": "text_delta", "text": "healed"}},
+    )
+    ok_lines += _sse("content_block_stop", {"type": "content_block_stop", "index": 0})
+    ok_lines += _sse(
+        "message_delta",
+        {"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+         "usage": {"output_tokens": 1}},
+    )
+    ok_lines += _sse("message_stop", {"type": "message_stop"})
+    ok = _FakeStreamResponse(ok_lines)
+
+    backend._client.stream = MagicMock(side_effect=[err, ok])  # type: ignore[method-assign]
+
+    final = None
+    async for ev in backend.generate_stream(
+        AIRequest(messages=[Message(role=MessageRole.USER, content="hi")])
+    ):
+        if ev.type == StreamEventType.MESSAGE_COMPLETE:
+            final = ev.response
+
+    assert final is not None
+    assert final.message.content == "healed"
+    # Model learned + two stream attempts made.
+    assert "claude-sonnet-4-6" in backend._sampling_unsupported
+    assert backend._client.stream.call_count == 2
 
     await backend.close()
 

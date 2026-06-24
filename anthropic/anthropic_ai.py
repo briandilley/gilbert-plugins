@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -37,8 +38,62 @@ logger = logging.getLogger(__name__)
 ai_logger = logging.getLogger("gilbert.ai")
 
 _BASE_URL = "https://api.anthropic.com/v1"
-_DEFAULT_MODEL = "claude-sonnet-4-20250514"
+_DEFAULT_MODEL = "claude-sonnet-4-6"
 _API_VERSION = "2023-06-01"
+
+
+def _model_rejects_sampling_params(model: str) -> bool:
+    """Whether ``model`` rejects the sampling parameters
+    (``temperature`` / ``top_p`` / ``top_k``).
+
+    Anthropic removed these on Opus 4.7 and later — sending any of them
+    returns HTTP 400 ("temperature is deprecated for this model"). We
+    detect by parsing the Opus ``major.minor`` version so future Opus
+    models (4.9, 5.x, …) inherit the behavior without a code change.
+    Sonnet and Haiku still accept the parameters, so they don't match.
+
+    This is the *static* gate. It's complemented at runtime by the
+    backend's learned set (see ``AnthropicAI._sampling_unsupported``),
+    which records any model the API rejects for a sampling param so a
+    config change to a model this check doesn't yet know about
+    self-heals after the first rejection.
+    """
+    m = re.match(r"claude-opus-(\d+)-(\d+)", model)
+    if not m:
+        return False
+    return (int(m.group(1)), int(m.group(2))) >= (4, 7)
+
+
+# Substrings that mark an HTTP 400 as a rejection of a sampling
+# parameter (rather than some unrelated bad-request). Used to learn,
+# at runtime, that a configured model no longer accepts these — so we
+# stop sending them and retry instead of churning on repeated 400s.
+_SAMPLING_PARAM_ERROR_MARKERS = ("temperature", "top_p", "top_k")
+
+
+def _is_sampling_param_error(status: int, reason: str) -> bool:
+    """True when an HTTP 400 reason indicates a sampling-parameter
+    rejection (e.g. ``temperature is deprecated for this model``)."""
+    if status != 400:
+        return False
+    low = reason.lower()
+    return any(marker in low for marker in _SAMPLING_PARAM_ERROR_MARKERS)
+
+
+def _extract_error_reason(err_body: Any) -> str:
+    """Pull the human-readable message out of Anthropic's error envelope
+    ``{"type": "error", "error": {"type": "...", "message": "..."}}``,
+    falling back to a top-level ``message`` then a truncated repr."""
+    reason = ""
+    if isinstance(err_body, dict):
+        err_obj = err_body.get("error")
+        if isinstance(err_obj, dict):
+            reason = str(err_obj.get("message") or "").strip()
+        if not reason:
+            reason = str(err_body.get("message") or "").strip()
+    if not reason:
+        reason = str(err_body)[:500]
+    return reason
 
 
 def _format_bytes(n: int) -> str:
@@ -63,13 +118,13 @@ def _format_bytes(n: int) -> str:
 # below is the real source of truth once present.
 _FALLBACK_MODELS = [
     ModelInfo(
-        id="claude-opus-4-20250514",
-        name="Claude Opus 4",
+        id="claude-opus-4-8",
+        name="Claude Opus 4.8",
         description="Most capable model — complex reasoning, nuanced writing, advanced coding.",
     ),
     ModelInfo(
-        id="claude-sonnet-4-20250514",
-        name="Claude Sonnet 4",
+        id="claude-sonnet-4-6",
+        name="Claude Sonnet 4.6",
         description="Balanced performance and speed — strong all-around model.",
     ),
     ModelInfo(
@@ -416,6 +471,12 @@ class AnthropicAI(AIBackend):
         self._enabled_models: list[str] = [m.id for m in _available_models()]
         self._max_tokens: int = 16384
         self._temperature: float = 0.7
+        # Models that the API has rejected for a sampling parameter
+        # (``temperature``/``top_p``/``top_k``) at runtime. Learned from
+        # 400 responses so that pointing the config at a model the
+        # static ``_model_rejects_sampling_params`` check doesn't know
+        # about self-heals after a single rejection instead of looping.
+        self._sampling_unsupported: set[str] = set()
 
     async def initialize(self, config: dict[str, Any]) -> None:
         from .shared_key import register_anthropic_api_key
@@ -482,14 +543,22 @@ class AnthropicAI(AIBackend):
         if self._client is None:
             raise RuntimeError("AnthropicAI not initialized")
 
-        body = self._build_request_body(request)
+        # Two attempts max: the second only happens when the first is
+        # rejected for a sampling parameter, which we learn from and
+        # retry without (see ``_note_sampling_rejection``).
+        for attempt in range(2):
+            body = self._build_request_body(request)
 
-        ai_logger.debug(
-            "Anthropic request: model=%s messages=%d", body["model"], len(body["messages"])
-        )
+            ai_logger.debug(
+                "Anthropic request: model=%s messages=%d",
+                body["model"],
+                len(body["messages"]),
+            )
 
-        resp = await self._client.post("/messages", json=body)
-        if resp.is_error:
+            resp = await self._client.post("/messages", json=body)
+            if not resp.is_error:
+                break
+
             # Surface Anthropic's actual error body — raise_for_status() hides it.
             err_body: Any
             try:
@@ -502,17 +571,13 @@ class AnthropicAI(AIBackend):
                 err_body,
                 json.dumps(body)[:2000],
             )
-            # Pull the human-readable reason out of Anthropic's error envelope:
-            # {"type": "error", "error": {"type": "...", "message": "..."}}
-            reason = ""
-            if isinstance(err_body, dict):
-                err_obj = err_body.get("error")
-                if isinstance(err_obj, dict):
-                    reason = str(err_obj.get("message") or "").strip()
-                if not reason:
-                    reason = str(err_body.get("message") or "").strip()
-            if not reason:
-                reason = str(err_body)[:500]
+            reason = _extract_error_reason(err_body)
+            # Self-heal: if the model rejected a sampling param, remember
+            # it and retry once without temperature instead of failing.
+            if attempt == 0 and self._note_sampling_rejection(
+                body["model"], resp.status_code, reason
+            ):
+                continue
             raise AIBackendError(
                 f"Anthropic API rejected request ({resp.status_code}): {reason}",
                 status=resp.status_code,
@@ -575,6 +640,7 @@ class AnthropicAI(AIBackend):
         usage_cache_read = 0
         model_id = self._model
 
+        retry_without_sampling = False
         async with self._client.stream(
             "POST",
             "/messages",
@@ -591,86 +657,96 @@ class AnthropicAI(AIBackend):
                     resp.status_code,
                     err_body,
                 )
-                reason = ""
-                if isinstance(err_body, dict):
-                    err_obj = err_body.get("error")
-                    if isinstance(err_obj, dict):
-                        reason = str(err_obj.get("message") or "").strip()
-                    if not reason:
-                        reason = str(err_body.get("message") or "").strip()
-                if not reason:
-                    reason = str(err_body)[:500]
-                raise AIBackendError(
-                    f"Anthropic API rejected streaming request "
-                    f"({resp.status_code}): {reason}",
-                    status=resp.status_code,
-                )
+                reason = _extract_error_reason(err_body)
+                # Self-heal: a sampling-parameter rejection is learned and
+                # retried (without temperature) instead of failing the call.
+                if self._note_sampling_rejection(
+                    body["model"], resp.status_code, reason
+                ):
+                    retry_without_sampling = True
+                else:
+                    raise AIBackendError(
+                        f"Anthropic API rejected streaming request "
+                        f"({resp.status_code}): {reason}",
+                        status=resp.status_code,
+                    )
+            else:
+                event_name = ""
+                data_lines: list[str] = []
+                async for line in resp.aiter_lines():
+                    # SSE: blank line terminates an event.
+                    if line == "":
+                        if event_name and data_lines:
+                            async for ev in self._dispatch_sse_event(
+                                event_name,
+                                "\n".join(data_lines),
+                                text_parts,
+                                block_types,
+                                tool_builders,
+                            ):
+                                yield ev
+                            # State updates driven off the raw payload so we
+                            # can emit message_delta usage / stop_reason info
+                            # without duplicating the parse logic.
+                            try:
+                                data = json.loads("\n".join(data_lines))
+                            except json.JSONDecodeError:
+                                data = None
+                            if isinstance(data, dict):
+                                event_type = str(data.get("type") or event_name)
+                                if event_type == "message_start":
+                                    msg = data.get("message") or {}
+                                    model_id = str(msg.get("model") or self._model)
+                                    usage = msg.get("usage") or {}
+                                    usage_input += int(usage.get("input_tokens", 0) or 0)
+                                    usage_output += int(
+                                        usage.get("output_tokens", 0) or 0
+                                    )
+                                    usage_cache_creation += int(
+                                        usage.get("cache_creation_input_tokens", 0) or 0
+                                    )
+                                    usage_cache_read += int(
+                                        usage.get("cache_read_input_tokens", 0) or 0
+                                    )
+                                    raw = msg.get("stop_reason")
+                                    if raw:
+                                        stop_reason_raw = str(raw)
+                                elif event_type == "message_delta":
+                                    delta = data.get("delta") or {}
+                                    raw = delta.get("stop_reason")
+                                    if raw:
+                                        stop_reason_raw = str(raw)
+                                    usage = data.get("usage") or {}
+                                    usage_output += int(
+                                        usage.get("output_tokens", 0) or 0
+                                    )
+                                    # ``message_delta`` can also carry trailing
+                                    # cache accounting on some model versions.
+                                    # Add (don't overwrite) so partial counts
+                                    # from ``message_start`` aren't lost.
+                                    usage_cache_creation += int(
+                                        usage.get("cache_creation_input_tokens", 0) or 0
+                                    )
+                                    usage_cache_read += int(
+                                        usage.get("cache_read_input_tokens", 0) or 0
+                                    )
+                        event_name = ""
+                        data_lines = []
+                        continue
+                    if line.startswith(":"):
+                        # SSE comment — ignore.
+                        continue
+                    if line.startswith("event:"):
+                        event_name = line[len("event:") :].strip()
+                    elif line.startswith("data:"):
+                        data_lines.append(line[len("data:") :].lstrip())
 
-            event_name = ""
-            data_lines: list[str] = []
-            async for line in resp.aiter_lines():
-                # SSE: blank line terminates an event.
-                if line == "":
-                    if event_name and data_lines:
-                        async for ev in self._dispatch_sse_event(
-                            event_name,
-                            "\n".join(data_lines),
-                            text_parts,
-                            block_types,
-                            tool_builders,
-                        ):
-                            yield ev
-                        # State updates driven off the raw payload so we
-                        # can emit message_delta usage / stop_reason info
-                        # without duplicating the parse logic.
-                        try:
-                            data = json.loads("\n".join(data_lines))
-                        except json.JSONDecodeError:
-                            data = None
-                        if isinstance(data, dict):
-                            event_type = str(data.get("type") or event_name)
-                            if event_type == "message_start":
-                                msg = data.get("message") or {}
-                                model_id = str(msg.get("model") or self._model)
-                                usage = msg.get("usage") or {}
-                                usage_input += int(usage.get("input_tokens", 0) or 0)
-                                usage_output += int(usage.get("output_tokens", 0) or 0)
-                                usage_cache_creation += int(
-                                    usage.get("cache_creation_input_tokens", 0) or 0
-                                )
-                                usage_cache_read += int(
-                                    usage.get("cache_read_input_tokens", 0) or 0
-                                )
-                                raw = msg.get("stop_reason")
-                                if raw:
-                                    stop_reason_raw = str(raw)
-                            elif event_type == "message_delta":
-                                delta = data.get("delta") or {}
-                                raw = delta.get("stop_reason")
-                                if raw:
-                                    stop_reason_raw = str(raw)
-                                usage = data.get("usage") or {}
-                                usage_output += int(usage.get("output_tokens", 0) or 0)
-                                # ``message_delta`` can also carry trailing cache
-                                # accounting on some model versions. Add (don't
-                                # overwrite) so partial counts from ``message_start``
-                                # aren't lost.
-                                usage_cache_creation += int(
-                                    usage.get("cache_creation_input_tokens", 0) or 0
-                                )
-                                usage_cache_read += int(
-                                    usage.get("cache_read_input_tokens", 0) or 0
-                                )
-                    event_name = ""
-                    data_lines = []
-                    continue
-                if line.startswith(":"):
-                    # SSE comment — ignore.
-                    continue
-                if line.startswith("event:"):
-                    event_name = line[len("event:") :].strip()
-                elif line.startswith("data:"):
-                    data_lines.append(line[len("data:") :].lstrip())
+        # Learned a sampling-param rejection above — replay the request
+        # now that ``_build_request_body`` will omit the offending param.
+        if retry_without_sampling:
+            async for ev in self.generate_stream(request):
+                yield ev
+            return
 
         # Map the final stop_reason and assemble the full assistant message.
         if stop_reason_raw == "tool_use":
@@ -816,6 +892,28 @@ class AnthropicAI(AIBackend):
 
     # --- Request Building ---
 
+    def _note_sampling_rejection(self, model: str, status: int, reason: str) -> bool:
+        """Record ``model`` as sampling-unsupported when an HTTP error is a
+        sampling-parameter rejection we haven't already learned.
+
+        Returns True when this call learned something new (i.e. the caller
+        should rebuild the request without the sampling params and retry).
+        Returns False for unrelated errors or models already flagged, so a
+        genuinely broken request isn't retried forever.
+        """
+        if model in self._sampling_unsupported:
+            return False
+        if not _is_sampling_param_error(status, reason):
+            return False
+        self._sampling_unsupported.add(model)
+        logger.warning(
+            "Model %s rejected a sampling parameter (%s); will omit "
+            "temperature for it going forward and retry.",
+            model,
+            reason,
+        )
+        return True
+
     def _build_request_body(self, request: AIRequest) -> dict[str, Any]:
         body: dict[str, Any] = {
             "model": request.model or self._model,
@@ -829,7 +927,17 @@ class AnthropicAI(AIBackend):
         if request.tools:
             body["tools"] = self._build_tools(request.tools)
 
-        body["temperature"] = self._temperature
+        # Only send ``temperature`` to models that accept it. Opus 4.7+
+        # reject sampling parameters with a 400; sending one there 400s
+        # every call (the cause of the sales-assistant intake storm).
+        # The runtime-learned set covers models the static check doesn't
+        # yet know about (e.g. a future config change).
+        model = body["model"]
+        if not (
+            _model_rejects_sampling_params(model)
+            or model in self._sampling_unsupported
+        ):
+            body["temperature"] = self._temperature
 
         # Prompt-caching breakpoint on the most-recent user turn.
         # Anthropic caches the prefix up to and including the tagged
