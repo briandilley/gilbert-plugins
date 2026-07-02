@@ -45,6 +45,7 @@ The table below is an index — jump to each plugin's detail section for configu
 | [jellyfin](#jellyfin) | `MediaLibraryBackend "jellyfin"` | — (uses `httpx`) | Media |
 | [kokoro](#kokoro) | `TTSBackend "kokoro"` | `kokoro`, `torch`, `av`, `numpy` | Speech |
 | [lutron-radiora](#lutron-radiora) | `LightsBackend "lutron-radiora"`, `ShadesBackend "lutron-radiora"` | `pylutron` | Lighting |
+| [mafia](#mafia) | `mafia_game` service | — (pure stdlib) | Games |
 | [mentra](#mentra) | `mentra` service (`MentraService` + `mentra_webhook` capability) — Gilbert on Mentra smart glasses (Even Realities G1, Vuzix Z100, Mentra Live) | `websockets>=12` | Wearables |
 | [messaging](#messaging) | `messaging` service (`MessagingService` + `send_text_message` AI tool, `/messages` SPA page) — RCS / MMS / SMS, RCS by default | — (pure stdlib) | Communication |
 | [mistral](#mistral) | `AIBackend "mistral"` | — (uses `httpx`) | Intelligence |
@@ -782,6 +783,30 @@ Both backends advertise the same connection parameters so the lights and shades 
 **Config action** — `test_connection`: connects to the repeater and reports the discovered light + shade counts.
 
 **Third-party deps** — `pylutron>=0.4.1`.
+
+---
+
+### mafia
+
+In-person social-deduction party game. Gilbert is the narrator: players gather in one room,
+a signed-in user creates a game at `/mafia` and shares the join code; everyone else joins from
+their phone with just a name (no account — see ADR-0011). Gilbert speaks the story aloud
+(requires the TTS service to be enabled; uses room speakers or falls back to the host's
+browser speaker), wakes the killers/doctor/detective at night for secret on-screen picks,
+and runs the open day vote. Strict-majority vote-outs; killers win at parity.
+
+**Provides:** `mafia_game` service (WS RPCs under `mafia.*`, guest-callable; `mafia_open` AI tool / `/mafia.open`).
+
+**Requires enabled:** `text_to_speech`.
+
+**Configure** (Settings → Games → Mafia): `enabled` (off by default), `narrator_prompt`
+(AI prompt), `ai_profile`, `speakers` (empty = default announce speakers), `announce_volume`
+(70), `nudge_seconds` (45), `max_concurrent_games` (2).
+
+Guests must be allowed (`auth.allow_guests`, on by default for LAN visitors) for account-less
+players to join.
+
+**No third-party Python dependencies.**
 
 ---
 
