@@ -110,6 +110,43 @@ protocol lives in core `interfaces/`; it lets the manager drive installs without
 backend's config, and lets a future runtime stand in for Ollama unchanged.
 _Avoid_: model store, downloader.
 
+## Games
+
+**Player**:
+A participant in a single game, identified only for that game's duration. Not the same as a
+*User* (account holder) — a Player may have no account. Creating a game always requires a User.
+_Avoid_: user, guest (both mean something else platform-wide).
+
+**Join code**:
+The short code (or QR) a game's creator shares that admits people as Players of that specific game.
+
+**Character**:
+A Player's secret in-game identity in Mafia — citizen, killer, doctor, or detective.
+_Avoid_: role (reserved platform-wide for the RBAC tier: admin/user/everyone).
+
+**Host**:
+The User who created a game. The Host is also a normal Player, but additionally steers the game's
+pacing (skipping a stalled phase, ending an undecided Day, removing a departed Player, aborting).
+_Avoid_: owner, admin (RBAC terms), narrator (that's Gilbert).
+
+**Narrator**:
+Gilbert's storytelling persona that runs a Mafia game: announces phases aloud, wakes special
+Characters, and weaves the night's outcome into a continuing story.
+
+**Ghost**:
+A dead Player. Ghosts spectate with full knowledge of all hidden state, may not speak in the room,
+and no longer act or vote.
+
+**Theme**:
+The story setting for a Mafia game (a camping trip, a haunted mansion, …), chosen by the game's
+creator at creation — from presets, free text, or left for the Narrator to invent — and held
+consistent across the whole game's narration.
+
+**Night / Day**:
+The two alternating Mafia phases. At *Night* all Players close their eyes and special Characters
+secretly act (kill / save / investigate); by *Day* everyone wakes, discusses, and votes to
+eliminate a suspect. A vote eliminates only on a strict majority of living Players.
+
 ## Vendor-specific terms
 
 **SMAPI service number**:
