@@ -7,7 +7,7 @@ from typing import Any
 
 from gilbert.interfaces.configuration import ConfigParam, ConfigurationReader
 from gilbert.interfaces.service import EnablementDep, Service, ServiceInfo, ServiceResolver
-from gilbert.interfaces.tools import ToolParameterType
+from gilbert.interfaces.tools import ToolDefinition, ToolParameterType
 
 from .game import (
     THEME_PRESETS,
@@ -561,3 +561,38 @@ class MafiaService(Service):
             speaker_names=self._speaker_names,
             volume=self._volume,
         )
+
+    # --- ToolProvider ---
+
+    @property
+    def tool_provider_name(self) -> str:
+        return "mafia"
+
+    def get_tools(self, user_ctx: Any = None) -> list[ToolDefinition]:
+        if not self._enabled:
+            return []
+        return [
+            ToolDefinition(
+                name="mafia_open",
+                description=(
+                    "Point users at the Mafia party game page. Call when someone "
+                    "wants to play Mafia (werewolf-style social deduction). The game "
+                    "itself is played at /mafia on each player's phone — this tool "
+                    "only returns the link and any open lobby join codes."
+                ),
+                parameters=[],
+                required_role="everyone",
+                slash_command="open",
+                slash_help="Open the Mafia party game",
+                parallel_safe=True,
+            )
+        ]
+
+    async def execute_tool(self, name: str, arguments: dict[str, Any]) -> str:
+        if name != "mafia_open":
+            raise KeyError(name)
+        lines = ["Gather everyone and open **[Open Mafia](/mafia)** on each phone."]
+        lobbies = [g for g in self._games.values() if g.phase is Phase.LOBBY]
+        for g in lobbies:
+            lines.append(f"- {g.host_name}'s game is open — join code **{g.join_code}**")
+        return "\n".join(lines)
