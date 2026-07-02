@@ -139,3 +139,112 @@ class MafiaGame:
             if p.token and secrets.compare_digest(p.token, token):
                 return p
         return None
+
+    # --- night ---
+
+    def begin_night(self) -> None:
+        self.night += 1
+        self.kill_proposed_by = None
+        self.kill_proposal = None
+        self.kill_target = None
+        self.save_target = None
+        self.votes = {}
+        self.phase = Phase.NIGHT_KILLERS
+
+    def _living(self, player_id: str) -> Player:
+        player = self.players.get(player_id)
+        if player is None or not player.alive:
+            raise GameError("That player is not in the game (or not alive)")
+        return player
+
+    def killer_act(self, player_id: str, target_id: str) -> str:
+        actor = self._living(player_id)
+        if actor.character is not Character.KILLER:
+            raise GameError("You are not a killer")
+        target = self._living(target_id)
+        if target.character is Character.KILLER:
+            raise GameError("You cannot target a fellow killer")
+        living_killers = self.alive_with(Character.KILLER)
+        if len(living_killers) == 1:
+            self.kill_target = target.player_id
+            return "confirmed"
+        if self.kill_proposal is None:
+            self.kill_proposal = target.player_id
+            self.kill_proposed_by = actor.player_id
+            return "proposed"
+        if actor.player_id == self.kill_proposed_by:
+            raise GameError("Wait for your partner to confirm")
+        if target.player_id != self.kill_proposal:
+            proposed = self.players[self.kill_proposal].name
+            raise GameError(f"Your partner chose {proposed} — tap them to confirm")
+        self.kill_target = target.player_id
+        return "confirmed"
+
+    def doctor_act(self, player_id: str, target_id: str) -> None:
+        actor = self._living(player_id)
+        if actor.character is not Character.DOCTOR:
+            raise GameError("You are not the doctor")
+        self.save_target = self._living(target_id).player_id
+
+    def detective_act(self, player_id: str, target_id: str) -> bool:
+        actor = self._living(player_id)
+        if actor.character is not Character.DETECTIVE:
+            raise GameError("You are not the detective")
+        if target_id == player_id:
+            raise GameError("You already know about yourself")
+        target = self._living(target_id)
+        self.checks.setdefault(actor.player_id, []).append(target.player_id)
+        return target.character is Character.KILLER
+
+    def resolve_night(self) -> Player | None:
+        if self.kill_target is None or self.kill_target == self.save_target:
+            return None
+        victim = self.players[self.kill_target]
+        victim.alive = False
+        return victim
+
+    # --- day ---
+
+    def cast_vote(self, voter_id: str, target: str | None) -> None:
+        if self.phase is not Phase.DAY:
+            raise GameError("There is no vote right now")
+        self._living(voter_id)
+        if target is None:
+            self.votes.pop(voter_id, None)
+            return
+        if target != "abstain":
+            self._living(target)
+        self.votes[voter_id] = target
+
+    def majority_needed(self) -> int:
+        return len(self.alive_players()) // 2 + 1
+
+    def tally(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for target in self.votes.values():
+            counts[target] = counts.get(target, 0) + 1
+        return counts
+
+    def majority_target(self) -> Player | None:
+        needed = self.majority_needed()
+        for target, count in self.tally().items():
+            if target != "abstain" and count >= needed:
+                return self.players[target]
+        return None
+
+    def eliminate(self, player_id: str) -> Player:
+        player = self.players[player_id]
+        player.alive = False
+        return player
+
+    # --- outcome ---
+
+    def check_winner(self) -> str:
+        living = self.alive_players()
+        killers = [p for p in living if p.character is Character.KILLER]
+        others = [p for p in living if p.character is not Character.KILLER]
+        if not killers:
+            return "citizens"
+        if len(killers) >= len(others):
+            return "killers"
+        return ""
