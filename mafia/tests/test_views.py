@@ -89,3 +89,41 @@ def test_ghost_sees_everything() -> None:
     ghost = state_for(g, citizen.player_id)["you"]["ghost"]
     assert ghost is not None
     assert set(ghost["characters"].values()) >= {"killer", "doctor"}
+
+
+def test_kill_proposal_visible_only_to_killers() -> None:
+    g = _started(8)
+    k1 = _by_char(g, Character.KILLER, 0)
+    k2 = _by_char(g, Character.KILLER, 1)
+    target = _by_char(g, Character.CITIZEN, 0)
+    g.killer_act(k1.player_id, target.player_id)
+    assert state_for(g, k1.player_id)["you"]["kill_proposal"] is not None
+    partner_view = state_for(g, k2.player_id)["you"]["kill_proposal"]
+    assert partner_view["target_id"] == target.player_id
+    doctor = _by_char(g, Character.DOCTOR)
+    detective = _by_char(g, Character.DETECTIVE)
+    bystander = _by_char(g, Character.CITIZEN, 1)
+    for pid in (doctor.player_id, detective.player_id, bystander.player_id):
+        assert state_for(g, pid)["you"]["kill_proposal"] is None
+    g.killer_act(k2.player_id, target.player_id)  # partner confirms
+    assert state_for(g, k1.player_id)["you"]["kill_proposal"] is None
+
+
+def test_votes_and_majority_gated_to_day_phase() -> None:
+    g = _started(8)
+    g.votes["someone"] = "target"  # bypass cast_vote to isolate the view gate
+    state = public_state(g)
+    assert state["votes"] == {}
+    assert state["majority_needed"] == 0
+    g.phase = Phase.DAY
+    state = public_state(g)
+    assert state["votes"] == {"someone": "target"}
+    assert state["majority_needed"] == g.majority_needed()
+
+
+def test_game_over_reveals_living_characters() -> None:
+    g = _started(8)
+    g.winner = "citizens"
+    state = public_state(g)
+    assert all(p["alive"] for p in state["players"])
+    assert all(p["character"] is not None for p in state["players"])
