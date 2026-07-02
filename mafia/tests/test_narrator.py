@@ -113,3 +113,32 @@ async def test_invent_theme() -> None:
     ai = _FakeAI(reply="A lighthouse cut off by a winter storm.")
     n = _narrator(ai=ai)
     assert await n.invent_theme() == "A lighthouse cut off by a winter storm."
+
+
+async def test_nudge_speaks_but_does_not_append_to_story() -> None:
+    """M1: nudges must not bloat the prompt or desync the client's story log."""
+    ai = _FakeAI(reply="Someone lingers in the shadows.")
+    spk = _FakeSpeaker()
+    n = _narrator(ai=ai, speaker=spk)
+    g = _game()
+    g.story.append("Night one was quiet.")
+    story_before = list(g.story)
+
+    text = await n.nudge(g)
+
+    assert text == "Someone lingers in the shadows."
+    assert g.story == story_before  # unchanged — not a story beat
+    assert spk.announced[0][0] == text  # but it was spoken
+    call = ai.calls[0]
+    assert call["tools_override"] == []
+    assert "a camping trip" in call["messages"][0].content  # still theme-aware
+
+
+async def test_nudge_falls_back_without_ai() -> None:
+    spk = _FakeSpeaker()
+    n = _narrator(ai=None, speaker=spk)
+    g = _game()
+    text = await n.nudge(g)
+    assert text == "Someone in the dark is taking their time."
+    assert g.story == []
+    assert spk.announced[0][0] == text

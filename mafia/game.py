@@ -17,8 +17,15 @@ from typing import Any
 MIN_PLAYERS = 4
 DETECTIVE_MIN_PLAYERS = 7
 SECOND_KILLER_MIN_PLAYERS = 8
+MAX_PLAYERS = 20
+MAX_NAME_LENGTH = 30
 
 _JOIN_CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+
+# ASCII C0 control characters + DEL — stripped from player-supplied names
+# (guest join-flood / display hardening; see add_player()).
+_CONTROL_CHARS = "".join(chr(c) for c in range(0x20)) + chr(0x7F)
+_CONTROL_CHAR_TABLE = str.maketrans("", "", _CONTROL_CHARS)
 
 THEME_SURPRISE = "surprise"
 THEME_PRESETS: list[tuple[str, str]] = [
@@ -103,9 +110,13 @@ class MafiaGame:
     def add_player(self, name: str, user_id: str = "") -> Player:
         if self.phase is not Phase.LOBBY:
             raise GameError("The game has already started")
-        clean = name.strip()
+        if len(self.players) >= MAX_PLAYERS:
+            raise GameError("The game is full")
+        clean = name.translate(_CONTROL_CHAR_TABLE).strip()
         if not clean:
             raise GameError("Pick a name first")
+        if len(clean) > MAX_NAME_LENGTH:
+            raise GameError("That name is too long")
         if any(p.name.lower() == clean.lower() for p in self.players.values()):
             raise GameError(f"The name {clean!r} is taken")
         player = Player(

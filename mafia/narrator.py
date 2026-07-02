@@ -101,6 +101,25 @@ class Narrator:
         await self.speak(text)
         return text
 
+    async def nudge(self, game: MafiaGame) -> str:
+        """Speak a short, theme-aware nudge WITHOUT appending to ``game.story``.
+
+        Nudges fire repeatedly while a phase stalls. Treating them as story
+        beats (via :meth:`narrate`) would both bloat the prompt sent on
+        every future beat and desync the client's story log from what was
+        actually spoken, since a nudge names no facts worth remembering.
+        """
+        parts = [
+            f"Theme / setting (stay strictly consistent with it): {game.theme}",
+            _BEAT_INSTRUCTIONS["nudge"],
+            "Write one short sentence. Spoken aloud, so no stage directions or markdown.",
+        ]
+        text = await self._one_shot("\n".join(p for p in parts if p))
+        if not text:
+            text = "Someone in the dark is taking their time."
+        await self.speak(text)
+        return text
+
     async def _one_shot(self, prompt: str) -> str:
         """Call the AI with a single user message and no tool loop (ADR-0010)."""
         if not isinstance(self._ai, AISamplingProvider):
