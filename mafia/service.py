@@ -55,7 +55,6 @@ class MafiaService(Service):
         # game_id → player_id → live connections (per-player secret channel)
         self._conns: dict[str, dict[str, set[Any]]] = {}
         self._nudge_tasks: dict[str, asyncio.Task[None]] = {}
-        self._beat_tasks: dict[str, asyncio.Task[None]] = {}
 
     def service_info(self) -> ServiceInfo:
         return ServiceInfo(
@@ -145,10 +144,9 @@ class MafiaService(Service):
 
     async def stop(self) -> None:
         self._enabled = False
-        for task in (*self._nudge_tasks.values(), *self._beat_tasks.values()):
+        for task in self._nudge_tasks.values():
             task.cancel()
         self._nudge_tasks.clear()
-        self._beat_tasks.clear()
         self._games.clear()
         self._conns.clear()
 
