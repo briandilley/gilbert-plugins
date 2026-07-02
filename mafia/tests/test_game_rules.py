@@ -132,6 +132,61 @@ class TestVoting:
             g.cast_vote(pids[0], pids[4])
 
 
+class TestPurgeReferences:
+    def test_removed_proposer_clears_proposal_pair(self) -> None:
+        g = _started(8)  # killer duo
+        k1 = _pid(g, Character.KILLER, 0)
+        g.killer_act(k1, _citizen(g))
+        g.purge_references(k1)
+        assert g.kill_proposal is None
+        assert g.kill_proposed_by is None
+
+    def test_removed_proposal_target_clears_proposal_pair(self) -> None:
+        g = _started(8)
+        k1, target = _pid(g, Character.KILLER, 0), _citizen(g)
+        g.killer_act(k1, target)
+        g.purge_references(target)
+        assert g.kill_proposal is None
+        assert g.kill_proposed_by is None
+
+    def test_removed_kill_target_cleared(self) -> None:
+        g = _started(6)  # single killer confirms instantly
+        target = _citizen(g)
+        g.killer_act(_pid(g, Character.KILLER), target)
+        g.purge_references(target)
+        assert g.kill_target is None
+
+    def test_removed_save_target_cleared(self) -> None:
+        g = _started(6)
+        saved = _citizen(g)
+        g.doctor_act(_pid(g, Character.DOCTOR), saved)
+        g.purge_references(saved)
+        assert g.save_target is None
+
+    def test_votes_by_and_for_removed_player_stripped(self) -> None:
+        g = _started(6)
+        g.phase = Phase.DAY
+        pids = [p.player_id for p in g.alive_players()]
+        removed = pids[0]
+        g.cast_vote(removed, pids[1])  # vote BY the removed player
+        g.cast_vote(pids[1], removed)  # vote FOR the removed player
+        g.cast_vote(pids[2], pids[3])  # unrelated vote
+        g.purge_references(removed)
+        assert removed not in g.votes
+        assert removed not in g.votes.values()
+        assert g.votes == {pids[2]: pids[3]}
+
+    def test_unrelated_state_untouched(self) -> None:
+        g = _started(8)
+        k1, target = _pid(g, Character.KILLER, 0), _citizen(g)
+        g.killer_act(k1, target)
+        g.doctor_act(_pid(g, Character.DOCTOR), _citizen(g, 1))
+        g.purge_references(_citizen(g, 2))  # bystander with no references
+        assert g.kill_proposal == target
+        assert g.kill_proposed_by == k1
+        assert g.save_target == _citizen(g, 1)
+
+
 class TestWinConditions:
     def test_citizens_win_when_killers_gone(self) -> None:
         g = _started(6)

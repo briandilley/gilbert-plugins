@@ -238,6 +238,18 @@ class MafiaGame:
         player.alive = False
         return player
 
+    def purge_references(self, player_id: str) -> None:
+        """Drop night picks and votes that point at a removed player."""
+        if self.kill_proposal == player_id or self.kill_proposed_by == player_id:
+            self.kill_proposal = None
+            self.kill_proposed_by = None
+        if self.kill_target == player_id:
+            self.kill_target = None
+        if self.save_target == player_id:
+            self.save_target = None
+        self.votes.pop(player_id, None)
+        self.votes = {v: t for v, t in self.votes.items() if t != player_id}
+
     # --- outcome ---
 
     def check_winner(self) -> str:

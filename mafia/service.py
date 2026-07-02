@@ -16,6 +16,7 @@ from .game import (
     GameError,
     MafiaGame,
     Phase,
+    Player,
     state_for,
 )
 from .narrator import Narrator
@@ -413,7 +414,7 @@ class MafiaService(Service):
         self._push_state(game)
         return {"type": "mafia.vote.cast.result", "ref": frame.get("id")}
 
-    async def _dusk(self, game: MafiaGame, eliminated: Any | None) -> None:
+    async def _dusk(self, game: MafiaGame, eliminated: Player | None) -> None:
         game.phase = Phase.DUSK
         narrator = self._narrator()
         await narrator.speak("The town has decided. Everyone, close your eyes.")
@@ -484,6 +485,7 @@ class MafiaService(Service):
         if player is None or not player.alive:
             return self._err(frame, "No such living player", 404)
         game.eliminate(player_id)
+        game.purge_references(player_id)
         narrator = self._narrator()
         await narrator.cue(
             game,
@@ -491,7 +493,14 @@ class MafiaService(Service):
             f"{player.name} has left the story. They were the {player.character}.",
         )
         if not await self._maybe_finish(game):
-            if game.phase in (Phase.NIGHT_KILLERS, Phase.NIGHT_DOCTOR, Phase.NIGHT_DETECTIVE):
+            # Advance only when the removed player was the awaited night actor —
+            # removing a bystander must not forfeit the pending kill/save/check.
+            phase_char = {
+                Phase.NIGHT_KILLERS: Character.KILLER,
+                Phase.NIGHT_DOCTOR: Character.DOCTOR,
+                Phase.NIGHT_DETECTIVE: Character.DETECTIVE,
+            }.get(game.phase)
+            if phase_char is not None and not game.alive_with(phase_char):
                 await self._advance_night(game)
         self._push_state(game)
         return {"type": "mafia.host.remove_player.result", "ref": frame.get("id")}

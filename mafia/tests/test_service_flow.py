@@ -211,6 +211,101 @@ async def test_host_abort(table) -> None:
     assert created["game_id"] not in svc._games
 
 
+async def _remove(svc: MafiaService, conns: dict[str, _Conn], game: Any, player: Any):
+    return await svc._ws_host_remove(
+        conns["Cam"], {"id": "r", "game_id": game.game_id, "player_id": player.player_id}
+    )
+
+
+async def test_host_remove_bystander_keeps_night_phase(table) -> None:
+    """Removing a citizen during NIGHT_KILLERS must not forfeit the kill."""
+    svc, created, conns, joins = table
+    game = _game(svc, created)
+    killer = _by_char(game, Character.KILLER)
+    bystander = _by_char(game, Character.CITIZEN)
+    other = _by_char(game, Character.CITIZEN, 1)
+
+    resp = await _remove(svc, conns, game, bystander)
+    assert resp["type"] == "mafia.host.remove_player.result"
+    assert game.phase is Phase.NIGHT_KILLERS  # killer is still the awaited actor
+    # the killer can still act
+    resp = await _act(svc, game, joins, killer, other)
+    assert resp["type"] == "mafia.night.act.result"
+    assert game.phase is Phase.NIGHT_DOCTOR
+
+
+async def test_host_remove_awaited_doctor_advances_and_purges_kill(table) -> None:
+    """Removing the awaited doctor advances the night; their stale kill_target is purged."""
+    svc, created, conns, joins = table
+    game = _game(svc, created)
+    killer = _by_char(game, Character.KILLER)
+    doctor = _by_char(game, Character.DOCTOR)
+
+    await _act(svc, game, joins, killer, doctor)  # killer targets the doctor
+    assert game.phase is Phase.NIGHT_DOCTOR
+
+    resp = await _remove(svc, conns, game, doctor)
+    assert resp["type"] == "mafia.host.remove_player.result"
+    # doctor was the awaited actor → night advanced (4 players: no detective → dawn → day)
+    assert game.phase is Phase.DAY
+    # the pending kill pointed at the removed doctor and was purged — nobody double-dies
+    assert game.kill_target is None
+
+
+async def test_host_remove_sole_killer_ends_game(table) -> None:
+    svc, created, conns, joins = table
+    game = _game(svc, created)
+    killer = _by_char(game, Character.KILLER)
+    resp = await _remove(svc, conns, game, killer)
+    assert resp["type"] == "mafia.host.remove_player.result"
+    assert game.winner == "citizens"
+    assert game.phase is Phase.ENDED
+
+
+async def test_host_remove_purges_votes_for_target(table) -> None:
+    """Stale votes for a removed player must not later 'eliminate' the dead player."""
+    svc, created, conns, joins = table
+    game = _game(svc, created)
+    killer = _by_char(game, Character.KILLER)
+    doctor = _by_char(game, Character.DOCTOR)
+    victim = _by_char(game, Character.CITIZEN)
+    other = _by_char(game, Character.CITIZEN, 1)
+
+    await _act(svc, game, joins, killer, victim)
+    await _act(svc, game, joins, doctor, victim)  # save → nobody dies, 4 alive in DAY
+    assert game.phase is Phase.DAY
+    assert game.majority_needed() == 3
+
+    for voter in (killer, doctor):  # 2 votes for victim — below majority of 3
+        resp = await svc._ws_vote_cast(
+            None,
+            {
+                "id": "v",
+                "game_id": game.game_id,
+                "player_token": _token(game, joins, voter),
+                "target": victim.player_id,
+            },
+        )
+        assert resp["type"] == "mafia.vote.cast.result"
+
+    await _remove(svc, conns, game, victim)  # 3 alive → majority drops to 2
+    assert victim.player_id not in game.votes.values()
+
+    # a subsequent vote must not resolve a majority onto the already-dead victim
+    resp = await svc._ws_vote_cast(
+        None,
+        {
+            "id": "v2",
+            "game_id": game.game_id,
+            "player_token": _token(game, joins, other),
+            "target": "abstain",
+        },
+    )
+    assert resp["type"] == "mafia.vote.cast.result"
+    assert game.phase is Phase.DAY
+    assert game.winner == ""
+
+
 async def test_secret_push_targeting(table) -> None:
     """The killer's awaiting flag reaches only the killer's connection."""
     svc, created, conns, joins = table
