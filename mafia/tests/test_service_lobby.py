@@ -125,3 +125,60 @@ async def test_declared_rpc_roles(svc: MafiaService) -> None:
     assert svc.get_ws_rpc_roles() == {"mafia.": "everyone"}
     handlers = svc.get_ws_handlers()
     assert "mafia.game.join" in handlers and "mafia.game.create" in handlers
+
+
+async def test_create_with_blank_display_name_falls_back(svc: MafiaService) -> None:
+    """M3: an empty host display_name falls back to user_id, then 'Host'."""
+    conn = _Conn(user_id="usr_9", name="")
+    created = await _create(svc, conn)
+    assert created["state"]["you"]["name"] == "usr_9"
+
+
+class TestDisabledService:
+    """C1: WsConnectionManager.subscribe_to_bus discovers get_ws_handlers()
+    exactly once at startup. If it returned {} while disabled, a service
+    enabled later via Settings would never get its RPC surface wired up
+    without a full process restart, and toggling off wouldn't close it
+    either (the manager's cached dict never re-consults get_ws_handlers()).
+    Both problems are fixed by registering unconditionally and gating each
+    handler individually via _disabled_err()."""
+
+    @pytest.fixture
+    async def disabled_svc(self) -> MafiaService:
+        service = MafiaService()
+        service._config = {"enabled": False}
+        await service.on_config_changed(service._config)
+        service._resolver = _FakeResolver()
+        service._enabled = False
+        return service
+
+    async def test_handlers_registered_even_while_disabled(
+        self, disabled_svc: MafiaService
+    ) -> None:
+        handlers = disabled_svc.get_ws_handlers()
+        assert handlers  # non-empty — discoverable at boot regardless of enabled state
+        assert "mafia.game.create" in handlers
+        assert "mafia.game.join" in handlers
+
+    async def test_call_while_disabled_returns_403(self, disabled_svc: MafiaService) -> None:
+        resp = await disabled_svc._ws_game_create(_Conn(), {"id": "r1", "theme_key": "camping"})
+        assert resp["type"] == "gilbert.error"
+        assert resp["code"] == 403
+        assert "disabled" in resp["error"].lower()
+
+    async def test_every_registered_handler_rejects_while_disabled(
+        self, disabled_svc: MafiaService
+    ) -> None:
+        """Every frame type registered by get_ws_handlers() must actually
+        honor the disabled gate — not just the ones exercised elsewhere."""
+        for frame_type, handler in disabled_svc.get_ws_handlers().items():
+            resp = await handler(_Conn(), {"id": "x", "game_id": "nope"})
+            assert resp["type"] == "gilbert.error", f"{frame_type} did not reject: {resp}"
+            assert resp["code"] == 403, f"{frame_type} did not 403: {resp}"
+
+    async def test_toggling_back_on_restores_normal_behavior(
+        self, disabled_svc: MafiaService
+    ) -> None:
+        disabled_svc._enabled = True
+        created = await _create(disabled_svc, _Conn())
+        assert created["join_code"]

@@ -62,8 +62,12 @@ export function MafiaPage(): ReactElement {
           setSession(null);
         }
       }
-      const { games } = await api.activeGames();
-      setActiveGames(games);
+      try {
+        const { games } = await api.activeGames();
+        setActiveGames(games);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      }
     })();
   }, [connected]); // eslint-disable-line react-hooks/exhaustive-deps
 

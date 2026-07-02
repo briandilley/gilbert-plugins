@@ -5,9 +5,11 @@ import contextvars
 import logging
 from typing import Any
 
+from gilbert.interfaces.auth import UserContext
 from gilbert.interfaces.configuration import ConfigParam, ConfigurationReader
 from gilbert.interfaces.service import EnablementDep, Service, ServiceInfo, ServiceResolver
 from gilbert.interfaces.tools import ToolDefinition, ToolParameterType
+from gilbert.interfaces.ws import WsConnectionBase
 
 from .game import (
     THEME_PRESETS,
@@ -153,8 +155,13 @@ class MafiaService(Service):
     # --- WS wiring ---
 
     def get_ws_handlers(self) -> dict[str, Any]:
-        if not self._enabled:
-            return {}
+        # Discovered ONCE at startup (WsConnectionManager.subscribe_to_bus
+        # runs exactly once) -- gating this on self._enabled would mean a
+        # service left disabled at boot never gets its RPC surface wired
+        # up, even after being toggled on later, until a full process
+        # restart. Always register the frame types; each handler checks
+        # self._enabled itself via _disabled_err() so toggling off closes
+        # the surface immediately without waiting for a restart.
         return {
             "mafia.game.create": self._ws_game_create,
             "mafia.game.join": self._ws_game_join,
@@ -178,7 +185,19 @@ class MafiaService(Service):
     def _err(frame: dict[str, Any], message: str, code: int = 400) -> dict[str, Any]:
         return {"type": "gilbert.error", "ref": frame.get("id"), "error": message, "code": code}
 
-    def _register_conn(self, game_id: str, player_id: str, conn: Any) -> None:
+    def _disabled_err(self, frame: dict[str, Any]) -> dict[str, Any] | None:
+        """Return a 403 error frame if the service is toggled off, else None.
+
+        get_ws_handlers() registers mafia.* frame types unconditionally
+        (see its docstring) since discovery only happens once at startup;
+        this per-call guard is what actually closes the RPC surface when
+        the service is disabled at runtime.
+        """
+        if not self._enabled:
+            return self._err(frame, "The Mafia game is disabled", 403)
+        return None
+
+    def _register_conn(self, game_id: str, player_id: str, conn: WsConnectionBase) -> None:
         conns = self._conns.setdefault(game_id, {}).setdefault(player_id, set())
         if conn in conns:
             return
@@ -209,7 +228,7 @@ class MafiaService(Service):
             return self._err(frame, "Not a player in this game", 403)
         return game, player
 
-    def _require_host(self, conn: Any, frame: dict[str, Any]) -> MafiaGame | dict[str, Any]:
+    def _require_host(self, conn: WsConnectionBase, frame: dict[str, Any]) -> MafiaGame | dict[str, Any]:
         game = self._games.get(str(frame.get("game_id", "")))
         if game is None:
             return self._err(frame, "Game not found", 404)
@@ -219,7 +238,9 @@ class MafiaService(Service):
 
     # --- lobby handlers ---
 
-    async def _ws_game_create(self, conn: Any, frame: dict[str, Any]) -> dict[str, Any]:
+    async def _ws_game_create(self, conn: WsConnectionBase, frame: dict[str, Any]) -> dict[str, Any]:
+        if (err := self._disabled_err(frame)) is not None:
+            return err
         user_id = conn.user_ctx.user_id
         if conn.user_level > 100 or user_id in ("", "guest"):
             return self._err(frame, "Creating a game needs a signed-in account", 403)
@@ -238,13 +259,14 @@ class MafiaService(Service):
             if preset is None:
                 return self._err(frame, f"Unknown theme {theme_key!r}")
             theme = preset
+        host_name = conn.user_ctx.display_name or conn.user_ctx.user_id or "Host"
         game = MafiaGame(
             host_user_id=user_id,
-            host_name=conn.user_ctx.display_name,
+            host_name=host_name,
             theme=theme,
             theme_key=theme_key,
         )
-        host_player = game.add_player(conn.user_ctx.display_name, user_id=user_id)
+        host_player = game.add_player(host_name, user_id=user_id)
         self._games[game.game_id] = game
         self._register_conn(game.game_id, host_player.player_id, conn)
         return {
@@ -257,7 +279,9 @@ class MafiaService(Service):
             "state": state_for(game, host_player.player_id),
         }
 
-    async def _ws_game_join(self, conn: Any, frame: dict[str, Any]) -> dict[str, Any]:
+    async def _ws_game_join(self, conn: WsConnectionBase, frame: dict[str, Any]) -> dict[str, Any]:
+        if (err := self._disabled_err(frame)) is not None:
+            return err
         code = str(frame.get("join_code", "")).strip().upper()
         game = next((g for g in self._games.values() if g.join_code == code), None)
         if game is None:
@@ -280,7 +304,9 @@ class MafiaService(Service):
             "state": state_for(game, player.player_id),
         }
 
-    async def _ws_game_resume(self, conn: Any, frame: dict[str, Any]) -> dict[str, Any]:
+    async def _ws_game_resume(self, conn: WsConnectionBase, frame: dict[str, Any]) -> dict[str, Any]:
+        if (err := self._disabled_err(frame)) is not None:
+            return err
         result = self._game_and_player(frame)
         if isinstance(result, dict):
             return result
@@ -292,7 +318,9 @@ class MafiaService(Service):
             "state": state_for(game, player.player_id),
         }
 
-    async def _ws_games_active(self, conn: Any, frame: dict[str, Any]) -> dict[str, Any]:
+    async def _ws_games_active(self, conn: WsConnectionBase, frame: dict[str, Any]) -> dict[str, Any]:
+        if (err := self._disabled_err(frame)) is not None:
+            return err
         return {
             "type": "mafia.games.active.result",
             "ref": frame.get("id"),
@@ -311,20 +339,32 @@ class MafiaService(Service):
 
     # --- game loop ---
 
-    async def _ws_game_start(self, conn: Any, frame: dict[str, Any]) -> dict[str, Any]:
+    async def _ws_game_start(self, conn: WsConnectionBase, frame: dict[str, Any]) -> dict[str, Any]:
+        if (err := self._disabled_err(frame)) is not None:
+            return err
         result = self._require_host(conn, frame)
         if isinstance(result, dict):
             return result
         game = result
         if game.phase is not Phase.LOBBY:
             return self._err(frame, "The game has already started")
-        narrator = self._narrator()
-        if game.theme_key == THEME_SURPRISE and not game.theme:
-            game.theme = await narrator.invent_theme()
         try:
             game.assign_characters()
         except GameError as exc:
             return self._err(frame, str(exc))
+        # Everything from the LOBBY check above through this assignment is
+        # synchronous (no ``await``), so it can't be interleaved with a
+        # concurrent start or join. Claim the game *before* the first await
+        # (theme invention / narration, which can take seconds): a second
+        # concurrent start then sees a non-LOBBY phase and bails with
+        # "already started" instead of reshuffling characters or
+        # double-running the night, and add_player's own LOBBY-only check
+        # rejects a join that arrives mid-start. If assign_characters()
+        # raised above, the phase never left LOBBY.
+        game.phase = Phase.DAWN  # non-LOBBY placeholder meaning "starting"
+        narrator = self._narrator()
+        if game.theme_key == THEME_SURPRISE and not game.theme:
+            game.theme = await narrator.invent_theme()
         names = ", ".join(p.name for p in game.players.values())
         await narrator.cue(game, "intro", f"The inhabitants: {names}.")
         game.begin_night()
@@ -335,7 +375,9 @@ class MafiaService(Service):
         self._restart_nudge(game)
         return {"type": "mafia.game.start.result", "ref": frame.get("id")}
 
-    async def _ws_night_act(self, conn: Any, frame: dict[str, Any]) -> dict[str, Any]:
+    async def _ws_night_act(self, conn: WsConnectionBase, frame: dict[str, Any]) -> dict[str, Any]:
+        if (err := self._disabled_err(frame)) is not None:
+            return err
         result = self._game_and_player(frame)
         if isinstance(result, dict):
             return result
@@ -395,7 +437,9 @@ class MafiaService(Service):
         game.phase = Phase.DAY
         await narrator.speak("Everyone, open your eyes. Discuss — then vote on your phones.")
 
-    async def _ws_vote_cast(self, conn: Any, frame: dict[str, Any]) -> dict[str, Any]:
+    async def _ws_vote_cast(self, conn: WsConnectionBase, frame: dict[str, Any]) -> dict[str, Any]:
+        if (err := self._disabled_err(frame)) is not None:
+            return err
         result = self._game_and_player(frame)
         if isinstance(result, dict):
             return result
@@ -446,11 +490,20 @@ class MafiaService(Service):
         await narrator.cue(game, "win", facts)
         self._cancel_nudge(game.game_id)
         self._push_state(game)
+        # Ended games would otherwise be retained forever — unbounded memory
+        # growth, and a join-code collision with a retained ENDED game can
+        # block a new lobby from forming. The final state was already
+        # pushed above, so every ghost keeps it client-side; drop the
+        # server-side copy the same way _ws_host_abort does.
+        self._games.pop(game.game_id, None)
+        self._conns.pop(game.game_id, None)
         return True
 
     # --- host powers ---
 
-    async def _ws_host_skip(self, conn: Any, frame: dict[str, Any]) -> dict[str, Any]:
+    async def _ws_host_skip(self, conn: WsConnectionBase, frame: dict[str, Any]) -> dict[str, Any]:
+        if (err := self._disabled_err(frame)) is not None:
+            return err
         result = self._require_host(conn, frame)
         if isinstance(result, dict):
             return result
@@ -462,7 +515,9 @@ class MafiaService(Service):
         self._restart_nudge(game)
         return {"type": "mafia.host.skip_phase.result", "ref": frame.get("id")}
 
-    async def _ws_host_end_day(self, conn: Any, frame: dict[str, Any]) -> dict[str, Any]:
+    async def _ws_host_end_day(self, conn: WsConnectionBase, frame: dict[str, Any]) -> dict[str, Any]:
+        if (err := self._disabled_err(frame)) is not None:
+            return err
         result = self._require_host(conn, frame)
         if isinstance(result, dict):
             return result
@@ -473,7 +528,9 @@ class MafiaService(Service):
         self._push_state(game)
         return {"type": "mafia.host.end_day.result", "ref": frame.get("id")}
 
-    async def _ws_host_remove(self, conn: Any, frame: dict[str, Any]) -> dict[str, Any]:
+    async def _ws_host_remove(self, conn: WsConnectionBase, frame: dict[str, Any]) -> dict[str, Any]:
+        if (err := self._disabled_err(frame)) is not None:
+            return err
         result = self._require_host(conn, frame)
         if isinstance(result, dict):
             return result
@@ -491,19 +548,30 @@ class MafiaService(Service):
             f"{player.name} has left the story. They were the {player.character}.",
         )
         if not await self._maybe_finish(game):
-            # Advance only when the removed player was the awaited night actor —
-            # removing a bystander must not forfeit the pending kill/save/check.
-            phase_char = {
-                Phase.NIGHT_KILLERS: Character.KILLER,
-                Phase.NIGHT_DOCTOR: Character.DOCTOR,
-                Phase.NIGHT_DETECTIVE: Character.DETECTIVE,
-            }.get(game.phase)
-            if phase_char is not None and not game.alive_with(phase_char):
-                await self._advance_night(game)
+            if game.phase is Phase.DAY:
+                # Removing a bystander can drop the alive count enough that
+                # an existing vote tally now clears the (now-lower) majority
+                # threshold — resolve it immediately rather than waiting for
+                # a vote that may never come.
+                target = game.majority_target()
+                if target is not None:
+                    await self._dusk(game, eliminated=target)
+            else:
+                # Advance only when the removed player was the awaited night actor —
+                # removing a bystander must not forfeit the pending kill/save/check.
+                phase_char = {
+                    Phase.NIGHT_KILLERS: Character.KILLER,
+                    Phase.NIGHT_DOCTOR: Character.DOCTOR,
+                    Phase.NIGHT_DETECTIVE: Character.DETECTIVE,
+                }.get(game.phase)
+                if phase_char is not None and not game.alive_with(phase_char):
+                    await self._advance_night(game)
         self._push_state(game)
         return {"type": "mafia.host.remove_player.result", "ref": frame.get("id")}
 
-    async def _ws_host_abort(self, conn: Any, frame: dict[str, Any]) -> dict[str, Any]:
+    async def _ws_host_abort(self, conn: WsConnectionBase, frame: dict[str, Any]) -> dict[str, Any]:
+        if (err := self._disabled_err(frame)) is not None:
+            return err
         result = self._require_host(conn, frame)
         if isinstance(result, dict):
             return result
@@ -542,9 +610,7 @@ class MafiaService(Service):
             ):
                 return
             try:
-                await self._narrator().cue(
-                    game, "nudge", "Someone in the dark is taking their time."
-                )
+                await self._narrator().nudge(game)
             except Exception:
                 logger.exception("Mafia nudge failed")
 
@@ -566,7 +632,7 @@ class MafiaService(Service):
     def tool_provider_name(self) -> str:
         return "mafia"
 
-    def get_tools(self, user_ctx: Any = None) -> list[ToolDefinition]:
+    def get_tools(self, user_ctx: UserContext | None = None) -> list[ToolDefinition]:
         if not self._enabled:
             return []
         return [
