@@ -53,6 +53,13 @@ export interface GameState {
   you: YouState;
 }
 
+/** The raw WS frame the server enqueues on every game-state change. */
+export interface MafiaStateFrame {
+  type: "mafia.state";
+  game_id: string;
+  state: GameState;
+}
+
 export interface MafiaSession {
   gameId: string;
   playerId: string;

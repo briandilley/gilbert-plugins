@@ -14,8 +14,23 @@ interface CreateResult {
 
 interface JoinResult extends CreateResult {}
 
+/** The typed WS RPC bindings returned by ``useMafiaApi``. */
+export interface MafiaApi {
+  create: (themeKey: string, themeText?: string) => Promise<CreateResult>;
+  join: (joinCode: string, name: string) => Promise<JoinResult>;
+  resume: (gameId: string, playerToken: string) => Promise<{ state: GameState }>;
+  activeGames: () => Promise<{ games: ActiveGame[] }>;
+  start: (gameId: string) => Promise<Record<string, unknown>>;
+  nightAct: (gameId: string, playerToken: string, targetId: string) => Promise<{ is_killer?: boolean }>;
+  vote: (gameId: string, playerToken: string, target: string | null) => Promise<Record<string, unknown>>;
+  hostSkip: (gameId: string) => Promise<Record<string, unknown>>;
+  hostEndDay: (gameId: string) => Promise<Record<string, unknown>>;
+  hostRemove: (gameId: string, playerId: string) => Promise<Record<string, unknown>>;
+  hostAbort: (gameId: string) => Promise<Record<string, unknown>>;
+}
+
 /** Typed WS RPC bindings for the mafia plugin. */
-export function useMafiaApi() {
+export function useMafiaApi(): MafiaApi {
   const { rpc } = useWebSocket();
   return useMemo(
     () => ({

@@ -12,7 +12,7 @@ import { Lobby } from "./components/Lobby";
 import { NightAction } from "./components/NightAction";
 import { StoryLog } from "./components/StoryLog";
 import { VotePanel } from "./components/VotePanel";
-import type { ActiveGame, GameState, MafiaSession } from "./types";
+import type { ActiveGame, GameState, MafiaSession, MafiaStateFrame } from "./types";
 
 const SESSION_KEY = "mafia.session";
 
@@ -37,12 +37,13 @@ export function MafiaPage(): ReactElement {
   // canCreate: probe once — guests get a 403 creating, so gate on /auth/me
   const [canCreate, setCanCreate] = useState(false);
 
-  // live pushes
+  // live pushes — the server enqueues mafia.state as a direct frame (not a
+  // gilbert.event envelope), so the subscriber receives the raw frame.
   useEffect(
     () =>
-      subscribe("mafia.state", (event) => {
-        const s = event.data.state as GameState;
-        if (!session || event.data.game_id === session.gameId) setState(s);
+      subscribe("mafia.state", (frame) => {
+        const f = frame as unknown as MafiaStateFrame;
+        if (!session || f.game_id === session.gameId) setState(f.state);
       }),
     [subscribe, session],
   );
