@@ -12,6 +12,7 @@ import secrets
 import uuid
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import Any
 
 MIN_PLAYERS = 4
 DETECTIVE_MIN_PLAYERS = 7
@@ -248,3 +249,95 @@ class MafiaGame:
         if len(killers) >= len(others):
             return "killers"
         return ""
+
+
+def _character_public(game: MafiaGame, player: Player) -> str | None:
+    """Reveal-on-death: characters are public once dead, or when the game is over."""
+    if not player.alive or game.winner:
+        return str(player.character)
+    return None
+
+
+def public_state(game: MafiaGame) -> dict[str, Any]:
+    in_day = game.phase is Phase.DAY
+    return {
+        "game_id": game.game_id,
+        "phase": str(game.phase),
+        "night": game.night,
+        "theme_key": game.theme_key,
+        "join_code": game.join_code if game.phase is Phase.LOBBY else "",
+        "players": [
+            {
+                "player_id": p.player_id,
+                "name": p.name,
+                "alive": p.alive,
+                "is_host": p.user_id == game.host_user_id,
+                "character": _character_public(game, p),
+            }
+            for p in game.players.values()
+        ],
+        "story": list(game.story),
+        "votes": dict(game.votes) if in_day else {},
+        "majority_needed": game.majority_needed() if in_day else 0,
+        "winner": game.winner,
+    }
+
+
+def _awaiting_for(game: MafiaGame, player: Player) -> str | None:
+    if not player.alive:
+        return None
+    if game.phase is Phase.NIGHT_KILLERS and player.character is Character.KILLER:
+        if game.kill_target is not None:
+            return None
+        if game.kill_proposal is not None:
+            return None if player.player_id == game.kill_proposed_by else "kill_confirm"
+        return "kill"
+    if game.phase is Phase.NIGHT_DOCTOR and player.character is Character.DOCTOR:
+        return "save" if game.save_target is None else None
+    if game.phase is Phase.NIGHT_DETECTIVE and player.character is Character.DETECTIVE:
+        return "check"
+    return None
+
+
+def state_for(game: MafiaGame, player_id: str) -> dict[str, Any]:
+    state = public_state(game)
+    player = game.players[player_id]
+    assigned = game.phase is not Phase.LOBBY
+    partner_name: str | None = None
+    if assigned and player.character is Character.KILLER:
+        partners = [k for k in game.killers() if k.player_id != player.player_id and k.alive]
+        partner_name = partners[0].name if partners else None
+    proposal: dict[str, str] | None = None
+    if (
+        player.character is Character.KILLER
+        and game.kill_proposal is not None
+        and game.kill_target is None
+    ):
+        target = game.players[game.kill_proposal]
+        proposal = {"target_id": target.player_id, "target_name": target.name}
+    check_results = [
+        {
+            "player_id": pid,
+            "name": game.players[pid].name,
+            "is_killer": game.players[pid].character is Character.KILLER,
+        }
+        for pid in game.checks.get(player.player_id, [])
+    ]
+    ghost: dict[str, Any] | None = None
+    if not player.alive or game.winner:
+        ghost = {
+            "characters": {p.player_id: str(p.character) for p in game.players.values()}
+        }
+    state["you"] = {
+        "player_id": player.player_id,
+        "name": player.name,
+        "alive": player.alive,
+        "is_host": player.user_id == game.host_user_id,
+        "character": str(player.character) if assigned else None,
+        "partner_name": partner_name,
+        "awaiting": _awaiting_for(game, player),
+        "kill_proposal": proposal,
+        "check_results": check_results,
+        "ghost": ghost,
+    }
+    return state
