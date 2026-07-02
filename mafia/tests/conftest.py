@@ -27,8 +27,8 @@ if _pkg_name not in sys.modules:
 
     # Leaf modules first, then dependents (service ← plugin), so each
     # relative import binds to the already-registered single copy.
-    # Note: game and narrator modules will be added in later tasks.
-    for _mod_name in ("service", "plugin"):
+    # Note: narrator module will be added in later tasks.
+    for _mod_name in ("game", "service", "plugin"):
         _spec = importlib.util.spec_from_file_location(
             f"{_pkg_name}.{_mod_name}",
             _plugin_dir / f"{_mod_name}.py",
