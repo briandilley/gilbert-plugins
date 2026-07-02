@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 from typing import Any
 
@@ -11,6 +12,7 @@ from gilbert.interfaces.tools import ToolParameterType
 from .game import (
     THEME_PRESETS,
     THEME_SURPRISE,
+    Character,
     GameError,
     MafiaGame,
     Phase,
@@ -308,28 +310,236 @@ class MafiaService(Service):
             ],
         }
 
-    # --- Task 10 stubs (kept truthful with get_ws_handlers; replaced there) ---
+    # --- game loop ---
 
     async def _ws_game_start(self, conn: Any, frame: dict[str, Any]) -> dict[str, Any]:
-        return self._err(frame, "Not implemented yet", 400)
+        result = self._require_host(conn, frame)
+        if isinstance(result, dict):
+            return result
+        game = result
+        if game.phase is not Phase.LOBBY:
+            return self._err(frame, "The game has already started")
+        narrator = self._narrator()
+        if game.theme_key == THEME_SURPRISE and not game.theme:
+            game.theme = await narrator.invent_theme()
+        try:
+            game.assign_characters()
+        except GameError as exc:
+            return self._err(frame, str(exc))
+        names = ", ".join(p.name for p in game.players.values())
+        await narrator.cue(game, "intro", f"The inhabitants: {names}.")
+        game.begin_night()
+        await narrator.cue(
+            game, "night", "Night falls. Killers, open your eyes and choose a victim."
+        )
+        self._push_state(game)
+        self._restart_nudge(game)
+        return {"type": "mafia.game.start.result", "ref": frame.get("id")}
 
     async def _ws_night_act(self, conn: Any, frame: dict[str, Any]) -> dict[str, Any]:
-        return self._err(frame, "Not implemented yet", 400)
+        result = self._game_and_player(frame)
+        if isinstance(result, dict):
+            return result
+        game, player = result
+        target_id = str(frame.get("target_id", ""))
+        extra: dict[str, Any] = {}
+        try:
+            if game.phase is Phase.NIGHT_KILLERS:
+                outcome = game.killer_act(player.player_id, target_id)
+                if outcome == "confirmed":
+                    await self._advance_night(game)
+            elif game.phase is Phase.NIGHT_DOCTOR:
+                game.doctor_act(player.player_id, target_id)
+                await self._advance_night(game)
+            elif game.phase is Phase.NIGHT_DETECTIVE:
+                extra["is_killer"] = game.detective_act(player.player_id, target_id)
+                await self._advance_night(game)
+            else:
+                return self._err(frame, "There is nothing to do right now")
+        except GameError as exc:
+            return self._err(frame, str(exc))
+        self._push_state(game)
+        self._restart_nudge(game)
+        return {"type": "mafia.night.act.result", "ref": frame.get("id"), **extra}
+
+    async def _advance_night(self, game: MafiaGame) -> None:
+        """Move to the next living special, or resolve the night at dawn."""
+        narrator = self._narrator()
+        if game.phase is Phase.NIGHT_KILLERS and game.alive_with(Character.DOCTOR):
+            game.phase = Phase.NIGHT_DOCTOR
+            await narrator.speak("Killers, close your eyes. Doctor, open yours — who will you save?")
+            return
+        if game.phase in (Phase.NIGHT_KILLERS, Phase.NIGHT_DOCTOR) and game.alive_with(
+            Character.DETECTIVE
+        ):
+            game.phase = Phase.NIGHT_DETECTIVE
+            await narrator.speak(
+                "Close your eyes. Detective, open yours — whose secret will you learn?"
+            )
+            return
+        await self._dawn(game)
+
+    async def _dawn(self, game: MafiaGame) -> None:
+        game.phase = Phase.DAWN
+        narrator = self._narrator()
+        victim = game.resolve_night()
+        if victim is None:
+            facts = "Nobody died last night — the town wakes relieved."
+        else:
+            facts = (
+                f"{victim.name} was killed in the night. "
+                f"They were the {victim.character}. Reveal this inside the story."
+            )
+        await narrator.cue(game, "dawn", facts)
+        if await self._maybe_finish(game):
+            return
+        game.phase = Phase.DAY
+        await narrator.speak("Everyone, open your eyes. Discuss — then vote on your phones.")
 
     async def _ws_vote_cast(self, conn: Any, frame: dict[str, Any]) -> dict[str, Any]:
-        return self._err(frame, "Not implemented yet", 400)
+        result = self._game_and_player(frame)
+        if isinstance(result, dict):
+            return result
+        game, player = result
+        raw = frame.get("target")
+        target = None if raw is None else str(raw)
+        try:
+            game.cast_vote(player.player_id, target)
+        except GameError as exc:
+            return self._err(frame, str(exc))
+        chosen = game.majority_target()
+        if chosen is not None:
+            await self._dusk(game, eliminated=chosen)
+        self._push_state(game)
+        return {"type": "mafia.vote.cast.result", "ref": frame.get("id")}
+
+    async def _dusk(self, game: MafiaGame, eliminated: Any | None) -> None:
+        game.phase = Phase.DUSK
+        narrator = self._narrator()
+        await narrator.speak("The town has decided. Everyone, close your eyes.")
+        if eliminated is not None:
+            game.eliminate(eliminated.player_id)
+            facts = (
+                f"The town cast out {eliminated.name}. They were the "
+                f"{eliminated.character}. Reveal this inside the story."
+            )
+        else:
+            facts = "The town argued until sundown but could not agree. Nobody was cast out."
+        await narrator.cue(game, "dusk", facts)
+        if await self._maybe_finish(game):
+            return
+        game.begin_night()
+        await narrator.speak("Night falls again. Killers, open your eyes.")
+        self._restart_nudge(game)
+
+    async def _maybe_finish(self, game: MafiaGame) -> bool:
+        winner = game.check_winner()
+        if not winner:
+            return False
+        game.winner = winner
+        game.phase = Phase.ENDED
+        narrator = self._narrator()
+        killers = ", ".join(k.name for k in game.killers())
+        if winner == "citizens":
+            facts = f"The killers ({killers}) are all gone. The town survives."
+        else:
+            facts = f"The killers ({killers}) now hold the town. Darkness wins."
+        await narrator.cue(game, "win", facts)
+        self._cancel_nudge(game.game_id)
+        self._push_state(game)
+        return True
+
+    # --- host powers ---
 
     async def _ws_host_skip(self, conn: Any, frame: dict[str, Any]) -> dict[str, Any]:
-        return self._err(frame, "Not implemented yet", 400)
+        result = self._require_host(conn, frame)
+        if isinstance(result, dict):
+            return result
+        game = result
+        if game.phase not in (Phase.NIGHT_KILLERS, Phase.NIGHT_DOCTOR, Phase.NIGHT_DETECTIVE):
+            return self._err(frame, "Nothing to skip right now")
+        await self._advance_night(game)
+        self._push_state(game)
+        self._restart_nudge(game)
+        return {"type": "mafia.host.skip_phase.result", "ref": frame.get("id")}
 
     async def _ws_host_end_day(self, conn: Any, frame: dict[str, Any]) -> dict[str, Any]:
-        return self._err(frame, "Not implemented yet", 400)
+        result = self._require_host(conn, frame)
+        if isinstance(result, dict):
+            return result
+        game = result
+        if game.phase is not Phase.DAY:
+            return self._err(frame, "It is not daytime")
+        await self._dusk(game, eliminated=None)
+        self._push_state(game)
+        return {"type": "mafia.host.end_day.result", "ref": frame.get("id")}
 
     async def _ws_host_remove(self, conn: Any, frame: dict[str, Any]) -> dict[str, Any]:
-        return self._err(frame, "Not implemented yet", 400)
+        result = self._require_host(conn, frame)
+        if isinstance(result, dict):
+            return result
+        game = result
+        player_id = str(frame.get("player_id", ""))
+        player = game.players.get(player_id)
+        if player is None or not player.alive:
+            return self._err(frame, "No such living player", 404)
+        game.eliminate(player_id)
+        narrator = self._narrator()
+        await narrator.cue(
+            game,
+            "dusk",
+            f"{player.name} has left the story. They were the {player.character}.",
+        )
+        if not await self._maybe_finish(game):
+            if game.phase in (Phase.NIGHT_KILLERS, Phase.NIGHT_DOCTOR, Phase.NIGHT_DETECTIVE):
+                await self._advance_night(game)
+        self._push_state(game)
+        return {"type": "mafia.host.remove_player.result", "ref": frame.get("id")}
 
     async def _ws_host_abort(self, conn: Any, frame: dict[str, Any]) -> dict[str, Any]:
-        return self._err(frame, "Not implemented yet", 400)
+        result = self._require_host(conn, frame)
+        if isinstance(result, dict):
+            return result
+        game = result
+        game.winner = "aborted"
+        game.phase = Phase.ENDED
+        self._cancel_nudge(game.game_id)
+        self._push_state(game)
+        self._games.pop(game.game_id, None)
+        self._conns.pop(game.game_id, None)
+        return {"type": "mafia.host.abort.result", "ref": frame.get("id")}
+
+    # --- nudges ---
+
+    def _cancel_nudge(self, game_id: str) -> None:
+        task = self._nudge_tasks.pop(game_id, None)
+        if task is not None:
+            task.cancel()
+
+    def _restart_nudge(self, game: MafiaGame) -> None:
+        self._cancel_nudge(game.game_id)
+        if game.phase not in (Phase.NIGHT_KILLERS, Phase.NIGHT_DOCTOR, Phase.NIGHT_DETECTIVE):
+            return
+        self._nudge_tasks[game.game_id] = asyncio.get_running_loop().create_task(
+            self._nudge_loop(game.game_id), context=contextvars.copy_context()
+        )
+
+    async def _nudge_loop(self, game_id: str) -> None:
+        while True:
+            await asyncio.sleep(self._nudge_seconds)
+            game = self._games.get(game_id)
+            if game is None or game.phase not in (
+                Phase.NIGHT_KILLERS,
+                Phase.NIGHT_DOCTOR,
+                Phase.NIGHT_DETECTIVE,
+            ):
+                return
+            try:
+                await self._narrator().cue(
+                    game, "nudge", "Someone in the dark is taking their time."
+                )
+            except Exception:
+                logger.exception("Mafia nudge failed")
 
     def _narrator(self) -> Narrator:
         """Build a :class:`Narrator` wired to the current config and resolved capabilities."""
