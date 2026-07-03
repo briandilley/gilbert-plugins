@@ -10,6 +10,7 @@ import { HostControls } from "./components/HostControls";
 import { JoinGate } from "./components/JoinGate";
 import { Lobby } from "./components/Lobby";
 import { NightAction } from "./components/NightAction";
+import { StatusCard } from "./components/StatusCard";
 import { StoryLog } from "./components/StoryLog";
 import { VotePanel } from "./components/VotePanel";
 import type { ActiveGame, GameState, MafiaSession, MafiaStateFrame } from "./types";
@@ -155,12 +156,16 @@ export function MafiaPage(): ReactElement {
         <GhostPanel state={state} />
       ) : (
         <>
-          {state.phase === "night" && (
+          {/* A live transition status (e.g. "Calculating the night…") takes
+              over the action area while Gilbert narrates, so nobody can act
+              mid-resolution and the screen never looks frozen. */}
+          {state.status ? (
+            <StatusCard text={state.status} />
+          ) : state.phase === "night" ? (
             <NightAction state={state} onSubmit={handlers.onSubmit} busy={busy} />
-          )}
-          {state.phase === "day" && (
+          ) : state.phase === "day" ? (
             <VotePanel state={state} onVote={handlers.onVote} busy={busy} />
-          )}
+          ) : null}
           <StoryLog story={state.story} />
         </>
       )}

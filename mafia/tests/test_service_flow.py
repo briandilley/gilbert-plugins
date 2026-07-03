@@ -309,6 +309,26 @@ async def test_full_night_to_day(table) -> None:
     assert len(game.story) >= 3
 
 
+async def test_resolution_pushes_working_status(table) -> None:
+    """While the night resolves (slow narration), screens get a transient
+    'Calculating the night…' status so they don't look frozen."""
+    svc, created, conns, joins = table
+    game = _game(svc, created)
+    victim = _by_char(game, Character.CITIZEN)
+    other = _by_char(game, Character.CITIZEN, 1)
+    await _complete_night(svc, game, joins, kill=victim, save=other)
+    statuses = [
+        m["state"].get("status")
+        for c in conns.values()
+        for m in c.sent
+        if m.get("type") == "mafia.state"
+    ]
+    assert any(s and "Calculating the night" in s for s in statuses)
+    # the final day push clears the status (plain state, no working banner)
+    last = [m for m in conns["Cam"].sent if m.get("type") == "mafia.state"][-1]
+    assert not last["state"].get("status")
+
+
 async def test_vote_majority_eliminates_and_night_falls(table) -> None:
     svc, created, conns, joins = table
     game = _game(svc, created)

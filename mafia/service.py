@@ -337,12 +337,20 @@ class MafiaService(Service):
 
         conn.add_close_callback(_cleanup)
 
-    def _push_state(self, game: MafiaGame) -> None:
-        """Per-player filtered state to every live connection of the game."""
+    def _push_state(self, game: MafiaGame, status: str = "") -> None:
+        """Per-player filtered state to every live connection of the game.
+
+        ``status`` is a transient "what's happening now" line (e.g.
+        "Calculating the night…"). Pushed just before a slow narration so
+        screens show that Gilbert is working rather than looking frozen; the
+        next plain push (no status) clears it.
+        """
         for player_id, conns in self._conns.get(game.game_id, {}).items():
             if player_id not in game.players:
                 continue
             state = state_for(game, player_id)
+            if status:
+                state["status"] = status
             frame = {"type": "mafia.state", "game_id": game.game_id, "state": state}
             for conn in list(conns):
                 conn.enqueue(frame)
@@ -554,6 +562,9 @@ class MafiaService(Service):
         # rejects a join that arrives mid-start. If assign_characters()
         # raised above, the phase never left LOBBY.
         game.phase = Phase.NIGHT  # non-LOBBY placeholder meaning "starting"
+        # Lift everyone out of the lobby into a "starting" screen while the
+        # (slow) theme + intro narration runs.
+        self._push_state(game, status="Setting the scene…")
         narrator = self._narrator(game)
         if game.theme_key == THEME_SURPRISE and not game.theme:
             game.theme = await narrator.invent_theme()
@@ -612,9 +623,12 @@ class MafiaService(Service):
         """Resolve the simultaneous night (kill vs. save) and open the day.
 
         Announces *that* someone died, never their role (revealed only at
-        game end). Pushes state before the slow narration so screens flip
-        promptly.
+        game end). Shows a "calculating" status while the narration runs so
+        screens don't look frozen.
         """
+        # Everyone is in (or the host forced it) — show that Gilbert is
+        # working out the outcome during the slow reveal narration.
+        self._push_state(game, status="Calculating the night…")
         narrator = self._narrator(game)
         victim = game.resolve_night()
         if victim is None:
@@ -650,7 +664,8 @@ class MafiaService(Service):
         """Resolve the day vote and return to a fresh simultaneous night.
 
         Announces *who* the town cast out, never their role (revealed only at
-        game end)."""
+        game end). Shows a "tallying" status during the verdict narration."""
+        self._push_state(game, status="Tallying the vote…")
         narrator = self._narrator(game)
         if eliminated is not None:
             game.eliminate(eliminated.player_id)

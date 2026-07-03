@@ -54,6 +54,9 @@ export interface GameState {
   alive_count: number;
   /** How many living players have submitted their night action (NIGHT only). */
   night_ready_count: number;
+  /** Transient "what's happening now" line while Gilbert narrates a
+   *  transition (e.g. "Calculating the night…"). Empty/absent otherwise. */
+  status?: string;
   winner: "" | "citizens" | "killers" | "aborted";
   you: YouState;
 }
