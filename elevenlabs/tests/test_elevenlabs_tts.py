@@ -25,7 +25,8 @@ async def test_initialize_sets_api_key(backend: ElevenLabsTTS) -> None:
 
 async def test_initialize_default_model(backend: ElevenLabsTTS) -> None:
     await backend.initialize({"api_key": "sk-test"})
-    assert backend._model_id == "eleven_turbo_v2_5"
+    # v3 is the default so audio tags are interpreted as delivery, not read aloud.
+    assert backend._model_id == "eleven_v3"
     await backend.close()
 
 
@@ -85,7 +86,7 @@ async def test_synthesize_calls_api(backend: ElevenLabsTTS) -> None:
 
         assert "/text-to-speech/voice123" in call_args.args[0]
         assert call_args.kwargs["json"]["text"] == "Hello"
-        assert call_args.kwargs["json"]["model_id"] == "eleven_turbo_v2_5"
+        assert call_args.kwargs["json"]["model_id"] == "eleven_v3"
         assert call_args.kwargs["params"]["output_format"] == "mp3_44100_128"
 
     assert result.audio == b"audio-bytes"

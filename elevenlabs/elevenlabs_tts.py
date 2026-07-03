@@ -350,8 +350,14 @@ class ElevenLabsTTS(TTSBackend):
             ConfigParam(
                 key="model_id",
                 type=ToolParameterType.STRING,
-                description="ElevenLabs model ID.",
-                default="eleven_turbo_v2_5",
+                description=(
+                    "ElevenLabs model ID. Defaults to eleven_v3, which "
+                    "interprets the [excited]/[whispers] audio tags from "
+                    "``enable_audio_tags`` as expressive delivery. Older "
+                    "models (eleven_turbo_v2_5, eleven_multilingual_v2, …) "
+                    "do NOT understand the tags and will read them aloud."
+                ),
+                default="eleven_v3",
             ),
             ConfigParam(
                 key="cache_max_entries",
@@ -502,7 +508,7 @@ class ElevenLabsTTS(TTSBackend):
         self._client: httpx.AsyncClient | None = None
         self._api_key: str = ""
         self._voice_id: str = ""
-        self._model_id: str = "eleven_turbo_v2_5"
+        self._model_id: str = "eleven_v3"
         self._cache: OrderedDict[_CacheKey, _CacheEntry] = OrderedDict()
         self._cache_max_entries: int = _DEFAULT_CACHE_MAX_ENTRIES
         self._cache_ttl_seconds: float = float(_DEFAULT_CACHE_TTL_SECONDS)
