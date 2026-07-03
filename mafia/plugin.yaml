@@ -1,0 +1,9 @@
+name: mafia
+version: "1.0.0"
+description: "In-person Mafia party game — Gilbert narrates aloud, players use their phones"
+
+provides:
+  - mafia_game
+
+requires: []
+depends_on: []

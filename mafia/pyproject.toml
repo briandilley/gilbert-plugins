@@ -1,0 +1,11 @@
+[project]
+name = "gilbert-plugin-mafia"
+version = "1.0.0"
+description = "In-person Mafia party game narrated by Gilbert"
+requires-python = ">=3.12"
+# stdlib only — the game engine, narration, and WS handlers need nothing
+# beyond what Gilbert core already provides.
+dependencies = []
+
+[tool.uv]
+package = false
