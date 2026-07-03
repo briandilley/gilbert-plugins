@@ -1,13 +1,15 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { ReactElement } from "react";
-import { DoorOpenIcon, SparklesIcon, UsersIcon } from "lucide-react";
+import { DoorOpenIcon, SparklesIcon, UsersIcon, Volume2Icon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardEyebrow, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 
-import type { ActiveGame } from "../types";
+import { useMafiaApi } from "../api";
+import type { NarrationChoice } from "../api";
+import type { ActiveGame, SpeakerOption } from "../types";
 
 /** Theme presets offered when creating a game — keys mirror ``THEME_PRESETS``
  *  in the backend's ``game.py``; labels here are UI-only shorthand. */
@@ -23,17 +25,47 @@ interface JoinGateProps {
   activeGames: ActiveGame[];
   canCreate: boolean;
   onJoin: (code: string, name: string) => void;
-  onCreate: (themeKey: string, themeText: string) => void;
+  onCreate: (themeKey: string, themeText: string, narration: NarrationChoice) => void;
   error: string | null;
 }
 
 /** Entry screen: join an existing game by code + name, or (signed-in
- *  household members only) start a new one by picking a theme. */
+ *  household members only) start a new one by picking a theme plus the
+ *  speakers and volume the narrator plays through for this game. */
 export function JoinGate({ activeGames, canCreate, onJoin, onCreate, error }: JoinGateProps): ReactElement {
+  const mafia = useMafiaApi();
   const [code, setCode] = useState("");
   const [name, setName] = useState("");
   const [themeKey, setThemeKey] = useState("surprise");
   const [themeText, setThemeText] = useState("");
+  // Per-game narration output. Speakers load lazily for hosts; an empty
+  // selection means "use the default announce speakers" server-side.
+  const [speakers, setSpeakers] = useState<SpeakerOption[]>([]);
+  const [selected, setSelected] = useState<string[]>([]);
+  const [volume, setVolume] = useState(70);
+
+  useEffect(() => {
+    if (!canCreate) return;
+    let live = true;
+    void mafia
+      .listSpeakers()
+      .then((res) => {
+        if (!live) return;
+        setSpeakers(res.speakers);
+        setVolume(res.defaults.volume);
+      })
+      .catch(() => {
+        /* leave the picker empty — creating still works with defaults */
+      });
+    return () => {
+      live = false;
+    };
+  }, [canCreate, mafia]);
+
+  const toggleSpeaker = (id: string) =>
+    setSelected((prev) =>
+      prev.includes(id) ? prev.filter((s) => s !== id) : [...prev, id],
+    );
 
   const canJoin = code.trim().length > 0 && name.trim().length > 0;
   const canSubmitCreate = themeKey !== "custom" || themeText.trim().length > 0;
@@ -144,10 +176,66 @@ export function JoinGate({ activeGames, canCreate, onJoin, onCreate, error }: Jo
                 Surprise me
               </label>
             </div>
+
+            <div className="flex flex-col gap-2 border-t border-border pt-3">
+              <span className="text-2xs font-mono uppercase tracking-[0.08em] text-muted-foreground">
+                Narration
+              </span>
+              {speakers.length > 0 ? (
+                <div className="flex flex-col gap-1" role="group" aria-label="Speakers">
+                  {speakers.map((s) => (
+                    <label key={s.id} className="flex items-center gap-2 text-sm">
+                      <input
+                        type="checkbox"
+                        checked={selected.includes(s.id)}
+                        onChange={() => toggleSpeaker(s.id)}
+                        className="accent-(--signal)"
+                      />
+                      <span className="flex-1 truncate">{s.name}</span>
+                      {s.backend && (
+                        <span className="rounded bg-foreground/5 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-muted-foreground">
+                          {s.backend}
+                        </span>
+                      )}
+                    </label>
+                  ))}
+                  <p className="text-xs text-muted-foreground">
+                    {selected.length === 0
+                      ? "No speaker picked — uses the default announce speakers."
+                      : `Narrating on ${selected.length} speaker${selected.length > 1 ? "s" : ""}.`}
+                  </p>
+                </div>
+              ) : (
+                <p className="text-xs text-muted-foreground">
+                  Narration plays on the default announce speakers.
+                </p>
+              )}
+
+              <label htmlFor="mafia-volume" className="flex items-center justify-between text-sm">
+                <span className="flex items-center gap-1.5">
+                  <Volume2Icon className="h-3.5 w-3.5" />
+                  Volume
+                </span>
+                <span className="font-mono text-xs text-muted-foreground">{volume}%</span>
+              </label>
+              <input
+                id="mafia-volume"
+                type="range"
+                min={0}
+                max={100}
+                step={1}
+                value={volume}
+                onChange={(e) => setVolume(Number(e.target.value))}
+                className="w-full accent-(--signal)"
+              />
+            </div>
+
             <Button
               variant="outline"
               disabled={!canSubmitCreate}
-              onClick={() => onCreate(themeKey, themeText.trim())}
+              onClick={() =>
+                onCreate(themeKey, themeText.trim(), { speakerNames: selected, volume })
+              }
             >
               <UsersIcon />
               Start a new game

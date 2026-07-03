@@ -130,8 +130,9 @@ pacing (skipping a stalled phase, ending an undecided Day, removing a departed P
 _Avoid_: owner, admin (RBAC terms), narrator (that's Gilbert).
 
 **Narrator**:
-Gilbert's storytelling persona that runs a Mafia game: announces phases aloud, wakes special
-Characters, and weaves the night's outcome into a continuing story.
+Gilbert's storytelling persona that runs a Mafia game: announces each phase aloud and weaves the
+night's outcome into a continuing story. A death is narrated as *who* died, never their Character
+(roles stay hidden until the game ends).
 
 **Ghost**:
 A dead Player. Ghosts spectate with full knowledge of all hidden state, may not speak in the room,
@@ -143,9 +144,11 @@ creator at creation — from presets, free text, or left for the Narrator to inv
 consistent across the whole game's narration.
 
 **Night / Day**:
-The two alternating Mafia phases. At *Night* all Players close their eyes and special Characters
-secretly act (kill / save / investigate); by *Day* everyone wakes, discusses, and votes to
-eliminate a suspect. A vote eliminates only on a strict majority of living Players.
+The two alternating Mafia phases. At *Night* every living Player acts at the same time on their own
+phone — there is no eyes-closed sequence: killers pick a target (a two-killer team sees each other's
+live pick and locks in on agreement), the doctor protects, the detective investigates, and everyone
+else taps Next. The Night resolves once all have submitted. By *Day* the town discusses and votes to
+eliminate a suspect; a vote eliminates only on a strict majority of living Players.
 
 ## Vendor-specific terms
 

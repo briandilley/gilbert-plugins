@@ -23,40 +23,66 @@ def _citizen(g: MafiaGame, index: int = 0) -> str:
     return _pid(g, Character.CITIZEN, index)
 
 
-class TestKillerDuo:
-    def test_single_killer_confirms_instantly(self) -> None:
-        g = _started(6)
-        assert g.killer_act(_pid(g, Character.KILLER), _citizen(g)) == "confirmed"
-        assert g.kill_target == _citizen(g)
+class TestKillerPick:
+    """Killers pick simultaneously, see each other's choice, and the kill
+    locks only once the living killers agree on one target."""
 
-    def test_duo_propose_then_confirm(self) -> None:
-        g = _started(8)
+    def test_single_killer_locks_instantly(self) -> None:
+        g = _started(6)  # one killer
+        killer, victim = _pid(g, Character.KILLER), _citizen(g)
+        assert g.killer_pick(killer, victim) == "locked"
+        assert g.kill_target == victim
+        assert g.kill_locked is True
+        assert killer in g.night_ready
+
+    def test_duo_locks_only_on_agreement(self) -> None:
+        g = _started(8)  # two killers
         k1, k2 = _pid(g, Character.KILLER, 0), _pid(g, Character.KILLER, 1)
         target = _citizen(g)
-        assert g.killer_act(k1, target) == "proposed"
-        assert g.kill_target is None
-        with pytest.raises(GameError):
-            g.killer_act(k2, _citizen(g, 1))  # must confirm the proposal
-        assert g.killer_act(k2, target) == "confirmed"
+        assert g.killer_pick(k1, target) == "waiting"
+        assert g.kill_target is None and g.kill_locked is False
+        assert k1 not in g.night_ready  # not counted until the duo agrees
+        # partner picks someone else → still waiting
+        assert g.killer_pick(k2, _citizen(g, 1)) == "waiting"
+        assert g.kill_locked is False
+        # partner switches to match → locks
+        assert g.killer_pick(k2, target) == "locked"
         assert g.kill_target == target
+        assert k1 in g.night_ready and k2 in g.night_ready
 
-    def test_proposer_cannot_confirm_own_proposal(self) -> None:
+    def test_killer_can_change_until_locked(self) -> None:
         g = _started(8)
-        k1 = _pid(g, Character.KILLER, 0)
-        g.killer_act(k1, _citizen(g))
+        k1, k2 = _pid(g, Character.KILLER, 0), _pid(g, Character.KILLER, 1)
+        a, b = _citizen(g, 0), _citizen(g, 1)
+        g.killer_pick(k1, a)
+        g.killer_pick(k1, b)  # changed mind before locking
+        assert g.night_kill_picks[k1] == b
+        assert g.killer_pick(k2, b) == "locked"
+        assert g.kill_target == b
+
+    def test_cannot_change_after_lock(self) -> None:
+        g = _started(6)
+        killer = _pid(g, Character.KILLER)
+        g.killer_pick(killer, _citizen(g))
         with pytest.raises(GameError):
-            g.killer_act(k1, _citizen(g))
+            g.killer_pick(killer, _citizen(g, 1))
 
     def test_killers_cannot_target_killers(self) -> None:
         g = _started(8)
         k1, k2 = _pid(g, Character.KILLER, 0), _pid(g, Character.KILLER, 1)
         with pytest.raises(GameError):
-            g.killer_act(k1, k2)
+            g.killer_pick(k1, k2)
 
-    def test_non_killer_cannot_act(self) -> None:
+    def test_non_killer_cannot_pick(self) -> None:
         g = _started(6)
         with pytest.raises(GameError):
-            g.killer_act(_citizen(g), _citizen(g, 1))
+            g.killer_pick(_citizen(g), _citizen(g, 1))
+
+    def test_night_actions_require_night_phase(self) -> None:
+        g = _started(6)
+        g.phase = Phase.DAY
+        with pytest.raises(GameError):
+            g.killer_pick(_pid(g, Character.KILLER), _citizen(g))
 
 
 class TestDoctorDetective:
@@ -65,12 +91,14 @@ class TestDoctorDetective:
         doc = _pid(g, Character.DOCTOR)
         g.doctor_act(doc, doc)
         assert g.save_target == doc
+        assert doc in g.night_ready
 
     def test_detective_verdict(self) -> None:
         g = _started(7)
         det = _pid(g, Character.DETECTIVE)
         assert g.detective_act(det, _pid(g, Character.KILLER)) is True
         assert g.detective_act(det, _citizen(g)) is False
+        assert det in g.night_ready
 
     def test_detective_cannot_check_self(self) -> None:
         g = _started(7)
@@ -79,11 +107,42 @@ class TestDoctorDetective:
             g.detective_act(det, det)
 
 
+class TestNightSubmission:
+    """Everyone submits at once; the night is complete only when every living
+    player has (killers locked, doctor saved, detective checked, citizens
+    tapped Next)."""
+
+    def test_citizen_ready_and_completion(self) -> None:
+        g = _started(6)  # killer, doctor, 4 citizens
+        assert g.night_complete() is False
+        g.killer_pick(_pid(g, Character.KILLER), _citizen(g))
+        g.doctor_act(_pid(g, Character.DOCTOR), _pid(g, Character.DOCTOR))
+        assert g.night_complete() is False  # citizens haven't readied
+        for i in range(4):
+            g.ready_up(_citizen(g, i))
+        assert g.night_complete() is True
+
+    def test_ready_rejected_for_special_role(self) -> None:
+        g = _started(6)
+        with pytest.raises(GameError):
+            g.ready_up(_pid(g, Character.DOCTOR))  # doctor must act, not ready
+
+    def test_detective_game_completion(self) -> None:
+        g = _started(7)  # killer, doctor, detective, 4 citizens
+        g.killer_pick(_pid(g, Character.KILLER), _citizen(g))
+        g.doctor_act(_pid(g, Character.DOCTOR), _citizen(g))
+        assert g.night_complete() is False  # detective + citizens outstanding
+        g.detective_act(_pid(g, Character.DETECTIVE), _pid(g, Character.KILLER))
+        for i in range(4):
+            g.ready_up(_citizen(g, i))
+        assert g.night_complete() is True
+
+
 class TestNightResolution:
     def test_kill_lands(self) -> None:
         g = _started(6)
         victim = _citizen(g)
-        g.killer_act(_pid(g, Character.KILLER), victim)
+        g.killer_pick(_pid(g, Character.KILLER), victim)
         died = g.resolve_night()
         assert died is not None and died.player_id == victim
         assert not g.players[victim].alive
@@ -91,7 +150,7 @@ class TestNightResolution:
     def test_doctor_save_blocks_kill(self) -> None:
         g = _started(6)
         victim = _citizen(g)
-        g.killer_act(_pid(g, Character.KILLER), victim)
+        g.killer_pick(_pid(g, Character.KILLER), victim)
         g.doctor_act(_pid(g, Character.DOCTOR), victim)
         assert g.resolve_night() is None
         assert g.players[victim].alive
@@ -99,6 +158,14 @@ class TestNightResolution:
     def test_no_kill_no_victim(self) -> None:
         g = _started(6)
         assert g.resolve_night() is None
+
+    def test_unlocked_duo_kills_nobody(self) -> None:
+        g = _started(8)
+        k1, k2 = _pid(g, Character.KILLER, 0), _pid(g, Character.KILLER, 1)
+        g.killer_pick(k1, _citizen(g, 0))
+        g.killer_pick(k2, _citizen(g, 1))  # never agreed → no lock
+        assert g.kill_locked is False
+        assert g.resolve_night() is None  # a forced/host-skipped night kills no one
 
 
 class TestVoting:
@@ -133,28 +200,27 @@ class TestVoting:
 
 
 class TestPurgeReferences:
-    def test_removed_proposer_clears_proposal_pair(self) -> None:
+    def test_removed_killer_drops_their_pick(self) -> None:
         g = _started(8)  # killer duo
         k1 = _pid(g, Character.KILLER, 0)
-        g.killer_act(k1, _citizen(g))
+        g.killer_pick(k1, _citizen(g))
         g.purge_references(k1)
-        assert g.kill_proposal is None
-        assert g.kill_proposed_by is None
+        assert k1 not in g.night_kill_picks
 
-    def test_removed_proposal_target_clears_proposal_pair(self) -> None:
+    def test_removed_pick_target_drops_the_pick(self) -> None:
         g = _started(8)
         k1, target = _pid(g, Character.KILLER, 0), _citizen(g)
-        g.killer_act(k1, target)
+        g.killer_pick(k1, target)
         g.purge_references(target)
-        assert g.kill_proposal is None
-        assert g.kill_proposed_by is None
+        assert target not in g.night_kill_picks.values()
 
-    def test_removed_kill_target_cleared(self) -> None:
-        g = _started(6)  # single killer confirms instantly
+    def test_removed_locked_target_unlocks(self) -> None:
+        g = _started(6)  # single killer locks instantly
         target = _citizen(g)
-        g.killer_act(_pid(g, Character.KILLER), target)
+        g.killer_pick(_pid(g, Character.KILLER), target)
         g.purge_references(target)
         assert g.kill_target is None
+        assert g.kill_locked is False
 
     def test_removed_save_target_cleared(self) -> None:
         g = _started(6)
@@ -162,6 +228,14 @@ class TestPurgeReferences:
         g.doctor_act(_pid(g, Character.DOCTOR), saved)
         g.purge_references(saved)
         assert g.save_target is None
+
+    def test_removed_player_dropped_from_ready(self) -> None:
+        g = _started(6)
+        cit = _citizen(g)
+        g.ready_up(cit)
+        assert cit in g.night_ready
+        g.purge_references(cit)
+        assert cit not in g.night_ready
 
     def test_votes_by_and_for_removed_player_stripped(self) -> None:
         g = _started(6)
@@ -179,11 +253,10 @@ class TestPurgeReferences:
     def test_unrelated_state_untouched(self) -> None:
         g = _started(8)
         k1, target = _pid(g, Character.KILLER, 0), _citizen(g)
-        g.killer_act(k1, target)
+        g.killer_pick(k1, target)
         g.doctor_act(_pid(g, Character.DOCTOR), _citizen(g, 1))
         g.purge_references(_citizen(g, 2))  # bystander with no references
-        assert g.kill_proposal == target
-        assert g.kill_proposed_by == k1
+        assert g.night_kill_picks[k1] == target
         assert g.save_target == _citizen(g, 1)
 
 

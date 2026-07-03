@@ -368,7 +368,7 @@ High-quality text-to-speech via the ElevenLabs API, plus batch and streaming spe
 **Configure** (Settings → TTS, when the `elevenlabs` backend is selected)
 - `api_key` *(sensitive)* — ElevenLabs API key.
 - `voice_id` — Voice ID to synthesize with (copy from the ElevenLabs voice library).
-- `model_id` — ElevenLabs model ID (default `eleven_turbo_v2_5`).
+- `model_id` — ElevenLabs model ID (default `eleven_v3`, which performs the `[excited]`/`[whispers]` audio tags from `enable_audio_tags`; older models read the tags aloud instead).
 - `cache_max_entries` — LRU cache capacity for recently synthesized phrases (default 256).
 - `cache_ttl_seconds` — How long a cached clip lives before re-synthesis (default 1800).
 
@@ -789,19 +789,33 @@ Both backends advertise the same connection parameters so the lights and shades 
 ### mafia
 
 In-person social-deduction party game. Gilbert is the narrator: players gather in one room,
-a signed-in user creates a game at `/mafia` and shares the join code; everyone else joins from
-their phone with just a name (no account — see ADR-0011). Gilbert speaks the story aloud
-(requires the TTS service to be enabled; uses room speakers or falls back to the host's
-browser speaker), wakes the killers/doctor/detective at night for secret on-screen picks,
-and runs the open day vote. Strict-majority vote-outs; killers win at parity.
+a signed-in user creates a game at `/mafia` (under the top-level **Games** nav group) and
+shares the join code; everyone else joins from their phone with just a name (no account —
+see ADR-0011). Gilbert speaks the story aloud (requires the TTS service to be enabled).
+There is no eyes-closed sequence: each night everyone acts at the same time on their own
+phone — killers pick a target (a two-killer team sees each other's live pick and locks in
+once they agree), the doctor protects someone, the detective investigates, and everyone
+else taps Next — then the town wakes to an open day vote. Every choice is select-then-submit,
+so a stray tap never commits. A death announces *who* died but never their role; roles are
+revealed only when the game ends. Strict-majority vote-outs; killers win at parity.
 
-**Provides:** `mafia_game` service (WS RPCs under `mafia.*`, guest-callable; `mafia_open` AI tool / `/mafia.open`).
+The **speakers and volume the narrator plays through are chosen per game** in the create
+form (via a live speaker picker + volume slider), not as a global setting — narration is
+heard in the room a given game is played in. No speaker selected → the speaker service's
+default announce speakers.
+
+**Provides:** `mafia_game` service (WS RPCs under `mafia.*`, guest-callable — including
+`mafia.speakers.list` for the create-form picker; `mafia_open` AI tool / `/mafia.open`).
 
 **Requires enabled:** `text_to_speech`.
 
-**Configure** (Settings → Games → Mafia): `enabled` (off by default), `narrator_prompt`
-(AI prompt), `ai_profile`, `speakers` (empty = default announce speakers), `announce_volume`
-(70), `nudge_seconds` (45), `max_concurrent_games` (2).
+**Configure** (Settings → Games → Mafia): `enabled` (off by default), `ai_profile`,
+`nudge_seconds` (45), `max_concurrent_games` (2). Every narration prompt is an editable
+`ai_prompt` field: `narrator_prompt` (the narrator persona / system prompt), the six per-beat
+instructions (`beat_intro_prompt`, `beat_night_prompt`, `beat_dawn_prompt`, `beat_dusk_prompt`,
+`beat_nudge_prompt`, `beat_win_prompt`), the style guidance (`narrate_style_prompt`,
+`nudge_style_prompt`), and `invent_theme_prompt` (for the "Surprise me" theme). Speaker and
+volume are set per game, not here.
 
 Guests must be allowed (`auth.allow_guests`, on by default for LAN visitors) for account-less
 players to join.

@@ -116,22 +116,49 @@ def _token(game: Any, joins: dict[str, dict[str, Any]], player: Any) -> str:
     return joins[player.name]["player_token"]
 
 
-async def _act(svc: MafiaService, game: Any, joins: dict[str, Any], player: Any, target: Any):
-    return await svc._ws_night_act(
-        None,
-        {
-            "id": "a",
-            "game_id": game.game_id,
-            "player_token": _token(game, joins, player),
-            "target_id": target.player_id,
-        },
-    )
+async def _night(
+    svc: MafiaService,
+    game: Any,
+    joins: dict[str, Any],
+    player: Any,
+    action: str,
+    target: Any = None,
+):
+    """Submit one simultaneous-night action for ``player``."""
+    frame = {
+        "id": "a",
+        "game_id": game.game_id,
+        "player_token": _token(game, joins, player),
+        "action": action,
+    }
+    if target is not None:
+        frame["target_id"] = target.player_id
+    return await svc._ws_night_act(None, frame)
+
+
+async def _complete_night(
+    svc: MafiaService, game: Any, joins: dict[str, Any], *, kill: Any, save: Any
+) -> None:
+    """Have every living player submit so the night resolves into the day.
+
+    Killers lock ``kill``, the doctor protects ``save``, the detective checks
+    someone, and citizens tap Next. The final submission resolves the night.
+    """
+    for k in game.alive_with(Character.KILLER):
+        await _night(svc, game, joins, k, "kill", kill)
+    for doc in game.alive_with(Character.DOCTOR):
+        await _night(svc, game, joins, doc, "save", save)
+    for det in game.alive_with(Character.DETECTIVE):
+        await _night(svc, game, joins, det, "check", kill)
+    for p in list(game.alive_players()):
+        if p.character is Character.CITIZEN:
+            await _night(svc, game, joins, p, "ready")
 
 
 async def test_start_assigns_and_enters_night(table) -> None:
     svc, created, conns, joins = table
     game = _game(svc, created)
-    assert game.phase is Phase.NIGHT_KILLERS
+    assert game.phase is Phase.NIGHT
     assert game.night == 1  # kill from night 1
     assert len(game.story) >= 1  # intro beat narrated
 
@@ -271,19 +298,14 @@ async def test_join_mid_start_is_refused() -> None:
 async def test_full_night_to_day(table) -> None:
     svc, created, conns, joins = table
     game = _game(svc, created)
-    killer = _by_char(game, Character.KILLER)
-    doctor = _by_char(game, Character.DOCTOR)
     victim = _by_char(game, Character.CITIZEN)
-
-    resp = await _act(svc, game, joins, killer, victim)
-    assert resp["type"] == "mafia.night.act.result"
-    assert game.phase is Phase.NIGHT_DOCTOR  # 4 players → no detective
-
-    other = next(p for p in game.alive_players() if p.player_id != victim.player_id)
-    await _act(svc, game, joins, doctor, other)  # saves the wrong person
+    other = _by_char(game, Character.CITIZEN, 1)
+    # everyone submits at once; the doctor protects the wrong person, so the
+    # kill lands on the victim and the night resolves into the day.
+    await _complete_night(svc, game, joins, kill=victim, save=other)
     assert game.phase is Phase.DAY
     assert not game.players[victim.player_id].alive
-    # dawn narration revealed the character while eyes were closed
+    # intro + night + dawn beats narrated into the story
     assert len(game.story) >= 3
 
 
@@ -293,8 +315,8 @@ async def test_vote_majority_eliminates_and_night_falls(table) -> None:
     killer = _by_char(game, Character.KILLER)
     doctor = _by_char(game, Character.DOCTOR)
     victim = _by_char(game, Character.CITIZEN)
-    await _act(svc, game, joins, killer, victim)
-    await _act(svc, game, joins, doctor, doctor)  # self-save, kill lands on victim
+    await _complete_night(svc, game, joins, kill=victim, save=doctor)  # self-save; victim dies
+    assert game.phase is Phase.DAY
 
     alive = game.alive_players()  # 3 alive → majority 2
     target = killer
@@ -326,8 +348,7 @@ async def test_win_removes_game_and_conns_after_final_push(table) -> None:
     killer = _by_char(game, Character.KILLER)
     doctor = _by_char(game, Character.DOCTOR)
     victim = _by_char(game, Character.CITIZEN)
-    await _act(svc, game, joins, killer, victim)
-    await _act(svc, game, joins, doctor, doctor)  # self-save, kill lands on victim
+    await _complete_night(svc, game, joins, kill=victim, save=doctor)  # self-save; victim dies
 
     alive = game.alive_players()  # 3 alive → majority 2
     voters = [p for p in alive if p.player_id != killer.player_id][:2]
@@ -360,16 +381,13 @@ async def test_win_removes_game_and_conns_after_final_push(table) -> None:
 async def test_host_end_day_without_majority(table) -> None:
     svc, created, conns, joins = table
     game = _game(svc, created)
-    killer = _by_char(game, Character.KILLER)
-    doctor = _by_char(game, Character.DOCTOR)
     victim = _by_char(game, Character.CITIZEN)
-    await _act(svc, game, joins, killer, victim)
-    await _act(svc, game, joins, doctor, victim)  # doctor saves the victim → nobody dies
+    await _complete_night(svc, game, joins, kill=victim, save=victim)  # saved → nobody dies
     assert game.phase is Phase.DAY
     assert game.players[victim.player_id].alive
     resp = await svc._ws_host_end_day(conns["Cam"], {"id": "e", "game_id": game.game_id})
     assert resp["type"] == "mafia.host.end_day.result"
-    assert game.phase is Phase.NIGHT_KILLERS
+    assert game.phase is Phase.NIGHT
     assert game.night == 2
 
 
@@ -378,7 +396,9 @@ async def test_host_skip_forfeits_kill(table) -> None:
     game = _game(svc, created)
     resp = await svc._ws_host_skip(conns["Cam"], {"id": "k", "game_id": game.game_id})
     assert resp["type"] == "mafia.host.skip_phase.result"
-    assert game.phase is not Phase.NIGHT_KILLERS  # advanced past killers
+    # nothing was locked, so the forced night kills no one and moves to day
+    assert game.phase is Phase.DAY
+    assert len(game.alive_players()) == 4
 
 
 async def test_host_abort(table) -> None:
@@ -397,7 +417,7 @@ async def _remove(svc: MafiaService, conns: dict[str, _Conn], game: Any, player:
 
 
 async def test_host_remove_bystander_keeps_night_phase(table) -> None:
-    """Removing a citizen during NIGHT_KILLERS must not forfeit the kill."""
+    """Removing a citizen while others still owe a night action keeps NIGHT."""
     svc, created, conns, joins = table
     game = _game(svc, created)
     killer = _by_char(game, Character.KILLER)
@@ -406,29 +426,35 @@ async def test_host_remove_bystander_keeps_night_phase(table) -> None:
 
     resp = await _remove(svc, conns, game, bystander)
     assert resp["type"] == "mafia.host.remove_player.result"
-    assert game.phase is Phase.NIGHT_KILLERS  # killer is still the awaited actor
-    # the killer can still act
-    resp = await _act(svc, game, joins, killer, other)
+    assert game.phase is Phase.NIGHT  # doctor + remaining citizen haven't submitted
+    # the killer can still lock a pick; night persists until everyone submits
+    resp = await _night(svc, game, joins, killer, "kill", other)
     assert resp["type"] == "mafia.night.act.result"
-    assert game.phase is Phase.NIGHT_DOCTOR
+    assert game.phase is Phase.NIGHT
 
 
-async def test_host_remove_awaited_doctor_advances_and_purges_kill(table) -> None:
-    """Removing the awaited doctor advances the night; their stale kill_target is purged."""
+async def test_host_remove_last_pending_resolves_night(table) -> None:
+    """Removing the only player the table is still waiting on completes the
+    simultaneous night and resolves it."""
     svc, created, conns, joins = table
     game = _game(svc, created)
     killer = _by_char(game, Character.KILLER)
     doctor = _by_char(game, Character.DOCTOR)
+    victim = _by_char(game, Character.CITIZEN)
+    other = _by_char(game, Character.CITIZEN, 1)
 
-    await _act(svc, game, joins, killer, doctor)  # killer targets the doctor
-    assert game.phase is Phase.NIGHT_DOCTOR
+    # everyone but the doctor submits; a kill is locked on the victim
+    await _night(svc, game, joins, killer, "kill", victim)
+    await _night(svc, game, joins, victim, "ready")
+    await _night(svc, game, joins, other, "ready")
+    assert game.phase is Phase.NIGHT  # still waiting on the doctor
 
     resp = await _remove(svc, conns, game, doctor)
     assert resp["type"] == "mafia.host.remove_player.result"
-    # doctor was the awaited actor → night advanced (4 players: no detective → dawn → day)
-    assert game.phase is Phase.DAY
-    # the pending kill pointed at the removed doctor and was purged — nobody double-dies
-    assert game.kill_target is None
+    # the night was the last thing outstanding → it resolved (no doctor left
+    # to save, so the locked kill lands)
+    assert game.phase is not Phase.NIGHT
+    assert not game.players[victim.player_id].alive
 
 
 async def test_host_remove_sole_killer_ends_game(table) -> None:
@@ -450,8 +476,7 @@ async def test_host_remove_purges_votes_for_target(table) -> None:
     victim = _by_char(game, Character.CITIZEN)
     other = _by_char(game, Character.CITIZEN, 1)
 
-    await _act(svc, game, joins, killer, victim)
-    await _act(svc, game, joins, doctor, victim)  # save → nobody dies, 4 alive in DAY
+    await _complete_night(svc, game, joins, kill=victim, save=victim)  # saved → 4 alive in DAY
     assert game.phase is Phase.DAY
     assert game.majority_needed() == 3
 
@@ -520,6 +545,87 @@ async def test_host_remove_resolves_pending_majority_in_day(svc: MafiaService) -
     # 3 alive → majority drops to 2, and Bob already has 2 votes: resolved
     # without any new mafia.vote.cast call.
     assert not bob.alive
+
+
+class _FakeSpeaker:
+    """SpeakerProvider fake that records every announce call."""
+
+    def __init__(self) -> None:
+        self.announced: list[tuple[str, list[str] | None, int | None]] = []
+
+    @property
+    def backends(self) -> dict[str, Any]:
+        return {}
+
+    def get_backend(self, name: str) -> Any:
+        return None
+
+    async def resolve_names(self, names: list[str]) -> dict[str, str]:
+        return {}
+
+    async def announce(
+        self,
+        text: str,
+        speaker_names: list[str] | None = None,
+        volume: int | None = None,
+        context: str = "",
+    ) -> str:
+        self.announced.append((text, speaker_names, volume))
+        return "ok"
+
+
+class _AIAndSpeakerResolver:
+    def __init__(self, speaker: Any) -> None:
+        self._speaker = speaker
+
+    def get_capability(self, name: str) -> Any:
+        if name == "ai_chat":
+            return _FakeAI()
+        if name == "speaker_control":
+            return self._speaker
+        return None
+
+    def require_capability(self, name: str) -> Any:
+        raise LookupError(name)
+
+    def get_all(self, name: str) -> list[Any]:
+        return []
+
+
+async def test_narration_uses_per_game_speaker_and_volume() -> None:
+    """The narrator announces over the speakers/volume chosen for THIS game,
+    not any global setting — proving the per-game plumbing end to end."""
+    speaker = _FakeSpeaker()
+    svc = MafiaService()
+    svc._config = {"enabled": True, "nudge_seconds": 9999}
+    await svc.on_config_changed(svc._config)
+    svc._resolver = _AIAndSpeakerResolver(speaker)
+    svc._enabled = True
+
+    host_conn = _Conn()
+    created = await svc._ws_game_create(
+        host_conn,
+        {
+            "id": "c",
+            "theme_key": "camping",
+            "speaker_names": ["Kitchen", "Patio"],
+            "volume": 33,
+        },
+    )
+    for name in ("Ana", "Ben", "Dot"):
+        conn = _Conn(user_id="guest", name=name, level=200)
+        await svc._ws_game_join(
+            conn, {"id": "j", "join_code": created["join_code"], "name": name}
+        )
+    resp = await svc._ws_game_start(host_conn, {"id": "s", "game_id": created["game_id"]})
+    assert resp["type"] == "mafia.game.start.result", resp
+    svc._cancel_nudge(created["game_id"])
+
+    assert speaker.announced, "narration never reached the speaker"
+    assert all(
+        names == ["Kitchen", "Patio"] and vol == 33
+        for _text, names, vol in speaker.announced
+    ), speaker.announced
 
 
 async def test_secret_push_targeting(table) -> None:

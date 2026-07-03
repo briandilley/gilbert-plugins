@@ -53,7 +53,7 @@ class TestLobby:
     def test_no_join_after_start(self) -> None:
         g = _game(4)
         g.assign_characters(random.Random(42))
-        g.phase = Phase.NIGHT_KILLERS
+        g.phase = Phase.NIGHT
         with pytest.raises(GameError):
             g.add_player("Late")
 

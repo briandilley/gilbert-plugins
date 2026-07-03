@@ -22,6 +22,10 @@ def test_ui_route_is_guest_visible() -> None:
     assert r.panel_id == "mafia.page"
     assert r.required_role == "everyone"
     assert r.requires_capability == "mafia_game"
+    # Nests under the top-level "Games" nav group (declared in core's
+    # web_api.py) rather than standing alone as its own header entry.
+    assert r.add_to_nav is True
+    assert r.nav_parent_group == "games"
 
 
 def test_service_info() -> None:

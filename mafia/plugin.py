@@ -35,11 +35,16 @@ class MafiaPlugin(Plugin):
                 panel_id="mafia.page",
                 label="Mafia",
                 description="Social-deduction party game narrated by Gilbert",
-                icon="moon",
+                icon="venetian-mask",
                 required_role="everyone",
                 requires_capability="mafia_game",
                 add_to_nav=True,
-                show_in_dashboard=True,
+                # Nests under the top-level "Games" group (declared in
+                # web_api.py). The group itself supplies the dashboard
+                # card landing on this route, so — like Andon FM under
+                # Media — this route doesn't also set show_in_dashboard,
+                # which would render a duplicate card.
+                nav_parent_group="games",
             )
         ]
 

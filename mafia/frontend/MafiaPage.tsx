@@ -105,7 +105,8 @@ export function MafiaPage(): ReactElement {
       session && state
         ? {
             onStart: () => run(() => api.start(session.gameId)),
-            onPick: (t: string) => run(() => api.nightAct(session.gameId, session.token, t)),
+            onSubmit: (action: "kill" | "save" | "check" | "ready", t?: string) =>
+              run(() => api.nightAct(session.gameId, session.token, action, t)),
             onVote: (t: string | null) => run(() => api.vote(session.gameId, session.token, t)),
             onSkip: () => run(() => api.hostSkip(session.gameId)),
             onEndDay: () => run(() => api.hostEndDay(session.gameId)),
@@ -134,9 +135,9 @@ export function MafiaPage(): ReactElement {
             adopt(r.game_id, r.player_id, r.player_token, r.state);
           })
         }
-        onCreate={(themeKey, themeText) =>
+        onCreate={(themeKey, themeText, narration) =>
           run(async () => {
-            const r = await api.create(themeKey, themeText);
+            const r = await api.create(themeKey, themeText, narration);
             adopt(r.game_id, r.player_id, r.player_token, r.state);
           })
         }
@@ -145,7 +146,6 @@ export function MafiaPage(): ReactElement {
   }
 
   const { you } = state;
-  const isNight = state.phase.startsWith("night");
   return (
     <div className="mx-auto flex max-w-md flex-col gap-4 p-4">
       {error && <div className="text-sm text-red-400">{error}</div>}
@@ -155,12 +155,11 @@ export function MafiaPage(): ReactElement {
         <GhostPanel state={state} />
       ) : (
         <>
-          {isNight && <NightAction state={state} onPick={handlers.onPick} busy={busy} />}
+          {state.phase === "night" && (
+            <NightAction state={state} onSubmit={handlers.onSubmit} busy={busy} />
+          )}
           {state.phase === "day" && (
             <VotePanel state={state} onVote={handlers.onVote} busy={busy} />
-          )}
-          {(state.phase === "dawn" || state.phase === "dusk") && (
-            <p className="text-center text-sm opacity-70">Listen to the narrator…</p>
           )}
           <StoryLog story={state.story} />
         </>

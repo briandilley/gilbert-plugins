@@ -14,9 +14,9 @@ interface HostControlsProps {
   onAbort: () => void;
 }
 
-/** Host-only collapsed drawer at the bottom of the page: skip the current
- *  night phase, end the day vote early, remove a living player, or abort the
- *  game entirely (second tap confirms). Renders nothing for non-hosts. */
+/** Host-only collapsed drawer at the bottom of the page: force the night to
+ *  resolve, end the day vote early, remove a living player, or abort the game
+ *  entirely (second tap confirms). Renders nothing for non-hosts. */
 export function HostControls({ state, onSkip, onEndDay, onRemove, onAbort }: HostControlsProps): ReactElement | null {
   const [open, setOpen] = useState(false);
   const [confirmAbort, setConfirmAbort] = useState(false);
@@ -24,7 +24,7 @@ export function HostControls({ state, onSkip, onEndDay, onRemove, onAbort }: Hos
 
   if (!state.you.is_host) return null;
 
-  const isNight = state.phase.startsWith("night");
+  const isNight = state.phase === "night";
   const isDay = state.phase === "day";
   const living = state.players.filter((p) => p.alive);
 
@@ -49,7 +49,7 @@ export function HostControls({ state, onSkip, onEndDay, onRemove, onAbort }: Hos
             {isNight && (
               <Button variant="outline" size="sm" onClick={onSkip}>
                 <SkipForwardIcon />
-                Skip phase
+                Skip night
               </Button>
             )}
             {isDay && (

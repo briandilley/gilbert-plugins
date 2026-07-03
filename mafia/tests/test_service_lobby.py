@@ -3,9 +3,11 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from gilbert_plugin_mafia.game import MafiaGame
 from gilbert_plugin_mafia.service import MafiaService
 
 from gilbert.interfaces.auth import UserContext
+from gilbert.interfaces.speaker import SpeakerInfo
 
 
 class _Conn:
@@ -35,6 +37,52 @@ def _guest_conn(name: str = "Guest") -> _Conn:
 class _FakeResolver:
     def get_capability(self, name: str) -> Any:
         return None
+
+    def require_capability(self, name: str) -> Any:
+        raise LookupError(name)
+
+    def get_all(self, name: str) -> list[Any]:
+        return []
+
+
+class _FakeSpeaker:
+    """Satisfies both SpeakerLister (list_speakers) and SpeakerProvider so the
+    same fake works for the picker RPC and for narration announce checks."""
+
+    def __init__(self, speakers: list[SpeakerInfo] | None = None) -> None:
+        self._speakers = speakers or []
+        self.announced: list[tuple[str, list[str] | None, int | None]] = []
+
+    async def list_speakers(self) -> list[SpeakerInfo]:
+        return list(self._speakers)
+
+    @property
+    def backends(self) -> dict[str, Any]:
+        return {}
+
+    def get_backend(self, name: str) -> Any:
+        return None
+
+    async def resolve_names(self, names: list[str]) -> dict[str, str]:
+        return {}
+
+    async def announce(
+        self,
+        text: str,
+        speaker_names: list[str] | None = None,
+        volume: int | None = None,
+        context: str = "",
+    ) -> str:
+        self.announced.append((text, speaker_names, volume))
+        return "ok"
+
+
+class _SpeakerResolver:
+    def __init__(self, speaker: Any) -> None:
+        self._speaker = speaker
+
+    def get_capability(self, name: str) -> Any:
+        return self._speaker if name == "speaker_control" else None
 
     def require_capability(self, name: str) -> Any:
         raise LookupError(name)
@@ -132,6 +180,108 @@ async def test_create_with_blank_display_name_falls_back(svc: MafiaService) -> N
     conn = _Conn(user_id="usr_9", name="")
     created = await _create(svc, conn)
     assert created["state"]["you"]["name"] == "usr_9"
+
+
+async def test_create_stores_per_game_speaker_and_volume(svc: MafiaService) -> None:
+    """Speaker + volume are a per-game choice set on the create frame, not
+    service-wide config."""
+    resp = await svc._ws_game_create(
+        _Conn(),
+        {
+            "id": "r1",
+            "theme_key": "camping",
+            "speaker_names": ["Kitchen", "Patio"],
+            "volume": 42,
+        },
+    )
+    game = svc._games[resp["game_id"]]
+    assert game.speaker_names == ["Kitchen", "Patio"]
+    assert game.volume == 42
+
+
+async def test_create_defaults_narration_when_absent(svc: MafiaService) -> None:
+    resp = await _create(svc, _Conn())
+    game = svc._games[resp["game_id"]]
+    assert game.speaker_names is None  # → default announce speakers
+    assert game.volume == 70
+
+
+async def test_create_empty_speaker_list_falls_back_to_default(svc: MafiaService) -> None:
+    resp = await svc._ws_game_create(
+        _Conn(), {"id": "r", "theme_key": "camping", "speaker_names": []}
+    )
+    assert svc._games[resp["game_id"]].speaker_names is None
+
+
+async def test_create_clamps_out_of_range_volume(svc: MafiaService) -> None:
+    resp = await svc._ws_game_create(
+        _Conn(), {"id": "r", "theme_key": "camping", "volume": 999}
+    )
+    assert svc._games[resp["game_id"]].volume == 100
+    resp2 = await svc._ws_game_create(
+        _Conn(user_id="usr_2"), {"id": "r", "theme_key": "camping", "volume": -5}
+    )
+    assert svc._games[resp2["game_id"]].volume == 0
+
+
+async def test_speakers_list_maps_backend_speakers() -> None:
+    svc = MafiaService()
+    svc._config = {"enabled": True}
+    await svc.on_config_changed(svc._config)
+    svc._resolver = _SpeakerResolver(
+        _FakeSpeaker(
+            [
+                SpeakerInfo(speaker_id="local:kitchen", name="Kitchen", ip_address="", backend_name="local"),
+                SpeakerInfo(
+                    speaker_id="sonos:patio",
+                    name="Patio",
+                    ip_address="",
+                    model="S1",
+                    group_name="Downstairs",
+                    backend_name="sonos",
+                ),
+            ]
+        )
+    )
+    svc._enabled = True
+    resp = await svc._ws_speakers_list(_Conn(), {"id": "s"})
+    assert resp["type"] == "mafia.speakers.list.result"
+    assert [s["id"] for s in resp["speakers"]] == ["Kitchen", "Patio"]
+    patio = resp["speakers"][1]
+    assert patio["backend"] == "sonos"
+    assert patio["group_name"] == "Downstairs"
+    assert resp["defaults"]["volume"] == 70
+
+
+async def test_speakers_list_empty_without_speaker_service(svc: MafiaService) -> None:
+    """No speaker backend → empty picker list, still returns defaults."""
+    resp = await svc._ws_speakers_list(_Conn(), {"id": "s"})
+    assert resp["speakers"] == []
+    assert resp["defaults"]["volume"] == 70
+
+
+async def test_narration_prompts_are_configurable(svc: MafiaService) -> None:
+    """Beat instructions, style guidance, and the invent-theme prompt are
+    user-editable config, cached on config change and fed to the Narrator."""
+    await svc.on_config_changed(
+        {
+            "beat_intro_prompt": "CUSTOM INTRO",
+            "narrate_style_prompt": "CUSTOM STYLE",
+            "invent_theme_prompt": "CUSTOM THEME",
+        }
+    )
+    assert svc._beats["intro"] == "CUSTOM INTRO"
+    assert svc._narrate_style == "CUSTOM STYLE"
+    assert svc._invent_theme_prompt == "CUSTOM THEME"
+    # Untouched beats keep their bundled defaults.
+    assert svc._beats["night"] and svc._beats["win"]
+
+    # The values reach the Narrator this service builds for a game.
+    game = MafiaGame(host_user_id="u", host_name="Cam")
+    prompts = svc._narrator(game)._prompts
+    assert prompts.beats["intro"] == "CUSTOM INTRO"
+    assert prompts.narrate_style == "CUSTOM STYLE"
+    assert prompts.invent_theme == "CUSTOM THEME"
 
 
 class TestDisabledService:

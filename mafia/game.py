@@ -49,13 +49,13 @@ class Character(StrEnum):
 
 
 class Phase(StrEnum):
+    # No eyes-closed sequence: at NIGHT every living player submits a choice
+    # simultaneously (killers pick, doctor saves, detective checks, citizens
+    # ready up). The night resolves once everyone has submitted; the outcome
+    # is narrated and play moves straight to DAY.
     LOBBY = "lobby"
-    NIGHT_KILLERS = "night_killers"
-    NIGHT_DOCTOR = "night_doctor"
-    NIGHT_DETECTIVE = "night_detective"
-    DAWN = "dawn"
+    NIGHT = "night"
     DAY = "day"
-    DUSK = "dusk"
     ENDED = "ended"
 
 
@@ -92,17 +92,28 @@ class MafiaGame:
     host_name: str
     theme: str = ""       # resolved description text fed to the Narrator
     theme_key: str = ""   # preset key, "custom", or "surprise"
+    # Per-game narration output, chosen by the host at create time. These
+    # were once service-wide config; narration is spoken in the room the
+    # game is played in, so which speakers narrate and how loud belongs to
+    # the individual game, not a global setting. ``speaker_names`` of
+    # ``None`` (or empty) falls back to the speaker service's default
+    # announce speakers; ``volume`` is 0-100.
+    speaker_names: list[str] | None = None
+    volume: int = 70
     game_id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     join_code: str = field(default_factory=_make_join_code)
     phase: Phase = Phase.LOBBY
     night: int = 0
     players: dict[str, Player] = field(default_factory=dict)
-    # night state (cleared by begin_night in Task 6)
-    kill_proposed_by: str | None = None
-    kill_proposal: str | None = None
-    kill_target: str | None = None
-    save_target: str | None = None
+    # --- simultaneous-night state (reset each begin_night) ---
+    # Each killer's current target pick. Killers see each other's picks live
+    # and change until they agree; on agreement the kill locks.
+    night_kill_picks: dict[str, str] = field(default_factory=dict)  # killer pid → target pid
+    kill_target: str | None = None  # the agreed, locked kill target
+    kill_locked: bool = False       # killers have agreed → target is final
+    save_target: str | None = None  # doctor's protection pick
     checks: dict[str, list[str]] = field(default_factory=dict)  # detective pid → checked pids
+    night_ready: set[str] = field(default_factory=set)  # players who've submitted their action
     votes: dict[str, str] = field(default_factory=dict)  # voter pid → target pid | "abstain"
     story: list[str] = field(default_factory=list)
     winner: str = ""  # "" | "citizens" | "killers" | "aborted"
@@ -152,16 +163,17 @@ class MafiaGame:
                 return p
         return None
 
-    # --- night ---
+    # --- night (simultaneous) ---
 
     def begin_night(self) -> None:
         self.night += 1
-        self.kill_proposed_by = None
-        self.kill_proposal = None
+        self.night_kill_picks = {}
         self.kill_target = None
+        self.kill_locked = False
         self.save_target = None
+        self.night_ready = set()
         self.votes = {}
-        self.phase = Phase.NIGHT_KILLERS
+        self.phase = Phase.NIGHT
 
     def _living(self, player_id: str) -> Player:
         player = self.players.get(player_id)
@@ -169,36 +181,47 @@ class MafiaGame:
             raise GameError("That player is not in the game (or not alive)")
         return player
 
-    def killer_act(self, player_id: str, target_id: str) -> str:
+    def _require_night(self) -> None:
+        if self.phase is not Phase.NIGHT:
+            raise GameError("There is nothing to do right now")
+
+    def killer_pick(self, player_id: str, target_id: str) -> str:
+        """Record a killer's current target. Killers pick simultaneously and
+        see each other's choice; the kill *locks* only once every living
+        killer has picked the same target. Returns ``"locked"`` on agreement
+        (the kill is now final and both killers count as submitted), else
+        ``"waiting"`` while the team hasn't converged yet.
+        """
+        self._require_night()
         actor = self._living(player_id)
         if actor.character is not Character.KILLER:
             raise GameError("You are not a killer")
+        if self.kill_locked:
+            raise GameError("The kill is already locked in")
         target = self._living(target_id)
         if target.character is Character.KILLER:
             raise GameError("You cannot target a fellow killer")
+        self.night_kill_picks[actor.player_id] = target.player_id
         living_killers = self.alive_with(Character.KILLER)
-        if len(living_killers) == 1:
-            self.kill_target = target.player_id
-            return "confirmed"
-        if self.kill_proposal is None:
-            self.kill_proposal = target.player_id
-            self.kill_proposed_by = actor.player_id
-            return "proposed"
-        if actor.player_id == self.kill_proposed_by:
-            raise GameError("Wait for your partner to confirm")
-        if target.player_id != self.kill_proposal:
-            proposed = self.players[self.kill_proposal].name
-            raise GameError(f"Your partner chose {proposed} — tap them to confirm")
-        self.kill_target = target.player_id
-        return "confirmed"
+        picks = [self.night_kill_picks.get(k.player_id) for k in living_killers]
+        if all(p is not None for p in picks) and len(set(picks)) == 1:
+            self.kill_target = picks[0]
+            self.kill_locked = True
+            for k in living_killers:
+                self.night_ready.add(k.player_id)
+            return "locked"
+        return "waiting"
 
     def doctor_act(self, player_id: str, target_id: str) -> None:
+        self._require_night()
         actor = self._living(player_id)
         if actor.character is not Character.DOCTOR:
             raise GameError("You are not the doctor")
         self.save_target = self._living(target_id).player_id
+        self.night_ready.add(actor.player_id)
 
     def detective_act(self, player_id: str, target_id: str) -> bool:
+        self._require_night()
         actor = self._living(player_id)
         if actor.character is not Character.DETECTIVE:
             raise GameError("You are not the detective")
@@ -206,7 +229,20 @@ class MafiaGame:
             raise GameError("You already know about yourself")
         target = self._living(target_id)
         self.checks.setdefault(actor.player_id, []).append(target.player_id)
+        self.night_ready.add(actor.player_id)
         return target.character is Character.KILLER
+
+    def ready_up(self, player_id: str) -> None:
+        """A player with no night action (a citizen) taps 'Next' to submit."""
+        self._require_night()
+        actor = self._living(player_id)
+        if actor.character is not Character.CITIZEN:
+            raise GameError("You have a night action to take first")
+        self.night_ready.add(actor.player_id)
+
+    def night_complete(self) -> bool:
+        """True once every living player has submitted their night action."""
+        return all(p.player_id in self.night_ready for p in self.alive_players())
 
     def resolve_night(self) -> Player | None:
         if self.kill_target is None or self.kill_target == self.save_target:
@@ -250,14 +286,18 @@ class MafiaGame:
         return player
 
     def purge_references(self, player_id: str) -> None:
-        """Drop night picks and votes that point at a removed player."""
-        if self.kill_proposal == player_id or self.kill_proposed_by == player_id:
-            self.kill_proposal = None
-            self.kill_proposed_by = None
+        """Drop night picks and votes made by / pointing at a removed player."""
+        self.night_kill_picks = {
+            k: t
+            for k, t in self.night_kill_picks.items()
+            if k != player_id and t != player_id
+        }
         if self.kill_target == player_id:
             self.kill_target = None
+            self.kill_locked = False
         if self.save_target == player_id:
             self.save_target = None
+        self.night_ready.discard(player_id)
         self.votes.pop(player_id, None)
         self.votes = {v: t for v, t in self.votes.items() if t != player_id}
 
@@ -275,14 +315,16 @@ class MafiaGame:
 
 
 def _character_public(game: MafiaGame, player: Player) -> str | None:
-    """Reveal-on-death: characters are public once dead, or when the game is over."""
-    if not player.alive or game.winner:
+    """Roles stay secret through play — a death reveals *that* a player died,
+    not *what* they were. Every role is revealed only once the game is over."""
+    if game.winner:
         return str(player.character)
     return None
 
 
 def public_state(game: MafiaGame) -> dict[str, Any]:
     in_day = game.phase is Phase.DAY
+    in_night = game.phase is Phase.NIGHT
     return {
         "game_id": game.game_id,
         "phase": str(game.phase),
@@ -302,24 +344,27 @@ def public_state(game: MafiaGame) -> dict[str, Any]:
         "story": list(game.story),
         "votes": dict(game.votes) if in_day else {},
         "majority_needed": game.majority_needed() if in_day else 0,
+        # Live night progress so every screen can show "3 of 5 ready".
+        "alive_count": len(game.alive_players()),
+        "night_ready_count": len(game.night_ready) if in_night else 0,
         "winner": game.winner,
     }
 
 
 def _awaiting_for(game: MafiaGame, player: Player) -> str | None:
-    if not player.alive:
+    """What action this player still owes for the current night (or None if
+    they've submitted / have nothing to do). Everyone acts at once."""
+    if not player.alive or game.phase is not Phase.NIGHT:
         return None
-    if game.phase is Phase.NIGHT_KILLERS and player.character is Character.KILLER:
-        if game.kill_target is not None:
-            return None
-        if game.kill_proposal is not None:
-            return None if player.player_id == game.kill_proposed_by else "kill_confirm"
+    if player.player_id in game.night_ready:
+        return None  # already submitted — waiting on the rest of the table
+    if player.character is Character.KILLER:
         return "kill"
-    if game.phase is Phase.NIGHT_DOCTOR and player.character is Character.DOCTOR:
-        return "save" if game.save_target is None else None
-    if game.phase is Phase.NIGHT_DETECTIVE and player.character is Character.DETECTIVE:
+    if player.character is Character.DOCTOR:
+        return "save"
+    if player.character is Character.DETECTIVE:
         return "check"
-    return None
+    return "ready"  # citizen — just taps Next
 
 
 def state_for(game: MafiaGame, player_id: str) -> dict[str, Any]:
@@ -327,17 +372,19 @@ def state_for(game: MafiaGame, player_id: str) -> dict[str, Any]:
     player = game.players[player_id]
     assigned = game.phase is not Phase.LOBBY
     partner_name: str | None = None
+    your_night_pick: str | None = None
+    partner_pick: dict[str, str] | None = None
     if assigned and player.character is Character.KILLER:
         partners = [k for k in game.killers() if k.player_id != player.player_id and k.alive]
         partner_name = partners[0].name if partners else None
-    proposal: dict[str, str] | None = None
-    if (
-        player.character is Character.KILLER
-        and game.kill_proposal is not None
-        and game.kill_target is None
-    ):
-        target = game.players[game.kill_proposal]
-        proposal = {"target_id": target.player_id, "target_name": target.name}
+        # The killer's own submitted pick (so the UI can highlight it) plus
+        # the partner's live pick — this is how the duo "sees each other" and
+        # converges on a shared target before it locks.
+        your_night_pick = game.night_kill_picks.get(player.player_id)
+        if partners:
+            pp = game.night_kill_picks.get(partners[0].player_id)
+            if pp is not None and pp in game.players:
+                partner_pick = {"target_id": pp, "target_name": game.players[pp].name}
     check_results = [
         {
             "player_id": pid,
@@ -359,7 +406,10 @@ def state_for(game: MafiaGame, player_id: str) -> dict[str, Any]:
         "character": str(player.character) if assigned else None,
         "partner_name": partner_name,
         "awaiting": _awaiting_for(game, player),
-        "kill_proposal": proposal,
+        "submitted": player.player_id in game.night_ready,
+        "your_night_pick": your_night_pick,
+        "partner_pick": partner_pick,
+        "kill_locked": game.kill_locked,
         "check_results": check_results,
         "ghost": ghost,
     }

@@ -9,6 +9,7 @@ persist a conversation per beat.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Any
 
 from gilbert.interfaces.ai import AISamplingProvider, Message, MessageRole
@@ -20,14 +21,30 @@ logger = logging.getLogger(__name__)
 
 _MAX_STORY_LINES = 20  # cap prompt growth on long games
 
-_BEAT_INSTRUCTIONS: dict[str, str] = {
-    "intro": "Open the game: set the scene, name the players as inhabitants, and tell everyone a killer walks among them. End by telling everyone to close their eyes as night falls.",
-    "night": "Briefly narrate night falling. Everyone's eyes are closed.",
-    "dawn": "Narrate the morning discovery described in the facts, then tell everyone to open their eyes.",
-    "dusk": "Everyone has closed their eyes after the vote. Narrate the outcome described in the facts as part of the story.",
-    "nudge": "One short in-character line gently hurrying a hesitating, unnamed someone in the dark. Do not name anyone.",
-    "win": "Narrate the finale described in the facts, then congratulate the winners and reveal nothing else.",
-}
+
+@dataclass(frozen=True)
+class NarrationPrompts:
+    """The tunable prompt strings that shape narration.
+
+    All of these are user-editable ``ai_prompt`` ConfigParams on
+    ``MafiaService``; the service resolves the active values (falling
+    back to its bundled defaults) and hands a fully-populated instance
+    to each :class:`Narrator` it builds. The Narrator never reads
+    defaults itself — it narrates with whatever it's given.
+
+    - ``system`` — the narrator persona (``system_prompt`` on every call).
+    - ``beats`` — per-beat instruction keyed by beat name
+      (``intro`` / ``night`` / ``dawn`` / ``dusk`` / ``nudge`` / ``win``).
+    - ``narrate_style`` — style/length guidance appended to every story beat.
+    - ``nudge_style`` — style/length guidance appended to stall nudges.
+    - ``invent_theme`` — the prompt used to invent a "Surprise me" theme.
+    """
+
+    system: str
+    beats: dict[str, str]
+    narrate_style: str
+    nudge_style: str
+    invent_theme: str
 
 
 class Narrator:
@@ -38,24 +55,21 @@ class Narrator:
         *,
         ai: Any,
         speaker: Any,
-        system_prompt: str,
+        prompts: NarrationPrompts,
         ai_profile: str,
         speaker_names: list[str] | None,
         volume: int | None,
     ) -> None:
         self._ai = ai
         self._speaker = speaker
-        self._system_prompt = system_prompt
+        self._prompts = prompts
         self._ai_profile = ai_profile
         self._speaker_names = speaker_names
         self._volume = volume
 
     async def invent_theme(self) -> str:
         """One-shot ask the AI for a 1-sentence murder-mystery setting."""
-        text = await self._one_shot(
-            "Invent an evocative setting for a murder-mystery party game. "
-            "Reply with a single short sentence describing the setting and nothing else."
-        )
+        text = await self._one_shot(self._prompts.invent_theme)
         return text or "A small town where everyone knows everyone"
 
     async def narrate(self, game: MafiaGame, beat: str, facts: str) -> str:
@@ -69,8 +83,8 @@ class Narrator:
             "Story so far:" if story_tail else "This is the very first beat of the story.",
             *story_tail,
             f"Facts to narrate now (do not contradict or invent deaths): {facts}",
-            _BEAT_INSTRUCTIONS.get(beat, ""),
-            "Write 2-4 sentences. Spoken aloud, so no stage directions or markdown.",
+            self._prompts.beats.get(beat, ""),
+            self._prompts.narrate_style,
         ]
         text = await self._one_shot("\n".join(p for p in parts if p))
         if not text:
@@ -111,8 +125,8 @@ class Narrator:
         """
         parts = [
             f"Theme / setting (stay strictly consistent with it): {game.theme}",
-            _BEAT_INSTRUCTIONS["nudge"],
-            "Write one short sentence. Spoken aloud, so no stage directions or markdown.",
+            self._prompts.beats.get("nudge", ""),
+            self._prompts.nudge_style,
         ]
         text = await self._one_shot("\n".join(p for p in parts if p))
         if not text:
@@ -127,7 +141,7 @@ class Narrator:
         try:
             response = await self._ai.complete_one_shot(
                 messages=[Message(role=MessageRole.USER, content=prompt)],
-                system_prompt=self._system_prompt,
+                system_prompt=self._prompts.system,
                 profile_name=self._ai_profile or None,
                 tools_override=[],
             )

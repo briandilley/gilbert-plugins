@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from gilbert_plugin_mafia.game import MafiaGame
-from gilbert_plugin_mafia.narrator import Narrator
+from gilbert_plugin_mafia.narrator import NarrationPrompts, Narrator
 
 
 class _Msg:
@@ -56,11 +56,28 @@ class _FakeSpeaker:
         return "ok"
 
 
+def _prompts() -> NarrationPrompts:
+    return NarrationPrompts(
+        system="You are the narrator.",
+        beats={
+            "intro": "intro beat",
+            "night": "night beat",
+            "dawn": "dawn beat",
+            "dusk": "dusk beat",
+            "nudge": "nudge beat",
+            "win": "win beat",
+        },
+        narrate_style="Write 2-4 sentences.",
+        nudge_style="Write one short sentence.",
+        invent_theme="Invent a setting.",
+    )
+
+
 def _narrator(ai: Any = None, speaker: Any = None) -> Narrator:
     return Narrator(
         ai=ai,
         speaker=speaker,
-        system_prompt="You are the narrator.",
+        prompts=_prompts(),
         ai_profile="standard",
         speaker_names=["Kitchen"],
         volume=70,
@@ -89,6 +106,15 @@ async def test_narrate_appends_story_and_carries_context() -> None:
     assert "a camping trip" in user_msg           # theme for consistency
     assert "Night one was quiet." in user_msg     # story so far
     assert "P1, the doctor, was found dead." in user_msg
+    assert "dawn beat" in user_msg                # configurable beat instruction
+    assert "Write 2-4 sentences." in user_msg     # configurable style guidance
+
+
+async def test_invent_theme_uses_configured_prompt() -> None:
+    ai = _FakeAI(reply="A lighthouse cut off by a winter storm.")
+    n = _narrator(ai=ai)
+    await n.invent_theme()
+    assert ai.calls[0]["messages"][0].content == "Invent a setting."
 
 
 async def test_narrate_falls_back_without_ai() -> None:
