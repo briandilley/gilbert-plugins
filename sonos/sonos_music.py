@@ -64,10 +64,16 @@ _SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
 _SPOTIFY_API_BASE = "https://api.spotify.com/v1"
 
 # Scopes Gilbert requests at link time. Covers search (no scope needed),
-# user library (for "my liked songs"), and user-owned playlists (for
-# "my playlists"). ``user-read-private`` gets the user's display name +
-# country for UX niceties. Intentionally omit ``*-modify-*`` scopes —
-# we only read, speakers do the playing through their own link.
+# user library (for "my liked songs" and liking a track), and reading
+# user-owned playlists (for "my playlists"). ``user-read-private`` gets
+# the user's display name + country for UX niceties.
+#
+# Playlist *write* scopes (``playlist-modify-public`` /
+# ``playlist-modify-private``) are deliberately NOT requested: Gilbert
+# never edits playlists in the upstream service. Gilbert-owned playlists
+# (see core/services/music_playlists.py) are stored locally and per-user,
+# which avoids forcing every operator to re-authorize and avoids letting
+# one household member edit another's Spotify account.
 _DEFAULT_SCOPES = (
     "user-library-read user-library-modify playlist-read-private "
     "playlist-read-collaborative user-read-private"
