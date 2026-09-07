@@ -19,6 +19,7 @@ if _pkg_name not in sys.modules:
     # Order matters — leaf modules first, then dependents.
     for _mod_name in (
         "client",
+        "discovery",
         "name_resolver",
         "access",
         "network",

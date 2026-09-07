@@ -34,15 +34,7 @@ class UniFiClient:
         verify_ssl: bool = False,
         timeout: float = 15.0,
     ) -> None:
-        # UniFi OS only serves its API over HTTPS — HTTP requests get a 301 to
-        # the https URL, which httpx may downgrade to GET, breaking login. Force
-        # the upgrade up front so users can paste either scheme.
-        normalized = host.rstrip("/")
-        if normalized.startswith("http://"):
-            normalized = "https://" + normalized[len("http://") :]
-        elif not normalized.startswith("https://"):
-            normalized = "https://" + normalized
-        self._host = normalized
+        self._host = self._normalize_host(host)
         self._username = username
         self._password = password
         self._client = httpx.AsyncClient(
@@ -53,9 +45,41 @@ class UniFiClient:
         )
         self._logged_in = False
 
+    @staticmethod
+    def _normalize_host(host: str) -> str:
+        """Force the https scheme UniFi OS requires.
+
+        UniFi OS only serves its API over HTTPS — HTTP requests get a 301 to
+        the https URL, which httpx may downgrade to GET, breaking login. Force
+        the upgrade up front so users can paste either scheme.
+        """
+        normalized = host.rstrip("/")
+        if normalized.startswith("http://"):
+            normalized = "https://" + normalized[len("http://") :]
+        elif not normalized.startswith("https://"):
+            normalized = "https://" + normalized
+        return normalized
+
     @property
     def host(self) -> str:
         return self._host
+
+    def set_host(self, host: str) -> None:
+        """Re-point this client at a new address, dropping the session.
+
+        Used when a console's DHCP lease changes: discovery finds the same
+        hardware at a new address and we re-home rather than failing every
+        poll until someone edits the config by hand.
+        """
+        normalized = self._normalize_host(host)
+        if normalized == self._host:
+            return
+        self._host = normalized
+        self._client.base_url = httpx.URL(normalized)
+        # The old console's cookie is meaningless on the new address.
+        self._client.cookies.clear()
+        self._logged_in = False
+        logger.info("UniFi client re-homed to %s", normalized)
 
     async def login(self) -> None:
         """Authenticate and store the session cookie."""

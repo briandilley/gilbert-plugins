@@ -1512,11 +1512,17 @@ The presence backend has three sub-sections that can each be enabled independent
 | UniFi Access | `unifi_access.host`, `unifi_access.api_token` *(sensitive)*, `unifi_access.verify_ssl` |
 
 The doorbell backend uses a flat config pointing at Protect:
-- `host` — UniFi Protect host.
+- `host` — UniFi Protect host. May be left blank when `auto_discover` is on.
 - `username` / `password` *(sensitive)* — Protect credentials.
 - `doorbell_names` — Array of camera names to treat as doorbells.
+- `auto_discover` *(default `true`)* — Find the console on the local network when `host` is blank or stops responding. UniFi consoles are usually DHCP clients, so a hardcoded URL breaks whenever the lease changes.
+- `console_mac` — Optional console MAC. When set, discovery re-homes to *that* console rather than the first Protect console it finds; when the pinned console is absent, discovery reports nothing instead of pointing at the wrong hardware.
 
-**Config action** — `test_connection`: pings each configured subsystem and reports status.
+**Auto-discovery** — sweeps the local `/24`, identifying consoles by their unauthenticated `GET /api/system` response (hardware shortname, name, MAC). Protect is detected by `GET /proxy/protect/api/bootstrap` answering `401`; a console without Protect serves the UniFi OS portal SPA (`200` + HTML) on that path, so success there is the *negative* signal. Re-homing after a connection failure is rate-limited to one sweep per 5 minutes, and repeated identical poll failures are logged once per 15 minutes rather than on every poll.
+
+**Config actions**
+- `test_connection` — pings each configured subsystem and reports status.
+- `discover` — scans the local network and reports every UniFi console found, with the address and MAC to configure, flagging which ones run Protect.
 
 **No third-party Python dependencies** — all UniFi APIs are spoken via `httpx`/`aiohttp`.
 
