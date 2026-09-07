@@ -1296,3 +1296,60 @@ async def test_list_speakers_reflects_live_state() -> None:
     assert info.group_name == "Living Zone"
     assert info.group_id == "live-group-id"
     assert info.state.value == "playing"
+
+
+async def test_audio_clip_failure_on_every_speaker_raises() -> None:
+    """A clip every speaker rejects must reach the caller.
+
+    ``_play_audio_clip`` gathers with ``return_exceptions=True`` and raises
+    when every target failed — but the per-speaker helper used to swallow
+    ``FailedCommand`` into a warning and return ``None``, so the failure
+    list was always empty and the raise was dead code. The announce tool
+    then reported success for an announcement nobody heard.
+    """
+    from aiosonos.exceptions import FailedCommand
+
+    backend, _client, player, _group = _make_backend_with_mock_speaker()
+    player.play_audio_clip = AsyncMock(
+        side_effect=FailedCommand("Command failed: ERROR_INVALID_PARAMETER")
+    )
+
+    with pytest.raises(FailedCommand, match="ERROR_INVALID_PARAMETER"):
+        await backend.play_uri(
+            PlayRequest(
+                uri="http://gilbert/output/speaker/announce.mp3",
+                speaker_ids=["RINCON_COORD"],
+                announce=True,
+                title="Dinner",
+            )
+        )
+
+
+async def test_audio_clip_partial_failure_does_not_raise() -> None:
+    """One dead speaker must not sink an otherwise-successful broadcast."""
+    from aiosonos.exceptions import FailedCommand
+
+    backend, client, player, _group = _make_backend_with_mock_speaker()
+
+    good_player = MagicMock()
+    good_player.id = "RINCON_GOOD"
+    good_player.name = "Office"
+    good_player.play_audio_clip = AsyncMock()
+    good_client = MagicMock()
+    good_client.player = good_player
+    backend._clients["RINCON_GOOD"] = good_client
+
+    player.play_audio_clip = AsyncMock(
+        side_effect=FailedCommand("Command failed: ERROR_DEVICE_UNAVAILABLE")
+    )
+
+    await backend.play_uri(
+        PlayRequest(
+            uri="http://gilbert/output/speaker/announce.mp3",
+            speaker_ids=["RINCON_COORD", "RINCON_GOOD"],
+            announce=True,
+            title="Dinner",
+        )
+    )
+
+    good_player.play_audio_clip.assert_awaited_once()

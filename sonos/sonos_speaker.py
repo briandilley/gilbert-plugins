@@ -947,28 +947,31 @@ class SonosSpeaker(SpeakerBackend):
         async def _one(pid: str) -> None:
             client = self._clients.get(pid)
             if client is None:
-                logger.warning(
-                    "Audio clip skipped on speaker %s: no connected client",
-                    self._name_for(pid),
+                raise RuntimeError(
+                    f"no connected client for speaker {self._name_for(pid)}"
                 )
-                return
-            try:
-                await client.player.play_audio_clip(
-                    request.uri,
-                    volume=volume,
-                    name=name,
-                )
-            except FailedCommand as exc:
-                logger.warning(
-                    "Audio clip failed on speaker %s: %s",
-                    self._name_for(pid),
-                    exc,
-                )
+            # Deliberately NOT catching FailedCommand here: the gather below
+            # collects failures so a clip every speaker rejects can be raised
+            # to the caller. Swallowing it into a warning made the "all
+            # speakers failed" branch unreachable, and an announcement nobody
+            # heard was still reported to the model as delivered.
+            await client.player.play_audio_clip(
+                request.uri,
+                volume=volume,
+                name=name,
+            )
 
         results = await asyncio.gather(
             *(_one(pid) for pid in speaker_ids), return_exceptions=True
         )
-        failures = [r for r in results if isinstance(r, Exception)]
+        failures = [r for r in results if isinstance(r, BaseException)]
+        for pid, result in zip(speaker_ids, results, strict=True):
+            if isinstance(result, BaseException):
+                logger.warning(
+                    "Audio clip failed on speaker %s: %s",
+                    self._name_for(pid),
+                    result,
+                )
         if failures and len(failures) == len(results):
             # Every speaker rejected the clip — surface the first error
             # so the caller knows playback didn't happen.
