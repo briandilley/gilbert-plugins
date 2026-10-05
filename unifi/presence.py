@@ -95,6 +95,20 @@ class UniFiPresenceBackend(PresenceBackend):
                 default=False,
             ),
             ConfigParam(
+                key="unifi_network.api_key",
+                type=ToolParameterType.STRING,
+                description=(
+                    "UniFi Network API key (Network app → Settings → Control Plane "
+                    "→ Integrations → Create API Key). Preferred over "
+                    "username/password, and used instead of it when both are set. "
+                    "Must be minted in the Network app — a Protect-scoped key gets "
+                    "401 from the Network API."
+                ),
+                default="",
+                restart_required=True,
+                sensitive=True,
+            ),
+            ConfigParam(
                 key="unifi_protect.host",
                 type=ToolParameterType.STRING,
                 description="UniFi Protect controller URL (e.g., https://192.168.1.1).",
@@ -223,10 +237,15 @@ class UniFiPresenceBackend(PresenceBackend):
         if host in self._clients:
             return self._clients[host]
 
+        api_key = str(cfg.get("api_key", "") or "")
         username = cfg.get("username", "")
         password = cfg.get("password", "")
-        if not username or not password:
-            logger.warning("No credentials configured for UniFi host %s", host)
+        if not api_key and (not username or not password):
+            logger.warning(
+                "No credentials configured for UniFi host %s — set api_key or a "
+                "username/password pair",
+                host,
+            )
             return None
 
         verify_ssl = cfg.get("verify_ssl", False)
@@ -235,6 +254,7 @@ class UniFiPresenceBackend(PresenceBackend):
             username=str(username),
             password=str(password),
             verify_ssl=bool(verify_ssl),
+            api_key=api_key,
         )
 
         try:

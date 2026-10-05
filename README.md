@@ -1503,13 +1503,26 @@ Ubiquiti UniFi integration that aggregates signals from multiple UniFi subsystem
 
 **Configure** (Settings → Monitoring → Presence / Doorbell)
 
-The presence backend has three sub-sections that can each be enabled independently:
+The presence backend has two configurable sub-sections:
 
 | Subsystem | Keys |
 |---|---|
-| UniFi Network | `unifi_network.host`, `unifi_network.username`, `unifi_network.password` *(sensitive)*, `unifi_network.verify_ssl` |
+| UniFi Network | `unifi_network.host`, `unifi_network.api_key` *(sensitive)*, `unifi_network.username`, `unifi_network.password` *(sensitive)*, `unifi_network.verify_ssl` |
 | UniFi Protect | `unifi_protect.host`, `unifi_protect.username`, `unifi_protect.password` *(sensitive)*, `unifi_protect.verify_ssl` |
-| UniFi Access | `unifi_access.host`, `unifi_access.api_token` *(sensitive)*, `unifi_access.verify_ssl` |
+
+UniFi Access has no keys of its own — it rides the Protect console's client, so
+configuring `unifi_protect.*` enables badge signals too.
+
+**Network authentication** — `unifi_network.api_key` is preferred and wins when
+both it and a username/password are set. Mint it in the **Network** app under
+Settings → Control Plane → Integrations → Create API Key; the client then sends
+`X-API-KEY` per request with no login round-trip and no session to expire. A key
+scoped to a different application gets a 401, which the client reports as a
+terminal auth error rather than retrying. Protect/Access still use
+username/password.
+
+Lookback windows: `face_lookback_minutes` (default 30) and `badge_lookback_hours`
+(default 24).
 
 The doorbell backend uses a flat config pointing at Protect:
 - `host` — UniFi Protect host.

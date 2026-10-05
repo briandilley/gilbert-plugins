@@ -23,16 +23,28 @@ class UniFiAPIError(Exception):
 class UniFiClient:
     """Async HTTP client for UniFi OS controllers (UDM, UDR, UNVR, CK Gen2+).
 
-    Handles cookie-based session auth with automatic re-login on 401.
+    Supports two authentication modes:
+
+    - **API key** (``api_key``): sends ``X-API-KEY`` on every request. This is
+      the key minted under Network → Settings → Control Plane → Integrations.
+      It needs no login round-trip and never expires mid-session, so it is the
+      preferred mode for the Network application. A Protect-scoped key gets
+      401 from the Network API (and vice versa) — scope the key to the app you
+      are pointing at.
+    - **Username / password**: cookie-based session auth with automatic
+      re-login on 401.
+
+    ``api_key`` wins when both are supplied.
     """
 
     def __init__(
         self,
         host: str,
-        username: str,
-        password: str,
+        username: str = "",
+        password: str = "",
         verify_ssl: bool = False,
         timeout: float = 15.0,
+        api_key: str = "",
     ) -> None:
         # UniFi OS only serves its API over HTTPS — HTTP requests get a 301 to
         # the https URL, which httpx may downgrade to GET, breaking login. Force
@@ -45,20 +57,37 @@ class UniFiClient:
         self._host = normalized
         self._username = username
         self._password = password
+        self._api_key = api_key
+        headers = {"X-API-KEY": api_key} if api_key else None
         self._client = httpx.AsyncClient(
             base_url=self._host,
             verify=verify_ssl,
             timeout=timeout,
             follow_redirects=True,
+            headers=headers,
         )
-        self._logged_in = False
+        # An API key authenticates every request on its own, so there is no
+        # session to establish and nothing to re-establish on 401.
+        self._logged_in = bool(api_key)
 
     @property
     def host(self) -> str:
         return self._host
 
+    @property
+    def uses_api_key(self) -> bool:
+        """True when this client authenticates with an API key."""
+        return bool(self._api_key)
+
     async def login(self) -> None:
-        """Authenticate and store the session cookie."""
+        """Authenticate and store the session cookie.
+
+        No-op in API-key mode — the key is sent per-request instead.
+        """
+        if self._api_key:
+            self._logged_in = True
+            return
+
         try:
             response = await self._client.post(
                 "/api/auth/login",
@@ -96,8 +125,15 @@ class UniFiClient:
         except httpx.ConnectError as e:
             raise UniFiConnectionError(f"Cannot reach {self._host}: {e}") from e
 
-        # Auto re-login on session expiry
+        # Auto re-login on session expiry. An API key has no session to
+        # refresh, so a 401 there is a real authorization failure — usually a
+        # key scoped to the wrong application.
         if response.status_code == 401:
+            if self._api_key:
+                raise UniFiAuthError(
+                    f"API key rejected by {self._host} for {path} — check that the key "
+                    f"was created in the application you are querying"
+                )
             logger.debug("Session expired on %s, re-authenticating", self._host)
             await self.login()
             try:
