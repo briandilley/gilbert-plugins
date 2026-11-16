@@ -61,6 +61,12 @@ _DEVICE_TOKENS = frozenset(
 # Characters to strip when normalizing names
 _STRIP_RE = re.compile(r"[^a-z\s]")
 
+# Ceiling for any match short of exact. A one-token candidate ("eric",
+# from an email local part) covers itself fully and gets the first-name
+# bonus, which used to reach 1.0 and tie an exact "Eric Dotson" match.
+# Ties go to whichever user is listed first, so the wrong Eric won.
+_MAX_PARTIAL_SCORE = 0.95
+
 
 @dataclass(frozen=True)
 class ResolvedUser:
@@ -224,4 +230,4 @@ def _compute_similarity(raw_tokens: list[str], display_name: str) -> float:
         elif len(raw_tokens[0]) >= 3 and display_tokens[0].startswith(raw_tokens[0]):
             score = min(1.0, score + 0.1)
 
-    return round(score, 3)
+    return round(min(score, _MAX_PARTIAL_SCORE), 3)

@@ -495,6 +495,27 @@ class TestNameResolver:
         assert result is not None
         assert result.confidence == 1.0
 
+    def test_exact_name_beats_a_shorter_name_listed_first(self) -> None:
+        """A first-name-only email must not tie a full display-name match.
+
+        Users arrive sorted by email, so "eric@" sorts ahead of
+        "ericdotson@". The email local part "eric" covers every token of
+        itself, which used to score 1.0 against "Eric Dotson" and win the
+        tie on order alone.
+        """
+        resolver = NameResolver()
+        resolver._users = [
+            {"_id": "usr_smith", "display_name": "Eric Smith", "email": "eric@example.com"},
+            {"_id": "usr_dotson", "display_name": "Eric Dotson", "email": "ericd@example.com"},
+        ]
+        result = resolver.resolve("Eric Dotson")
+        assert result is not None
+        assert result.user_id == "usr_dotson"
+        assert result.confidence == 1.0
+
+    def test_partial_match_scores_below_an_exact_one(self) -> None:
+        assert _compute_similarity(_tokenize("Eric Dotson"), "eric") < 1.0
+
     def test_resolve_caches(self) -> None:
         resolver = NameResolver()
         resolver._users = [
